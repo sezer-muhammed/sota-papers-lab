@@ -19,15 +19,18 @@
 //! render = render, cuda/render.cu;
 //! search = objective, cmaes, auto, search;
 //! judge = judge, encode, xmp;
+//! detail = detail, cuda/detail.cu; lens = lens, cuda/lens.cu;
 //! integration = ops.
 
 pub mod auto;
 pub mod cmaes;
 pub mod color;
 pub mod decode;
+pub mod detail;
 pub mod develop;
 pub mod encode;
 pub mod judge;
+pub mod lens;
 pub mod objective;
 pub mod ops;
 pub mod render;
