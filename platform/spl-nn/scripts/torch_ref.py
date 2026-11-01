@@ -5,11 +5,12 @@ otherwise) that `src/tests.rs` reads. References are computed in float64
 on the bf16/FP8 values the kernels see; PyTorch's own bf16/FP8 outputs are
 saved next to them so the tests can compare our error with PyTorch's.
 
-Run in a PyTorch CUDA container on the GPU host, e.g.
+Run in a PyTorch CUDA container on the GPU host (spl-gs-ref has torch
+2.9.1+cu128), e.g.
 
     docker run --rm --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp \
       -v "$PWD:/w" -v ~/spl-work/out:/out -w /w \
-      pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime \
+      spl-gs-ref:latest \
       python3 platform/spl-nn/scripts/torch_ref.py /out/nn-dense/fixtures
 """
 
