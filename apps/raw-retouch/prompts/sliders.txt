@@ -37,3 +37,7 @@ Calibration, the camera's base colour rendering for the whole image. Leave it ou
 - green_primary_saturation: richer or calmer greens and yellows.
 - blue_primary_hue: shifts blues toward cyan (negative) or purple (positive).
 - blue_primary_saturation: richer or calmer colour across the image; +5 to +15 enriches most colours gently.
+[black_white]
+Black and white (Lightroom's Black & White treatment). Leave bw at 0 unless the photograph should be monochrome:
+- bw: 0 keeps colour, 1 converts the image to black and white.
+- gray mixer (gray_red, gray_orange, gray_yellow, gray_green, gray_aqua, gray_blue, gray_purple, gray_magenta): -100 to +100, used only when bw is 1. How bright each original colour turns in the black and white image: negative darkens it, positive lightens it. Typical moves: gray_blue -20 to -40 for a dramatic sky, gray_orange and gray_red +10 to +25 for luminous skin, gray_green and gray_yellow to separate foliage from the subject.

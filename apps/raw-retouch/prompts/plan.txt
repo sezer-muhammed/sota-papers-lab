@@ -14,7 +14,7 @@ Measurements of the Neutral render (brightness from 0 = black to 1 = white; clip
 Allowed range of each setting for this photo:
 {bounds}
 
-Propose up to three looks for this photograph, each a complete edit. Every look must be tasteful and natural enough to print, and the looks must be visibly different from each other: for example a faithful natural rendering, a vivid or punchy one, and a mood that suits the subject (warm and soft, cool and crisp, bright and airy, or dark and moody). First fix what the photo needs with the Basic panel, such as exposure, highlight or shadow detail and white balance. Then finish it only where the photo benefits: a gentle curve, a little clarity on a landscape, a deeper blue sky, calmer foliage, softer skin. Prefer moderate values and make large moves only where the image clearly needs them.
+{task}
 
 Answer with:
 - analysis: one or two sentences on what the photo shows, its light, and what it needs.

@@ -134,6 +134,13 @@ pub struct AutoInput {
     pub evals_per_look: u32,
     #[serde(default)]
     pub export: ExportOptions,
+    /// The edit wanted, in a few words of any language ("siyah beyaz",
+    /// "high contrast, saturated"); trimmed, at most 500 characters, empty
+    /// = none. Claude plans and judges looks that fulfil it; without
+    /// Claude, keywords pick the looks.
+    #[serde(default)]
+    #[ts(optional)]
+    pub instruction: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema, TS)]
@@ -157,6 +164,9 @@ pub struct CandidateSummary {
 #[ts(export, export_to = "raw-retouch/")]
 pub struct JudgeSummary {
     pub model: String,
+    /// The edit request Claude planned and judged by, as cleaned; null for
+    /// the usual natural taste.
+    pub instruction: Option<String>,
     /// Claude's read of the scene.
     pub scene: Option<String>,
     /// Why the winner won.
@@ -205,6 +215,11 @@ pub struct AutoOutput {
     /// Download name stem: the RAW's file name without extension.
     pub stem: String,
     pub timings: Timings,
+    /// The edit request as used (cleaned); null when there was none.
+    pub instruction: Option<String>,
+    /// How the request was followed: by Claude, or by keywords only when
+    /// Claude was off or failed. Null when there was no request.
+    pub instruction_note: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]

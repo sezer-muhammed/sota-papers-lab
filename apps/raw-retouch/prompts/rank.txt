@@ -4,6 +4,8 @@ Camera: {camera}. Shot at {shot}.
 
 {images}
 
+{request}
+
 Rank all {n} versions from best to worst as finished photographs. Use your checklist: exposure, highlight and shadow detail, white balance and skin, colour, signs of over-processing, and mood. Compare them side by side; some differences are subtle.
 
 Answer with:

@@ -33,4 +33,11 @@ refine: boolean,
 /**
  * Parameter-search evaluations per look.
  */
-evals_per_look: number, export: ExportOptions, };
+evals_per_look: number, export: ExportOptions, 
+/**
+ * The edit wanted, in a few words of any language ("siyah beyaz",
+ * "high contrast, saturated"); trimmed, at most 500 characters, empty
+ * = none. Claude plans and judges looks that fulfil it; without
+ * Claude, keywords pick the looks.
+ */
+instruction?: string, };

@@ -2,6 +2,11 @@
 
 export type JudgeSummary = { model: string, 
 /**
+ * The edit request Claude planned and judged by, as cleaned; null for
+ * the usual natural taste.
+ */
+instruction: string | null, 
+/**
  * Claude's read of the scene.
  */
 scene: string | null, 

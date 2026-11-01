@@ -4,6 +4,8 @@ Camera: {camera}. Shot at {shot}.
 
 {images}
 
+{request}
+
 Which is the better finished photograph? Use your checklist and compare them side by side; the difference may be small. Answer "tie" only if you genuinely cannot prefer either: they look the same, or their strengths and faults balance out.
 
 Answer with:
