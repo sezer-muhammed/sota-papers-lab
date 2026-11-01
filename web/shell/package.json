@@ -10,6 +10,7 @@
     "typecheck": "tsc -p ."
   },
   "dependencies": {
+    "@spl/bindings": "workspace:*",
     "@spl/sdk": "workspace:*",
     "@spl/ui": "workspace:*",
     "lucide-react": "^1.60.0",
