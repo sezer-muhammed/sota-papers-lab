@@ -9,12 +9,24 @@
 //! learned aesthetic score takes part: none ranks edits of one photo
 //! reliably, and an optimizer would chase its biases.
 //!
+//! Settings beyond the Basic panel (Tone Curve, Presence, Color Mixer,
+//! Calibration) are held near the look's typical values by per-slider
+//! expert priors (`search/priors.rs`). The render statistics are global, so
+//! colour terms read the photo's colours per band (`search/hues.rs`): skin
+//! keeps its hue, saturation and brightness, and no band's colour is pushed
+//! past what nature shows.
+//!
 //! `Score::total` is the sum of `Score::terms`; penalties are negative.
 //! Weights are in units where 1.0 is a clearly visible flaw.
 
 use serde::{Deserialize, Serialize};
 
-use crate::search::{warm_shift, warmed};
+use crate::search::hues::{AQUA, BANDS, BLUE, GREEN, MAGENTA, ORANGE, PURPLE, RED, YELLOW};
+use crate::search::priors::{
+    self, BLUE_SAT, CLARITY, CURVE_DARKS, CURVE_HIGHLIGHTS, CURVE_LIGHTS, CURVE_SHADOWS, DEHAZE,
+    GREEN_SAT, HUE, LUM, PRIORS, RED_HUE, RED_SAT, SAT, TEXTURE,
+};
+use crate::search::{Hues, warm_shift, warmed};
 use crate::types::{Params, Scene, Stats};
 
 // Hard constraints. Any violation costs a flat amount, so a feasible render
@@ -101,6 +113,33 @@ const WB_DRIFT_TINT: f32 = 3.0;
 /// Lifting a high-ISO photo's shadows lifts its noise.
 const W_NOISE: f32 = 0.2;
 const NOISE_ISO_FROM: f32 = 800.0;
+/// Settings beyond the Basic panel away from the look's typical values, per
+/// squared expert standard deviation (`search/priors.rs`): a move of one
+/// standard deviation costs as much as a small look-target miss.
+const W_SETTINGS: f32 = 0.1;
+
+// Colour by band, from the photo's colour profile (`search/hues.rs`).
+
+/// Skin keeps its hue: hue moves (Color Mixer bands weighted by where the
+/// photo's skin-like pixels sit, plus half of Red Primary Hue) cost the
+/// full weight per this many slider units, squared.
+const W_SKIN: f32 = 0.5;
+const SKIN_HUE_TOL: f32 = 5.0;
+/// Skin saturation may rise this much (band saturation plus half of Red
+/// Primary Saturation) before it costs, per this many units more.
+const SKIN_SAT_TOL: f32 = 8.0;
+const SKIN_SAT_SCALE: f32 = 10.0;
+/// Skin may darken this much before it costs, per this many units more.
+const SKIN_DARK_TOL: f32 = 8.0;
+const SKIN_DARK_SCALE: f32 = 10.0;
+/// Natural colourfulness (Oklab C / L) per band, red to magenta: a band
+/// pushed past it (or past its own neutral colour, if already beyond) by
+/// its saturation slider and the overall colour gain looks dyed. Skies and
+/// foliage are held tightest.
+const BAND_CEILING: [f32; BANDS] = [0.45, 0.32, 0.36, 0.36, 0.30, 0.32, 0.40, 0.45];
+const BAND_CEILING_KEEP: f32 = 1.05;
+const W_BAND: f32 = 0.4;
+const BAND_SCALE: f32 = 0.03;
 
 // Look targets: a free band around each target, quadratic for the first
 // scale unit outside it and linear beyond, so an unreachable target (a
@@ -151,12 +190,28 @@ const ANCHOR_FIDELITY_SHARE: f32 = 0.25;
 /// What unusable stats (NaN, infinity) score: finite, so rankings work.
 const INVALID_TOTAL: f32 = -1.0e6;
 
-/// Per-slider scale of a "full" edit, the width of the PPR10K search
-/// bounds, in [`Params`] order; temperature in mireds. Distances in these
-/// units make one exposure stop and about 20 contrast points comparable.
-const SLIDER_SCALE: [f32; Params::BASIC] = [
-    120.0, 34.0, 3.7, 77.0, 127.0, 96.0, 105.0, 103.0, 58.0, 50.0,
-];
+/// Per-slider scale of a "full" edit, the width of the search bounds, in
+/// [`Params`] order; temperature in mireds. Distances in these units make
+/// one exposure stop and about 20 contrast points comparable. The Basic
+/// panel's come from PPR10K, the rest are their prior boxes
+/// (`search/priors.rs`); Detail and Lens (0) do not count.
+const SLIDER_SCALE: [f32; Params::COUNT] = {
+    let basic = [
+        120.0, 34.0, 3.7, 77.0, 127.0, 96.0, 105.0, 103.0, 58.0, 50.0,
+    ];
+    let mut s = [0.0; Params::COUNT];
+    let mut i = 0;
+    while i < Params::BASIC {
+        s[i] = basic[i];
+        i += 1;
+    }
+    let mut k = 0;
+    while k < priors::N {
+        s[priors::FIRST + k] = PRIORS[k].hi - PRIORS[k].lo;
+        k += 1;
+    }
+    s
+};
 
 /// PPR10K expert statistics (33,483 Camera Raw XMPs, PV2012), experts a, b
 /// and c as (mean, p5, p95), for exposure, contrast, highlights, shadows,
@@ -262,6 +317,8 @@ pub struct SceneContext {
     pub neutral: Stats,
     pub raw_clipped_fraction: f32,
     pub iso: Option<u32>,
+    /// The photo's colours by Color Mixer band.
+    pub hues: Hues,
 }
 
 impl SceneContext {
@@ -273,6 +330,7 @@ impl SceneContext {
             neutral,
             raw_clipped_fraction: scene.info.raw_clipped_fraction,
             iso: scene.info.iso,
+            hues: Hues::of(scene),
         }
     }
 }
@@ -340,43 +398,124 @@ pub(crate) fn noise_factor(iso: Option<u32>) -> f32 {
     })
 }
 
-/// Squared distance between two parameter sets' Basic panels in
-/// [`SLIDER_SCALE`] units.
+/// Squared distance between two parameter sets in [`SLIDER_SCALE`] units,
+/// over every searched setting (Detail and Lens do not count).
 pub(crate) fn distance_sq(a: &Params, b: &Params) -> f32 {
-    let (a, b) = (a.basic(), b.basic());
+    let (a, b) = (a.to_array(), b.to_array());
     let mired = |k: f32| 1.0e6 / k.max(1.0);
     let dt = (mired(a[0]) - mired(b[0])) / SLIDER_SCALE[0];
     dt * dt
-        + (1..Params::BASIC)
+        + (1..priors::END)
             .map(|i| ((a[i] - b[i]) / SLIDER_SCALE[i]).powi(2))
             .sum::<f32>()
 }
 
+/// Vivid beyond the Basic panel: an S-curve, crisper texture and clarity, a
+/// touch of dehaze, richer non-skin bands and deeper skies, and the
+/// experts' Calibration saturation boost (PPR10K: Blue Primary +23 to +50).
+const VIVID_EXTRA: [(usize, f32); 20] = [
+    (CURVE_SHADOWS, -3.0),
+    (CURVE_DARKS, -6.0),
+    (CURVE_LIGHTS, 6.0),
+    (CURVE_HIGHLIGHTS, 3.0),
+    (TEXTURE, 6.0),
+    (CLARITY, 12.0),
+    (DEHAZE, 4.0),
+    (SAT + RED, 5.0),
+    (SAT + YELLOW, 6.0),
+    (SAT + GREEN, 10.0),
+    (SAT + AQUA, 8.0),
+    (SAT + BLUE, 10.0),
+    (SAT + PURPLE, 5.0),
+    (SAT + MAGENTA, 5.0),
+    (LUM + GREEN, -3.0),
+    (LUM + AQUA, -4.0),
+    (LUM + BLUE, -6.0),
+    (RED_SAT, 5.0),
+    (GREEN_SAT, 5.0),
+    (BLUE_SAT, 15.0),
+];
+
+/// Bright and airy: open darks, softer clarity, glowing skin, light and
+/// muted foliage and skies.
+const BRIGHT_EXTRA: [(usize, f32); 16] = [
+    (CURVE_SHADOWS, 4.0),
+    (CURVE_DARKS, 6.0),
+    (CURVE_LIGHTS, 4.0),
+    (TEXTURE, -2.0),
+    (CLARITY, -6.0),
+    (SAT + YELLOW, -5.0),
+    (SAT + GREEN, -8.0),
+    (SAT + AQUA, -4.0),
+    (SAT + BLUE, -4.0),
+    (LUM + ORANGE, 6.0),
+    (LUM + YELLOW, 6.0),
+    (LUM + GREEN, 8.0),
+    (LUM + AQUA, 6.0),
+    (LUM + BLUE, 6.0),
+    (LUM + PURPLE, 3.0),
+    (LUM + MAGENTA, 3.0),
+];
+
+/// Moody: lower lights and highlights, darker blues and greens, muted
+/// foliage; clarity stays where auto put it.
+const MOODY_EXTRA: [(usize, f32); 13] = [
+    (CURVE_DARKS, -4.0),
+    (CURVE_LIGHTS, -10.0),
+    (CURVE_HIGHLIGHTS, -8.0),
+    (SAT + ORANGE, -4.0),
+    (SAT + YELLOW, -10.0),
+    (SAT + GREEN, -12.0),
+    (SAT + AQUA, -5.0),
+    (SAT + BLUE, -6.0),
+    (LUM + YELLOW, -5.0),
+    (LUM + GREEN, -8.0),
+    (LUM + AQUA, -8.0),
+    (LUM + BLUE, -12.0),
+    (LUM + PURPLE, -5.0),
+];
+
 /// A look's typical edit relative to auto, in [`Params`] order with
 /// temperature as a warm shift in mireds. Seeds the search and centres the
-/// over-editing penalty, so a moody look is not punished for being moody.
-pub(crate) fn look_offset(look: &LookSpec) -> [f32; Params::BASIC] {
+/// over-editing penalty and the settings prior, so a moody look is not
+/// punished for being moody. Natural is auto itself; anchors have none.
+pub(crate) fn look_offset(look: &LookSpec) -> [f32; Params::COUNT] {
+    let mut out = [0.0; Params::COUNT];
     if look.anchor.is_some() {
-        return [0.0; Params::BASIC];
+        return out;
     }
-    match look.id.as_str() {
-        "vivid" => [0.0, 0.0, 0.0, 18.0, -5.0, 0.0, 0.0, -10.0, 25.0, 8.0],
-        "bright" => [0.0, 0.0, 0.45, -12.0, -15.0, 25.0, 5.0, 15.0, -5.0, -3.0],
-        "moody" => [
-            0.0, 0.0, -0.45, 12.0, -25.0, -5.0, -10.0, -20.0, -8.0, -12.0,
-        ],
-        _ => [0.0; Params::BASIC],
+    let (basic, extra): ([f32; Params::BASIC], &[(usize, f32)]) = match look.id.as_str() {
+        "vivid" => (
+            [0.0, 0.0, 0.0, 18.0, -5.0, 0.0, 0.0, -10.0, 25.0, 8.0],
+            &VIVID_EXTRA,
+        ),
+        "bright" => (
+            [0.0, 0.0, 0.45, -12.0, -15.0, 25.0, 5.0, 15.0, -5.0, -3.0],
+            &BRIGHT_EXTRA,
+        ),
+        "moody" => (
+            [
+                0.0, 0.0, -0.45, 12.0, -25.0, -5.0, -10.0, -20.0, -8.0, -12.0,
+            ],
+            &MOODY_EXTRA,
+        ),
+        _ => return out,
+    };
+    out[..Params::BASIC].copy_from_slice(&basic);
+    for &(i, v) in extra {
+        out[i] = v;
     }
+    out
 }
 
 /// `base` moved by `factor` times `offset` (see [`look_offset`]).
-pub(crate) fn offset_params(base: &Params, offset: &[f32; Params::BASIC], factor: f32) -> Params {
-    let mut a = base.basic();
+pub(crate) fn offset_params(base: &Params, offset: &[f32; Params::COUNT], factor: f32) -> Params {
+    let mut a = base.to_array();
     a[0] = warmed(base.temperature, factor * offset[0]);
     for (v, d) in a.iter_mut().zip(offset).skip(1) {
         *v += factor * d;
     }
-    base.with_basic(a)
+    Params::from_array(a)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -521,7 +660,9 @@ pub(crate) struct Objective {
     /// The look's typical edit, taken off before the expert prior: the
     /// experts retouched for a natural look, and a vivid edit is not an
     /// unusual natural one.
-    prior_offset: [f32; Params::BASIC],
+    prior_offset: [f32; Params::COUNT],
+    /// `baseline` as an array: the centre of the settings prior.
+    centre: [f32; Params::COUNT],
     reference: Reference,
     clip_hi_limit: f32,
     clip_lo_limit: f32,
@@ -535,6 +676,9 @@ pub(crate) struct Objective {
     as_shot_temperature: f32,
     as_shot_tint: f32,
     noise: f32,
+    hues: Hues,
+    skin: f32,
+    presence: [f32; BANDS],
 }
 
 fn finite_or(x: f32, fallback: f32) -> f32 {
@@ -558,7 +702,7 @@ impl Objective {
         let as_shot_temperature = crate::search::sane_temperature(cx.as_shot_temperature);
         let as_shot_tint = finite_or(cx.as_shot_tint, 0.0).clamp(-150.0, 150.0);
 
-        let auto = crate::auto::auto_from_stats(n, as_shot_temperature, as_shot_tint, cx.iso);
+        let auto = crate::auto::auto_from_context(cx);
         let mode = match look.anchor {
             Some(anchor) => Mode::Anchor(fill_non_finite(anchor, &auto)),
             None => {
@@ -588,11 +732,15 @@ impl Objective {
         };
         let baseline = match mode {
             Mode::Anchor(anchor) => anchor,
-            Mode::Look(_) => offset_params(&auto, &look_offset(look), 1.0),
+            Mode::Look(_) => {
+                let mut a = offset_params(&auto, &look_offset(look), 1.0).to_array();
+                cx.hues.fix(&mut a);
+                Params::from_array(a)
+            }
         };
 
         let prior_offset = match mode {
-            Mode::Anchor(_) => [0.0; Params::BASIC],
+            Mode::Anchor(_) => [0.0; Params::COUNT],
             Mode::Look(_) => look_offset(look),
         };
         // A look that asks for more colour gets room above its own band.
@@ -605,6 +753,7 @@ impl Objective {
             mode,
             baseline,
             prior_offset,
+            centre: baseline.to_array(),
             reference,
             clip_hi_limit: (CLIP_HI_LIMIT + CLIP_HI_RAW_ALLOWANCE * raw_clipped)
                 .min(CLIP_HI_LIMIT_MAX),
@@ -623,6 +772,9 @@ impl Objective {
             as_shot_temperature,
             as_shot_tint,
             noise: noise_factor(cx.iso),
+            hues: cx.hues,
+            skin: cx.hues.skin_presence(),
+            presence: std::array::from_fn(|b| cx.hues.presence(b)),
         }
     }
 
@@ -644,7 +796,8 @@ impl Objective {
     }
 
     fn eval(&self, s: &Stats, p: &Params, mut term: impl FnMut(&'static str, f32)) -> (f32, bool) {
-        if !stats_valid(s) || !p.to_array().iter().all(|v| v.is_finite()) {
+        let a = p.to_array();
+        if !stats_valid(s) || !a.iter().all(|v| v.is_finite()) {
             term("invalid", INVALID_TOTAL);
             return (INVALID_TOTAL, false);
         }
@@ -683,6 +836,9 @@ impl Objective {
         );
         let lift = p.exposure.max(0.0) / 1.5 + p.shadows.max(0.0) / 60.0 + p.blacks.max(0.0) / 60.0;
         add("prior.noise", -share * W_NOISE * self.noise * lift * lift);
+        let (skin, bands) = self.colour(&a, saturation);
+        add("colour.skin", -W_SKIN * skin);
+        add("colour.bands", -W_BAND * bands);
 
         match self.mode {
             Mode::Anchor(anchor) => add("anchor.distance", -W_ANCHOR * distance_sq(p, &anchor)),
@@ -693,6 +849,10 @@ impl Objective {
                     self.as_shot_tint,
                 );
                 add("prior.experts", -W_PRIOR * prior);
+                add(
+                    "prior.settings",
+                    -W_SETTINGS * priors::cost(&a, &self.centre),
+                );
                 let overedit = distance_sq(p, &self.baseline);
                 add("prior.overedit", -W_OVEREDIT * overedit);
                 let drift = (warm_shift(self.baseline.temperature, p.temperature) / WB_DRIFT_MIRED)
@@ -728,6 +888,38 @@ impl Objective {
         } else {
             (INVALID_TOTAL, false)
         }
+    }
+}
+
+impl Objective {
+    /// The colour terms: how far skin moves (hue, saturation, darkening)
+    /// weighted by how much skin the photo shows, and how far each band's
+    /// colourfulness (its neutral colour times its saturation slider and
+    /// the render's overall colour `gain` over the neutral) passes its
+    /// natural ceiling, weighted by the band's presence.
+    fn colour(&self, a: &[f32; Params::COUNT], gain: f32) -> (f32, f32) {
+        let h = &self.hues;
+        let mut skin = 0.0;
+        if self.skin > 0.0 {
+            let (mut hue, mut sat, mut lum) = (0.5 * a[RED_HUE], 0.5 * a[RED_SAT], 0.0);
+            for (b, w) in h.skin_bands.iter().enumerate() {
+                hue += w * a[HUE + b];
+                sat += w * a[SAT + b];
+                lum += w * a[LUM + b];
+            }
+            skin = self.skin
+                * ((hue / SKIN_HUE_TOL).powi(2)
+                    + ((sat - SKIN_SAT_TOL).max(0.0) / SKIN_SAT_SCALE).powi(2)
+                    + ((-SKIN_DARK_TOL - lum).max(0.0) / SKIN_DARK_SCALE).powi(2));
+        }
+        let gain = if gain.is_finite() { gain.max(0.0) } else { 1.0 };
+        let mut bands = 0.0;
+        for b in (0..BANDS).filter(|&b| self.presence[b] > 0.0) {
+            let after = h.chroma[b] * (1.0 + a[SAT + b] / 100.0).max(0.0) * gain;
+            let ceiling = BAND_CEILING[b].max(BAND_CEILING_KEEP * h.chroma[b]);
+            bands += self.presence[b] * huber((after - ceiling).max(0.0) / BAND_SCALE);
+        }
+        (skin, bands)
     }
 }
 
@@ -863,6 +1055,7 @@ fn expert_prior(p: &Params, as_shot_temperature: f32, as_shot_tint: f32) -> f32 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::priors::SHADOW_TINT;
 
     /// A plausible neutral render of an ordinary daylight scene.
     fn neutral_stats() -> Stats {
@@ -903,6 +1096,7 @@ mod tests {
             neutral: neutral_stats(),
             raw_clipped_fraction: 0.0,
             iso: Some(200),
+            hues: Hues::default(),
         }
     }
 
@@ -1304,5 +1498,141 @@ mod tests {
         let mut c = a;
         c.exposure = 0.37;
         assert!((distance_sq(&a, &c) - 0.01).abs() < 1e-5);
+        // The new settings count in units of their box; Detail and Lens not.
+        let mut d = a;
+        d.clarity = 6.5;
+        assert!((distance_sq(&a, &d) - 0.01).abs() < 1e-5);
+        let mut e = a;
+        e.sharpening = 150.0;
+        e.lens_profile = 1.0;
+        assert_eq!(distance_sq(&a, &e), 0.0);
+    }
+
+    /// A photo with a blue sky, green foliage and a face.
+    fn colourful_cx() -> SceneContext {
+        SceneContext {
+            hues: Hues {
+                mass: [0.01, 0.10, 0.03, 0.20, 0.05, 0.30, 0.0, 0.0],
+                chroma: [0.2, 0.15, 0.2, 0.25, 0.2, 0.28, 0.0, 0.0],
+                skin: 0.08,
+                skin_bands: [0.2, 0.7, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            ..cx()
+        }
+    }
+
+    #[test]
+    fn looks_move_the_new_settings_their_way_inside_the_boxes() {
+        for l in LookSpec::builtin() {
+            let o = look_offset(&l);
+            for (k, prior) in PRIORS.iter().enumerate() {
+                let v = o[priors::FIRST + k];
+                assert!(prior.lo <= v && v <= prior.hi, "{} {}", l.id, prior.key);
+            }
+            // No look moves a hue (no flips), Shadows Tint or Detail/Lens.
+            assert!((HUE..SAT).all(|i| o[i] == 0.0), "{}", l.id);
+            assert_eq!(o[SHADOW_TINT], 0.0);
+            assert!(o[priors::END..].iter().all(|v| *v == 0.0));
+        }
+        assert_eq!(look_offset(&look("natural")), [0.0; Params::COUNT]);
+        let (vivid, moody, bright) = (
+            look_offset(&look("vivid")),
+            look_offset(&look("moody")),
+            look_offset(&look("bright")),
+        );
+        assert!(vivid[CLARITY] > 0.0 && vivid[BLUE_SAT] > 0.0 && vivid[SAT + BLUE] > 0.0);
+        assert!(moody[CURVE_LIGHTS] < 0.0 && moody[LUM + BLUE] < 0.0);
+        assert!(bright[CURVE_DARKS] > 0.0 && bright[LUM + ORANGE] > 0.0);
+        // Vivid leaves skin's saturation alone.
+        assert_eq!(vivid[SAT + ORANGE], 0.0);
+    }
+
+    #[test]
+    fn settings_prior_centres_on_the_look() {
+        let s = neutral_stats();
+        let n = cx();
+        let auto = crate::auto::auto_from_context(&n);
+        let crisp = Params {
+            clarity: auto.clarity + 12.0,
+            texture: auto.texture + 6.0,
+            ..auto
+        };
+        let prior = |l: &str, p: &Params| term(&score(&s, p, &look(l), &n), "prior.settings");
+        assert_eq!(prior("natural", &auto), 0.0);
+        assert!(
+            prior("natural", &crisp) < -0.3,
+            "{}",
+            prior("natural", &crisp)
+        );
+        // Vivid expects that much crispness: cheaper there than plain auto.
+        assert!(prior("vivid", &crisp) > prior("vivid", &auto));
+        // Anchors judge closeness to the anchor instead.
+        let anchored = score(&s, &crisp, &LookSpec::proposal("c", "C", auto), &n);
+        assert!(anchored.terms.iter().all(|(t, _)| t != "prior.settings"));
+        assert!(term(&anchored, "anchor.distance") < 0.0);
+    }
+
+    #[test]
+    fn skin_keeps_its_hue_saturation_and_brightness() {
+        let s = neutral_stats();
+        let n = colourful_cx();
+        let base = natural_params();
+        let skin = |p: &Params| term(&score(&s, p, &look("natural"), &n), "colour.skin");
+        assert_eq!(skin(&base), 0.0);
+        let shifted = Params {
+            hue_orange: 10.0,
+            ..base
+        };
+        // The top of orange's box plus a Calibration red boost.
+        let loud = Params {
+            saturation_orange: 15.0,
+            red_primary_saturation: 20.0,
+            ..base
+        };
+        let dark = Params {
+            luminance_orange: -30.0,
+            ..base
+        };
+        assert!(skin(&shifted) < -0.5, "{}", skin(&shifted));
+        assert!(skin(&loud) < -0.5, "{}", skin(&loud));
+        assert!(skin(&dark) < -0.5, "{}", skin(&dark));
+        // The experts' gentle skin move costs nothing.
+        let gentle = Params {
+            saturation_orange: -5.0,
+            luminance_orange: 8.0,
+            ..base
+        };
+        assert_eq!(skin(&gentle), 0.0);
+        // Without skin in the photo, orange is free.
+        assert_eq!(
+            term(&score(&s, &loud, &look("natural"), &cx()), "colour.skin"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn skies_and_foliage_stay_within_natural_colour() {
+        let n = colourful_cx();
+        let base = natural_params();
+        let bands =
+            |s: &Stats, p: &Params| term(&score(s, p, &look("natural"), &n), "colour.bands");
+        let s = neutral_stats();
+        assert_eq!(bands(&s, &base), 0.0);
+        let dyed_sky = Params {
+            saturation_blue: 30.0,
+            ..base
+        };
+        assert!(bands(&s, &dyed_sky) < -0.3, "{}", bands(&s, &dyed_sky));
+        // The same sky slider on a render already far more colourful costs more.
+        let mut loud = s.clone();
+        loud.colorfulness *= 1.3;
+        assert!(bands(&loud, &dyed_sky) < bands(&s, &dyed_sky));
+        // Taking colour out never costs, and absent bands are free.
+        let muted = Params {
+            saturation_blue: -30.0,
+            saturation_magenta: 40.0,
+            ..base
+        };
+        assert_eq!(bands(&s, &muted), 0.0);
     }
 }

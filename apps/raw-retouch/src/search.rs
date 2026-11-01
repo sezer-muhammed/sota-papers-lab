@@ -3,16 +3,46 @@
 //!
 //! Every render goes into one archive, and a look's result is the best
 //! archived render under that look's objective, so a point found while
-//! searching one look can win another. Looks run one after another; each
-//! starts from the best of its seeds (auto, auto moved the look's way, the
-//! anchor, the PPR10K expert means and scrambled Halton points over the
-//! whole box) and runs CMA-ES with one batched render call per generation.
+//! searching one look can win another. Looks run one after another, each in
+//! three stages with one batched render call per CMA-ES generation, each
+//! starting from the best archived point under the look's objective:
+//!
+//! 1. **Basic** (70 % of the look's evaluations): the ten Basic sliders,
+//!    every other setting at the look's typical value (auto plus the look's
+//!    offset). It starts from the best of its seeds (auto, auto moved the
+//!    look's way, the anchor, the PPR10K expert means and scrambled Halton
+//!    points over the whole box).
+//! 2. **Tone** (12 %): the Basic panel with the parametric Tone Curve and
+//!    Texture/Clarity/Dehaze, 17 dimensions the render statistics see
+//!    directly (percentiles, contrast, local contrast, clipping); a short
+//!    local CMA-ES that lets the curve and clarity take over part of the
+//!    tone work where it pays.
+//! 3. **Colour** (18 %): the Color Mixer's saturation and luminance of the
+//!    bands the photo holds ([`Hues`]), Calibration's three primary
+//!    saturations, and Vibrance and Saturation so global and per-band
+//!    colour can trade off; a small local CMA-ES. The objective scores it
+//!    with its colour terms (skin protection, natural band chroma) next to
+//!    the gamut and colourfulness limits, and the per-slider expert priors
+//!    keep every band near the look's typical move. Hue sliders, Shadows
+//!    Tint and the primaries' hues stay at zero: no statistic sees a hue
+//!    move, so it would be a guess, and zero rules out hue flips.
+//!
+//! Stages 2 and 3 search only within 2.5 expert standard deviations of
+//! their start (`Space::around`), so CMA-ES's round steps suit every new
+//! setting. Splitting keeps every stage small enough to converge within the
+//! budget: one 17-dimensional run from the start converged worse than the
+//! 10-dimensional Basic search it replaces (natural's score varied from
+//! -0.3 to -1.0 over seeds on the synthetic scene, against -0.2 now), and a
+//! 48-dimensional one would mostly learn its covariance. The colour stage
+//! never spends evaluations on bands that are not there.
 //! Every parameter set is quantized to Lightroom's steps before it is
 //! rendered, so the archive holds only exportable edits: an optimum that
 //! sits on a constraint boundary cannot be rounded across it on export, and
 //! a candidate's stats and score describe exactly the sliders it exports.
 
 mod halton;
+pub(crate) mod hues;
+pub(crate) mod priors;
 mod space;
 #[cfg(test)]
 mod synthetic;
@@ -30,7 +60,9 @@ use crate::objective::{
     LookSpec, Objective, PPR10K, SceneContext, Score, distance_sq, look_offset, offset_params,
 };
 use crate::render::RenderEngine;
-use crate::types::{Params, Scene, Stats};
+use crate::types::{PARAM_SPECS, ParamGroup, ParamSpec, Params, Scene, Stats};
+pub use hues::Hues;
+use priors::{BLUE_SAT, GREEN_SAT, LUM, PRIORS, RED_SAT, SAT};
 use space::{LinearKey, Space};
 
 // The search box: PPR10K's union of the three experts' 1st to 99th
@@ -82,9 +114,34 @@ const DISTINCT: f32 = 0.08;
 const POLISH_SIGMA0: f64 = 0.05;
 const POLISH_POPULATION: usize = 12;
 const POLISH_EVALS: usize = 300;
+/// What the tone stage varies; it also decides which finalists look alike.
+const TONE_GROUPS: [ParamGroup; 3] = [
+    ParamGroup::Basic,
+    ParamGroup::ToneCurve,
+    ParamGroup::Presence,
+];
+/// Shares of a look's evaluations the tone refinement and the colour stage
+/// get; the Basic panel's stage has the rest.
+const REFINE_SHARE: f32 = 0.12;
+const COLOUR_SHARE: f32 = 0.18;
+/// The tone refinement starts from a good point and stays near it.
+const REFINE_SIGMA0: f64 = 0.08;
+/// The colour stage starts from a good point and stays near it.
+const COLOUR_SIGMA0: f64 = 0.15;
+const COLOUR_RESTARTS: usize = 1;
+/// Each stage searches the settings with an expert prior within this many
+/// standard deviations of where it starts (`Space::around`).
+const TRUST_STDS: f32 = 2.5;
+/// Basic panel fields (indices into [`Params::to_array`]) the colour stage
+/// varies with the bands.
+const VIBRANCE_FIELD: usize = 8;
+const SATURATION_FIELD: usize = 9;
 
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
+    /// Renders per look, over all three stages. 2000 matches the Basic-only
+    /// search's scores at 1500 on the sample RAWs (the Basic stage gets 70 %
+    /// of it) and takes about 0.9 s for four looks on the GPU host.
     pub evals_per_look: usize,
     pub max_finalists: usize,
     pub seed: u64,
@@ -93,7 +150,7 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            evals_per_look: 1500,
+            evals_per_look: 2000,
             max_finalists: 6,
             seed: 7,
         }
@@ -212,6 +269,10 @@ pub fn clamp_params(p: &Params, lo: &Params, hi: &Params) -> Params {
 /// or clipped RAWs. Every bound sits on Lightroom's step grid, so
 /// quantizing an in-box value keeps it in the box.
 ///
+/// The Tone Curve, Presence, Color Mixer and Calibration get the expert
+/// boxes of `search/priors.rs`, except the Color Mixer bands the photo does
+/// not hold ([`Hues`]), which stay at zero.
+///
 /// Settings the search does not vary are fixed (`low == high`): Lightroom's
 /// defaults, except Detail and Lens Corrections, which are this photo's
 /// automatic values ([`crate::finish::with_auto`]). So every candidate
@@ -222,6 +283,7 @@ pub fn bounds(scene: &Scene) -> (Params, Params) {
         scene.info.as_shot_tint,
         scene.info.raw_clipped_fraction,
         LinearKey::measure(&scene.search),
+        &Hues::of(scene),
     );
     (
         crate::finish::with_auto(&lo, &scene.info),
@@ -234,6 +296,7 @@ fn bounds_for(
     as_shot_tint: f32,
     raw_clipped_fraction: f32,
     key: Option<LinearKey>,
+    hues: &Hues,
 ) -> (Params, Params) {
     let ramp = |x: f32, (from, to): (f32, f32)| ((x - from) / (to - from)).clamp(0.0, 1.0);
     let lerp = |(a, b): (f32, f32), t: f32| a + (b - a) * t;
@@ -285,7 +348,17 @@ fn bounds_for(
         saturation: SATURATION.1,
         ..Params::neutral(temperature, tint)
     };
-    (lo, hi)
+    let (mut lo, mut hi) = (lo.to_array(), hi.to_array());
+    for (k, prior) in PRIORS.iter().enumerate() {
+        let i = priors::FIRST + k;
+        if PARAM_SPECS[i].searched {
+            lo[i] = prior.lo;
+            hi[i] = prior.hi;
+        }
+    }
+    hues.fix(&mut lo);
+    hues.fix(&mut hi);
+    (Params::from_array(lo), Params::from_array(hi))
 }
 
 pub fn run(
@@ -327,6 +400,8 @@ pub fn run_with<E: Evaluator + ?Sized>(
     );
     let auto = book.candidate(auto_at, "auto", "Auto", CandidateSource::Auto, &natural);
 
+    let looks: Vec<LookSpec> = looks.iter().map(|l| planned(l, &auto_params)).collect();
+    let looks = looks.as_slice();
     let objectives: Vec<Objective> = looks.iter().map(|l| Objective::new(l, &cx)).collect();
     let share = 0.95 / looks.len().max(1) as f32;
     progress(0.04, "Searching looks");
@@ -363,7 +438,8 @@ pub fn run_with<E: Evaluator + ?Sized>(
             book.candidate(book.best(objective), &id, &look.label, source, objective)
         })
         .collect();
-    let finalists = finalists(&auto, &looks_out, &space, cfg.max_finalists);
+    let alike = Space::with_groups(lo, hi, &TONE_GROUPS);
+    let finalists = finalists(&auto, &looks_out, &alike, cfg.max_finalists);
     progress(1.0, "Search done");
     Ok(SearchResult {
         neutral,
@@ -375,7 +451,9 @@ pub fn run_with<E: Evaluator + ?Sized>(
 }
 
 /// Short local search from a hand-picked parameter set (Claude's
-/// refinement): fixes clipping and gamut without moving far.
+/// refinement): fixes clipping and gamut without moving far. It varies the
+/// tone stage's settings (Claude adjusts the Basic panel); colour stays as
+/// the start has it.
 pub fn polish(
     engine: &mut RenderEngine,
     scene: &Scene,
@@ -411,7 +489,10 @@ pub fn polish_with<E: Evaluator + ?Sized>(
         tol_fun: TOL_FUN,
         seed: derived_seed(cfg.seed, u64::MAX),
     };
-    minimize_into(&mut book, &space, &objective, &space.unit_of(&start), &opts)?;
+    let local = space
+        .around(&start, TRUST_STDS)
+        .fixing(&tone_dims(), &start);
+    minimize_into(&mut book, &local, &objective, &local.unit_of(&start), &opts)?;
     let at = book.best(&objective);
     Ok(book.candidate(
         at,
@@ -588,7 +669,84 @@ fn repair_auto<E: Evaluator + ?Sized>(
     Ok(closest.unwrap_or(at))
 }
 
-/// One look: seeds in one batch, then CMA-ES from the best archived point.
+/// Claude plans the Basic panel only, so an anchor look takes every other
+/// setting from auto (the plan's own values there are placeholders).
+fn planned(look: &LookSpec, auto: &Params) -> LookSpec {
+    LookSpec {
+        anchor: look.anchor.map(|a| auto.with_basic(a.basic())),
+        ..look.clone()
+    }
+}
+
+/// The tone stage's fields: Basic, Tone Curve, Presence.
+fn tone_dims() -> Vec<usize> {
+    ParamSpec::indices_of(&TONE_GROUPS)
+}
+
+/// The colour stage's fields in this box: Vibrance and Saturation, every
+/// band's saturation and luminance the box lets vary (the bands the photo
+/// holds), and the three primaries' saturation.
+fn colour_dims(space: &Space) -> Vec<usize> {
+    let (lo, hi) = (space.lo.to_array(), space.hi.to_array());
+    let bands = (0..hues::BANDS).flat_map(|b| [SAT + b, LUM + b]);
+    [VIBRANCE_FIELD, SATURATION_FIELD]
+        .into_iter()
+        .chain(bands)
+        .chain([RED_SAT, GREEN_SAT, BLUE_SAT])
+        .filter(|&i| lo[i] < hi[i])
+        .collect()
+}
+
+/// Where a look's settings sit before searching: the anchor, or auto moved
+/// by the look's typical offset, inside the box and on Lightroom's grid.
+fn typical(look: &LookSpec, auto: &Params, space: &Space) -> Params {
+    let p = look
+        .anchor
+        .unwrap_or_else(|| offset_params(auto, &look_offset(look), 1.0));
+    space.clamp(&p).quantized()
+}
+
+/// The evaluations of each stage: (Basic, tone refinement, colour). The
+/// colour stage gets nothing when it has no fields.
+fn stage_budget(evals: usize, colour_dims: usize) -> (usize, usize, usize) {
+    let share = |s: f32| (evals as f32 * s).round() as usize;
+    let colour = if colour_dims == 0 {
+        0
+    } else {
+        share(COLOUR_SHARE).min(evals)
+    };
+    let refine = share(REFINE_SHARE).min(evals - colour);
+    (evals - colour - refine, refine, colour)
+}
+
+/// CMA-ES settings for one stage.
+fn stage_options(
+    sigma0: f64,
+    lambda: usize,
+    max_evals: usize,
+    restarts: usize,
+    seed: u64,
+) -> cmaes::Options {
+    cmaes::Options {
+        sigma0,
+        lambda,
+        max_lambda: MAX_POPULATION,
+        max_evals,
+        restarts,
+        restart_from_best: true,
+        tol_x: TOL_X,
+        tol_fun: TOL_FUN,
+        seed,
+    }
+}
+
+/// One look in three stages, each starting from the best archived point
+/// under the look's objective so far:
+/// 1. the Basic panel: seeds in one batch, then CMA-ES, with every other
+///    setting at the look's typical values;
+/// 2. the Basic panel with the Tone Curve and Presence, a short local
+///    CMA-ES, so the curve and clarity can take over part of the tone work;
+/// 3. the colour fields ([`colour_dims`]), everything else held.
 fn search_look<E: Evaluator + ?Sized>(
     book: &mut Book<E>,
     space: &Space,
@@ -599,30 +757,55 @@ fn search_look<E: Evaluator + ?Sized>(
     index: usize,
 ) -> Result<()> {
     let seed = derived_seed(cfg.seed, index as u64);
-    let mut seeds = seeds(look, auto, space, seed);
-    seeds.truncate(cfg.evals_per_look);
+    let colour = colour_dims(space);
+    let (basic_evals, refine_evals, colour_evals) = stage_budget(cfg.evals_per_look, colour.len());
+    let best = |book: &Book<E>| book.entries[book.best(objective)].params;
+
+    let typical = typical(look, auto, space);
+    let basic = space.fixing(&ParamSpec::indices_of(&[ParamGroup::Basic]), &typical);
+    let mut seeds = seeds(look, auto, &basic, seed);
+    seeds.truncate(basic_evals);
     book.measure(&seeds)?;
-    let remaining = cfg.evals_per_look - seeds.len();
-    if remaining == 0 {
-        return Ok(());
-    }
-    let start = book.entries[book.best(objective)].params;
-    let opts = cmaes::Options {
-        sigma0: if look.anchor.is_some() {
+    let remaining = basic_evals - seeds.len();
+    if remaining > 0 {
+        let start = best(book);
+        let sigma0 = if look.anchor.is_some() {
             ANCHOR_SIGMA0
         } else {
             LOOK_SIGMA0
-        },
-        lambda: POPULATION,
-        max_lambda: MAX_POPULATION,
-        max_evals: remaining,
-        restarts: RESTARTS,
-        restart_from_best: true,
-        tol_x: TOL_X,
-        tol_fun: TOL_FUN,
-        seed: derived_seed(seed, 1),
-    };
-    minimize_into(book, space, objective, &space.unit_of(&start), &opts)
+        };
+        let opts = stage_options(
+            sigma0,
+            POPULATION,
+            remaining,
+            RESTARTS,
+            derived_seed(seed, 1),
+        );
+        minimize_into(book, &basic, objective, &basic.unit_of(&start), &opts)?;
+    }
+
+    if refine_evals > 0 {
+        let start = best(book);
+        let tone = space
+            .around(&start, TRUST_STDS)
+            .fixing(&tone_dims(), &start);
+        let opts = stage_options(REFINE_SIGMA0, 0, refine_evals, 0, derived_seed(seed, 4));
+        minimize_into(book, &tone, objective, &tone.unit_of(&start), &opts)?;
+    }
+
+    if colour_evals > 0 {
+        let start = best(book);
+        let colours = space.around(&start, TRUST_STDS).fixing(&colour, &start);
+        let opts = stage_options(
+            COLOUR_SIGMA0,
+            0,
+            colour_evals,
+            COLOUR_RESTARTS,
+            derived_seed(seed, 3),
+        );
+        minimize_into(book, &colours, objective, &colours.unit_of(&start), &opts)?;
+    }
+    Ok(())
 }
 
 /// CMA-ES over the box on Lightroom's step grid, archiving every render.
@@ -790,7 +973,7 @@ mod tests {
 
     #[test]
     fn bounds_follow_ppr10k_around_as_shot() {
-        let (lo, hi) = bounds_for(5200.0, 8.0, 0.0, None);
+        let (lo, hi) = bounds_for(5200.0, 8.0, 0.0, None, &Hues::default());
         assert_eq!(lo.temperature, warmed(5200.0, -50.0).ceil());
         assert_eq!(hi.temperature, warmed(5200.0, 70.0).floor());
         assert!(lo.temperature < 5200.0 && 5200.0 < hi.temperature);
@@ -813,7 +996,7 @@ mod tests {
         assert!(inside(&neutral, &lo, &hi));
         // Extreme as-shot values stay legal and ordered.
         for (t, tint) in [(2000.0, -150.0), (50000.0, 150.0), (f32::NAN, f32::NAN)] {
-            let (lo, hi) = bounds_for(t, tint, f32::NAN, None);
+            let (lo, hi) = bounds_for(t, tint, f32::NAN, None, &Hues::default());
             assert!(
                 lo.to_array()
                     .iter()
@@ -827,18 +1010,19 @@ mod tests {
     #[test]
     fn bounds_widen_for_dark_bright_and_high_range_scenes() {
         let key = |median: f32, p05: f32, p995: f32| Some(LinearKey { median, p05, p995 });
-        let (lo, hi) = bounds_for(5200.0, 8.0, 0.0, key(0.09, 0.01, 0.8));
+        let (lo, hi) = bounds_for(5200.0, 8.0, 0.0, key(0.09, 0.01, 0.8), &Hues::default());
         assert_eq!(
             (lo.exposure, hi.exposure, lo.highlights, hi.shadows),
             (-1.2, 2.5, -87.0, 68.0)
         );
-        let (_, night) = bounds_for(5200.0, 8.0, 0.0, key(0.004, 0.0004, 0.05));
+        let (_, night) = bounds_for(5200.0, 8.0, 0.0, key(0.004, 0.0004, 0.05), &Hues::default());
         assert_eq!((night.exposure, night.shadows), (3.0, 85.0));
-        let (bright, _) = bounds_for(5200.0, 8.0, 0.0, key(0.4, 0.1, 1.0));
+        let (bright, _) = bounds_for(5200.0, 8.0, 0.0, key(0.4, 0.1, 1.0), &Hues::default());
         assert_eq!(bright.exposure, -2.0);
-        let (backlit, backlit_hi) = bounds_for(5200.0, 8.0, 0.0, key(0.05, 0.001, 1.0));
+        let (backlit, backlit_hi) =
+            bounds_for(5200.0, 8.0, 0.0, key(0.05, 0.001, 1.0), &Hues::default());
         assert_eq!((backlit.highlights, backlit_hi.shadows), (-100.0, 85.0));
-        let (clipped, _) = bounds_for(5200.0, 8.0, 0.02, key(0.09, 0.01, 0.8));
+        let (clipped, _) = bounds_for(5200.0, 8.0, 0.02, key(0.09, 0.01, 0.8), &Hues::default());
         assert_eq!(clipped.highlights, -100.0);
         // The scene-level entry point reads the linear search image.
         let syn = Synthetic::new(0.003, 0.9, 0.05, (0.0, 0.0));
@@ -848,7 +1032,7 @@ mod tests {
 
     #[test]
     fn space_round_trips_and_spaces_temperature_in_mireds() {
-        let (lo, hi) = bounds_for(5200.0, 8.0, 0.0, None);
+        let (lo, hi) = bounds_for(5200.0, 8.0, 0.0, None, &Hues::default());
         let space = Space::new(lo, hi);
         let p = Params {
             temperature: 6100.0,
@@ -867,13 +1051,17 @@ mod tests {
         for (a, b) in p.to_array().iter().zip(back.to_array()) {
             assert!((a - b).abs() < 1e-3 * a.abs().max(1.0), "{p:?} vs {back:?}");
         }
-        assert_eq!(space.params_at(&[0.0; 10]), lo);
-        assert_eq!(space.params_at(&[1.0; 10]), hi);
+        // Basic, Tone Curve, Presence and the primaries' saturation: no
+        // colour band is present, and hues stay at zero.
+        let n = space.dims().len();
+        assert_eq!(n, 10 + 4 + 3 + 3);
+        assert_eq!(space.params_at(&vec![0.0; n]), lo);
+        assert_eq!(space.params_at(&vec![1.0; n]), hi);
         // Halfway in the box is halfway in mireds, not in kelvin.
-        let mid = space.params_at(&[0.5; 10]).temperature;
+        let mid = space.params_at(&vec![0.5; n]).temperature;
         assert!((warm_shift(5200.0, mid) - 10.0).abs() < 0.05, "{mid}");
         assert!(mid < 0.5 * (lo.temperature + hi.temperature));
-        assert!((space.distance(&lo, &hi) - (10.0f32).sqrt()).abs() < 1e-4);
+        assert!((space.distance(&lo, &hi) - (n as f32).sqrt()).abs() < 1e-4);
     }
 
     #[test]
@@ -987,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn four_looks_of_1500_evals_take_under_a_second() {
+    fn four_looks_of_2000_evals_take_under_a_second() {
         let mut syn = Synthetic::daylight();
         let scene = syn.scene();
         let mut messages = Vec::new();
@@ -1002,7 +1190,7 @@ mod tests {
         .unwrap();
         let elapsed = start.elapsed();
         eprintln!(
-            "4 looks x 1500 evals: {} evaluations, {} renderer calls, {:.0} ms",
+            "4 looks x 2000 evals: {} evaluations, {} renderer calls, {:.0} ms",
             r.evaluations,
             syn.calls,
             elapsed.as_secs_f64() * 1000.0
@@ -1010,9 +1198,11 @@ mod tests {
         // Unoptimized test builds are several times slower than release.
         let limit = if cfg!(debug_assertions) { 3.0 } else { 1.0 };
         assert!(elapsed.as_secs_f64() < limit, "{elapsed:?}");
-        assert!(r.evaluations > 4 * 1000 && r.evaluations <= 4 * 1500 + 2);
-        // One batched call per generation: about 1500 / 20 per look.
-        assert!(syn.calls < 4 * 90, "{} calls", syn.calls);
+        assert!(r.evaluations > 4 * 1500 && r.evaluations <= 4 * 2000 + 2);
+        // One batched call per generation: about 1400 / 20 in the Basic
+        // stage, 240 / 12 in the tone stage and 360 / 8 in the colour stage
+        // (5 dimensions on a grey scene).
+        assert!(syn.calls < 4 * 150, "{} calls", syn.calls);
         // Progress after each look, rising to 1.
         assert!(messages.len() >= 6);
         assert!(messages.windows(2).all(|w| w[0].0 <= w[1].0));
@@ -1171,5 +1361,172 @@ mod tests {
         };
         let r = run_synthetic(&mut Synthetic::daylight(), &LookSpec::builtin(), &cfg);
         assert_eq!(r.evaluations, 2 + 4 * 5);
+    }
+
+    /// The new settings of one candidate, for failure messages.
+    fn extra(p: &Params) -> String {
+        let a = p.to_array();
+        (Params::BASIC..priors::END)
+            .filter(|&i| a[i] != 0.0)
+            .map(|i| format!("{} {:+}", Params::NAMES[i], a[i]))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[test]
+    fn bounds_cover_the_new_settings_and_only_the_colours_present() {
+        let syn = Synthetic::colourful();
+        let scene = syn.scene();
+        let hues = Hues::of(&scene);
+        let (lo, hi) = bounds(&scene);
+        let (lo, hi) = (lo.to_array(), hi.to_array());
+        let present: Vec<usize> = (0..hues::BANDS).filter(|&b| hues.searched(b)).collect();
+        assert!(
+            present.contains(&hues::BLUE) && present.contains(&hues::ORANGE),
+            "{hues:?}"
+        );
+        assert!(present.len() < hues::BANDS, "{hues:?}");
+        for (k, prior) in PRIORS.iter().enumerate() {
+            let i = priors::FIRST + k;
+            let band = [priors::HUE, SAT, LUM]
+                .into_iter()
+                .find(|&first| (first..first + hues::BANDS).contains(&i))
+                .map(|first| i - first);
+            if band.is_some_and(|b| !present.contains(&b)) || !PARAM_SPECS[i].searched {
+                assert_eq!((lo[i], hi[i]), (0.0, 0.0), "{}", prior.key);
+            } else {
+                assert_eq!((lo[i], hi[i]), (prior.lo, prior.hi), "{}", prior.key);
+            }
+        }
+        // Detail and Lens stay fixed at the photo's automatic values.
+        assert!((priors::END..Params::COUNT).all(|i| lo[i] == hi[i]));
+    }
+
+    #[test]
+    fn stages_split_the_fields_and_the_budget() {
+        let tone = tone_dims();
+        assert_eq!(tone, (0..17).collect::<Vec<_>>());
+        let syn = Synthetic::colourful();
+        let scene = syn.scene();
+        let (lo, hi) = bounds(&scene);
+        let space = Space::new(lo, hi);
+        let colour = colour_dims(&space);
+        let hues = Hues::of(&scene);
+        let bands = (0..hues::BANDS).filter(|&b| hues.searched(b)).count();
+        assert_eq!(colour.len(), 2 + 2 * bands + 3, "{colour:?}");
+        assert!(
+            colour
+                .iter()
+                .all(|i| !tone.contains(i) || *i == VIBRANCE_FIELD || *i == SATURATION_FIELD)
+        );
+        assert!(!colour.contains(&priors::HUE) && !colour.contains(&priors::SHADOW_TINT));
+        assert_eq!(stage_budget(1500, colour.len()), (1050, 180, 270));
+        assert_eq!(stage_budget(5, colour.len()), (3, 1, 1));
+        assert_eq!(stage_budget(1500, 0), (1320, 180, 0));
+        assert_eq!(stage_budget(1, colour.len()), (1, 0, 0));
+
+        // A stage varies its own fields and holds the rest where it starts.
+        let at = Params {
+            clarity: 9.0,
+            saturation_blue: 12.0,
+            ..crate::auto::auto_params(&Stats::default(), &scene)
+        };
+        let stage = space.fixing(&colour, &at);
+        let moved = stage.params_at(&vec![0.9; stage.dims().len()]);
+        assert_eq!(moved.clarity, 9.0);
+        assert_eq!(moved.exposure, at.exposure);
+        assert!(moved.saturation_blue > 20.0);
+        let back = stage.params_at(&stage.unit_of(&at));
+        assert!((back.saturation_blue - 12.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn colourful_scene_gets_new_settings_by_look() {
+        let mut syn = Synthetic::colourful();
+        let scene = syn.scene();
+        let (lo, hi) = bounds(&scene);
+        let r = run_synthetic(&mut syn, &LookSpec::builtin(), &SearchConfig::default());
+        for c in [&r.auto].into_iter().chain(&r.looks) {
+            eprintln!("{:>13}: {:.2} {}", c.id, c.score.total, extra(&c.params));
+            assert!(c.score.feasible, "{}: {:?}", c.id, c.score);
+            assert!(inside(&c.params, &lo, &hi), "{}", c.id);
+            assert_eq!(c.params.quantized(), c.params, "{}", c.id);
+            // Hues, Shadows Tint and the primaries' hues are not searched.
+            let a = c.params.to_array();
+            assert!((priors::HUE..SAT).all(|i| a[i] == 0.0), "{}", c.id);
+            assert_eq!(c.params.shadow_tint, 0.0);
+        }
+        let (natural, vivid, moody, bright) = (
+            look(&r, "natural").params,
+            look(&r, "vivid").params,
+            look(&r, "moody").params,
+            look(&r, "bright").params,
+        );
+        // Natural stays close to auto beyond the Basic panel.
+        let a = r.auto.params;
+        assert!(
+            (natural.clarity - a.clarity).abs() <= 8.0,
+            "{}",
+            extra(&natural)
+        );
+        for curve in [
+            natural.curve_shadows,
+            natural.curve_darks,
+            natural.curve_lights,
+            natural.curve_highlights,
+        ] {
+            assert!(curve.abs() <= 12.0, "{}", extra(&natural));
+        }
+        // Vivid is crisper and richer; moody darkens skies; bright lightens them.
+        assert!(vivid.clarity > natural.clarity, "{}", extra(&vivid));
+        assert!(
+            vivid.blue_primary_saturation > natural.blue_primary_saturation,
+            "{}",
+            extra(&vivid)
+        );
+        assert!(
+            moody.luminance_blue < natural.luminance_blue,
+            "{}",
+            extra(&moody)
+        );
+        assert!(
+            moody.curve_lights < natural.curve_lights,
+            "{}",
+            extra(&moody)
+        );
+        assert!(
+            bright.luminance_blue > moody.luminance_blue,
+            "{}",
+            extra(&bright)
+        );
+        // Skin keeps its colour: orange stays near auto's gentle skin move.
+        for c in &r.looks {
+            assert!(c.params.saturation_orange <= 8.0, "{}", extra(&c.params));
+        }
+    }
+
+    #[test]
+    fn claude_anchors_take_the_new_settings_from_auto() {
+        let mut syn = Synthetic::colourful();
+        let scene = syn.scene();
+        let (lo, _) = bounds(&scene);
+        // The judge fills the settings it does not plan with the box's low
+        // corner (clarity -25, every band -30): placeholders.
+        let anchor = Params {
+            exposure: 0.4,
+            contrast: 10.0,
+            highlights: -40.0,
+            shadows: 20.0,
+            vibrance: 15.0,
+            ..lo
+        };
+        let looks = [LookSpec::proposal("claude-1", "Warm and soft", anchor)];
+        let r = run_synthetic(&mut syn, &looks, &SearchConfig::default());
+        let c = &r.looks[0].params;
+        let auto = r.auto.params;
+        assert!((c.clarity - auto.clarity).abs() <= 6.0, "{}", extra(c));
+        assert!(c.curve_shadows.abs() <= 10.0, "{}", extra(c));
+        assert!(c.saturation_blue.abs() <= 12.0, "{}", extra(c));
+        assert!((c.exposure - 0.4).abs() < 0.35, "{c:?}");
     }
 }

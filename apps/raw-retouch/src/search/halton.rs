@@ -2,10 +2,14 @@
 
 use crate::cmaes::Rng;
 
-const PRIMES: [usize; 16] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53];
+const PRIMES: [usize; 32] = [
+    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+    101, 103, 107, 109, 113, 127, 131,
+];
 
-/// `count` points in [0, 1)^dim, dim at most 16. Every base's digits pass
-/// through a random permutation per digit position, drawn from `seed`. On a
+/// `count` points in [0, 1)^dim, dim at most 32 (enough for the tone
+/// stage's 17). Every base's digits pass through a random permutation per
+/// digit position, drawn from `seed`. On a
 /// short run the plain sequence lines up its high bases (the first 23
 /// points in bases 23 and 29 fall on one line); the scramble breaks that
 /// and makes different seeds explore different points.
@@ -76,6 +80,11 @@ mod tests {
         }
         // Bases 23 and 29 no longer fall on a line.
         let r = correlation(&a.iter().map(|p| (p[8], p[9])).collect::<Vec<_>>());
+        assert!(r.abs() < 0.6, "correlation {r}");
+        // The tone stage's 17 dimensions, high bases included.
+        let wide = scrambled(32, 17, 3);
+        assert!(wide.iter().all(|p| p.len() == 17));
+        let r = correlation(&wide.iter().map(|p| (p[15], p[16])).collect::<Vec<_>>());
         assert!(r.abs() < 0.6, "correlation {r}");
     }
 
