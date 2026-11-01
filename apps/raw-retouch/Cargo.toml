@@ -1,0 +1,27 @@
+[package]
+name = "spl-app-raw-retouch"
+description = "Automatic RAW photo retouching: develop, search Lightroom-style sliders, judge with Claude, export JPEG and XMP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.23"
+blake3.workspace = true
+jpeg-encoder = "0.7"
+rawler = "0.8"
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+spl-core.workspace = true
+spl-gpu.workspace = true
+tempfile = "3"
+tiff = "0.11"
+tokio.workspace = true
+tracing.workspace = true
+ts-rs.workspace = true
+
+[lints]
+workspace = true

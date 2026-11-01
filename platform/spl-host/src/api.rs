@@ -25,6 +25,20 @@ pub struct RunRequest {
     #[serde(default)]
     #[ts(type = "unknown")]
     pub input: serde_json::Value,
+    /// `false`: answer at once with the run in `running` state and keep
+    /// working; poll `GET /v1/runs/{id}` for progress. Default `true`.
+    #[serde(default)]
+    #[ts(optional)]
+    pub wait: Option<bool>,
+}
+
+/// The latest progress event of a run that is still going.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct RunProgress {
+    /// 0 to 1.
+    pub fraction: f64,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -32,6 +46,10 @@ pub struct RunRequest {
 pub struct RunDetail {
     pub run: RunRecord,
     pub metrics: Vec<MetricRecord>,
+    /// Only while the run is going.
+    pub progress: Option<RunProgress>,
+    /// Recent log lines of a run that is still going (oldest first).
+    pub logs: Vec<String>,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -154,7 +172,12 @@ async fn get_run(
         .await?
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no run `{id}`")))?;
     let metrics = store.list_metrics(&id).await?;
-    Ok(Json(RunDetail { run, metrics }))
+    Ok(Json(RunDetail {
+        run,
+        metrics,
+        progress: None,
+        logs: Vec::new(),
+    }))
 }
 
 async fn get_artifact(

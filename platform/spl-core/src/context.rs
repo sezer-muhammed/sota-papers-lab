@@ -25,6 +25,11 @@ impl Resources {
     }
 }
 
+/// The host's data directory (database, artifacts, caches). Hosts insert it
+/// into [`Resources`]; ops keep their own caches under it.
+#[derive(Debug, Clone)]
+pub struct DataDir(pub std::path::PathBuf);
+
 /// Everything an op may touch while it runs.
 pub struct RunCx {
     pub run_id: String,

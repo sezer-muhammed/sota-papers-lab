@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use spl_core::{ArtifactStore, EventSink, Registry, Resources, Result, RunCx, RunEvent, bail};
+use spl_core::{
+    ArtifactStore, DataDir, EventSink, Registry, Resources, Result, RunCx, RunEvent, bail,
+};
 use spl_data::LocalStore;
 use spl_db::{MetricRecord, NewRun, RunRecord, RunStatus, Store};
 use spl_gpu::GpuReport;
@@ -33,6 +35,7 @@ impl Host {
         });
         let mut resources = Resources::default();
         resources.insert::<GpuReport>(gpu);
+        resources.insert(Arc::new(DataDir(config.data_dir.clone())));
 
         Ok(Arc::new(Self {
             registry,

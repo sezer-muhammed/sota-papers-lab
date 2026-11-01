@@ -11,7 +11,7 @@ mod op;
 mod registry;
 
 pub use artifact::{ArtifactKind, ArtifactRef, ArtifactStore};
-pub use context::{Resources, RunCx};
+pub use context::{DataDir, Resources, RunCx};
 pub use event::{EventSink, RunEvent};
 pub use op::{BoxFuture, DynOp, Op, OpDescriptor};
 pub use registry::Registry;

@@ -8,5 +8,7 @@ pub fn registry() -> Registry {
     let mut registry = Registry::new();
     #[cfg(feature = "device-info")]
     spl_app_device_info::register(&mut registry);
+    #[cfg(feature = "raw-retouch")]
+    spl_app_raw_retouch::register(&mut registry);
     registry
 }
