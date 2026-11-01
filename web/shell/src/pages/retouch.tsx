@@ -128,7 +128,7 @@ function Intro({ action }: { action?: ReactNode }) {
     <PageIntro
       eyebrow="App · raw_retouch"
       title="Retouch RAW photos"
-      lead="Each photo is developed on the GPU, searched over Lightroom's ten Basic sliders, judged by Claude, and exported as a full-resolution JPEG with an XMP sidecar."
+      lead="Each photo is developed on the GPU, given Lightroom develop settings by a per-photo search, judged by Claude, and exported as a full-resolution JPEG with an XMP sidecar."
       action={action}
     />
   );

@@ -5,7 +5,8 @@ import type { RawInfo } from "./RawInfo";
 
 export type InspectOutput = { info: RawInfo, 
 /**
- * As-shot white balance, every other slider at zero.
+ * As-shot white balance and Lightroom's defaults, except Detail and
+ * Lens Corrections: this photo's automatic values.
  */
 neutral: Params, 
 /**

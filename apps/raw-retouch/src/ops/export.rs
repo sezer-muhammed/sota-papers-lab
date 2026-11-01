@@ -8,8 +8,8 @@ use tokio::sync::Semaphore;
 use super::ExportOptions;
 use super::cache::Photo;
 use super::work::{Span, blocking, unless_cancelled};
-use crate::develop::develop_full;
 use crate::encode;
+use crate::finish::develop_full;
 use crate::render::{RenderEngine, render_full};
 use crate::types::{Gpu, Params, Rgb8Image};
 use crate::xmp;
@@ -58,7 +58,8 @@ pub(super) struct Files {
 }
 
 /// Full-resolution JPEG and 16-bit TIFF (as `opts` asks) and the XMP
-/// sidecar: demosaic, render with output sharpening, turn upright, encode.
+/// sidecar: demosaic with the lens corrections, render, sharpen and reduce
+/// noise as the Detail settings say, turn upright, encode.
 pub(super) async fn export(
     cx: &RunCx,
     gpu: &Gpu,
@@ -84,11 +85,12 @@ pub(super) async fn export(
             // Held until the big buffers are gone.
             let _permit = permit;
             r.progress(0.0, "Exporting full resolution: demosaicing");
-            let full = develop_full(&gpu, &photo.frame)?;
+            let scene = photo.scene_for(&gpu, &params)?;
+            let full = develop_full(&gpu, &photo.frame, photo.lens.as_ref(), &params)?;
             r.check()?;
             r.progress(0.35, "Exporting full resolution: rendering");
             let image = {
-                let rendered = render_full(&gpu, &photo.scene, &full, &params)?;
+                let rendered = render_full(&gpu, &scene, &full, &params)?;
                 drop(full);
                 encode::orient16(&rendered, photo.scene.info.orientation)
             };

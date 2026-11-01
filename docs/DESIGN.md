@@ -45,6 +45,8 @@ Controls:
 
 Pages with app-specific views (the Retouch page, `#/retouch`) compose these; photos and other user content may carry their own colours, and labels laid over a photo use a translucent black chip with white text so they read on any image. Its scopes are data, drawn with tokens: histogram channels in the red, green and blue 700 steps, their overlaps in amber, teal and pink 700, all three in gray-700; only the vectorscope's dots take the photo's own hues.
 
+Its Develop panel (Lightroom's Basic, Tone Curve, Color Mixer, Detail, Lens Corrections and Calibration, laid out from the host's `PARAM_SPECS`) shows each section as a disclosure row with a mono summary, remembered per browser. The Color Mixer's and Calibration's slider tracks and band chips are data like the vectorscope: hues computed from Lightroom's band centres, not brand colours. A 6px blue-700 dot marks a value set away from Lightroom's default (as shot for white balance); a gray tick under a track marks the auto edit's value once a slider leaves it.
+
 ## Motion
 
 Reveal and stagger on scroll, ping for live status, skeleton shimmer, indeterminate bar, check draw. All disabled under `prefers-reduced-motion`.

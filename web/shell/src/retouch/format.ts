@@ -1,54 +1,92 @@
+import type { ParamSpec as SpecRow } from "@spl/bindings/raw-retouch/ParamSpec";
 import type { Params } from "@spl/bindings/raw-retouch/Params";
+import { PARAM_SPECS } from "@spl/bindings/raw-retouch/paramSpecs";
 import type { RawInfo } from "@spl/bindings/raw-retouch/RawInfo";
 
 export type ParamKey = keyof Params;
 
-export type ParamSpec = {
-  key: ParamKey;
-  label: string;
-  group: "White balance" | "Tone" | "Presence";
-  /** Slider range and step (Lightroom's own, except temperature: see below). */
-  min: number;
-  max: number;
-  step: number;
-  /** Half-width of the table bar; none for temperature, which has no centre. */
-  bar?: number;
-};
+/** One Params field as the host's PARAM_SPECS (apps/raw-retouch/src/types.rs)
+    describes it: Lightroom's label, XMP name, panel, range, step, default. */
+export type ParamSpec = Omit<SpecRow, "key"> & { key: ParamKey };
 
-/* Lightroom Classic's Basic panel, in its order. The temperature slider spans
-   2000 to 12000 K where photos live; the number field beside it takes
-   Lightroom's full 2000 to 50000. */
-export const PARAMS: ParamSpec[] = [
-  { key: "temperature", label: "Temp", group: "White balance", min: 2000, max: 12000, step: 50 },
-  { key: "tint", label: "Tint", group: "White balance", min: -150, max: 150, step: 1, bar: 150 },
-  { key: "exposure", label: "Exposure", group: "Tone", min: -5, max: 5, step: 0.01, bar: 5 },
-  { key: "contrast", label: "Contrast", group: "Tone", min: -100, max: 100, step: 1, bar: 100 },
-  { key: "highlights", label: "Highlights", group: "Tone", min: -100, max: 100, step: 1, bar: 100 },
-  { key: "shadows", label: "Shadows", group: "Tone", min: -100, max: 100, step: 1, bar: 100 },
-  { key: "whites", label: "Whites", group: "Tone", min: -100, max: 100, step: 1, bar: 100 },
-  { key: "blacks", label: "Blacks", group: "Tone", min: -100, max: 100, step: 1, bar: 100 },
-  { key: "vibrance", label: "Vibrance", group: "Presence", min: -100, max: 100, step: 1, bar: 100 },
-  { key: "saturation", label: "Saturation", group: "Presence", min: -100, max: 100, step: 1, bar: 100 },
-];
+/** Every Params field, in the host's order. */
+export const SPECS = PARAM_SPECS as ParamSpec[];
 
-export const PARAM_KEYS = PARAMS.map((spec) => spec.key);
+export const PARAM_KEYS: ParamKey[] = SPECS.map((spec) => spec.key);
 
-export const TEMPERATURE_RANGE = { min: 2000, max: 50000 } as const;
+/** The Basic panel: the fields every run has carried. Runs recorded before
+    the other fields existed lack them (see completeParams). */
+export const BASIC_KEYS: ParamKey[] = SPECS.filter((spec) => spec.group === "Basic").map((spec) => spec.key);
+
+const BY_KEY = new Map(SPECS.map((spec) => [spec.key, spec]));
+
+export function specOf(key: ParamKey): ParamSpec {
+  const spec = BY_KEY.get(key);
+  if (!spec) throw new Error(`No ParamSpec for ${key}`);
+  return spec;
+}
+
+/** Lightroom's whole temperature range, which the kelvin field takes. */
+export const TEMPERATURE_RANGE = { min: specOf("temperature").min, max: specOf("temperature").max } as const;
+
+/** The temperature slider spans 2000 to 12000 K, where photos live. */
+export const TEMPERATURE_SLIDER = { min: 2000, max: 12000, step: 50 } as const;
+
+/** An on/off setting (Lens Corrections), stored as 0 or 1 like Lightroom. */
+export const isSwitch = (spec: ParamSpec) => spec.min === 0 && spec.max === 1 && spec.step === 1;
+
+/** Decimals the step shows: 2 for exposure, 1 for the sharpening radius. */
+export const decimalsOf = (spec: ParamSpec) => (spec.step >= 1 ? 0 : Math.round(-Math.log10(spec.step)));
+
+/** A field's value, or Lightroom's default where an older run lacks it. */
+function valueOf(params: Params, spec: ParamSpec): number {
+  const value = (params as Record<string, unknown>)[spec.key];
+  return typeof value === "number" && Number.isFinite(value) ? value : (spec.neutral ?? 0);
+}
+
+/** `params` with every field: those a run recorded before they existed take
+    Lightroom's defaults, as the host's serde defaults do. Complete input
+    comes back as is. */
+export function completeParams(params: Params): Params {
+  const raw = params as Record<string, unknown>;
+  const missing = SPECS.filter((spec) => {
+    const value = raw[spec.key];
+    return typeof value !== "number" || !Number.isFinite(value);
+  });
+  if (missing.length === 0) return params;
+  const out: Record<string, unknown> = { ...raw };
+  for (const spec of missing) out[spec.key] = spec.neutral ?? 0;
+  return out as Params;
+}
 
 export function sameParams(a: Params | undefined, b: Params | undefined): boolean {
   if (!a || !b) return false;
-  return PARAM_KEYS.every((key) => Math.abs(a[key] - b[key]) < 1e-6);
+  return SPECS.every((spec) => Math.abs(valueOf(a, spec) - valueOf(b, spec)) < 1e-6);
 }
 
-/** Clamped to the slider's legal range and rounded to its step, the way
-    Lightroom stores it (whole kelvin, 0.01 EV, whole units). */
+/** Clamped to the field's legal range and rounded to its step, the way
+    Lightroom stores it (whole kelvin, 0.01 EV, 0.1 px, whole units): the
+    host's `ParamSpec::quantize`. */
 export function snapParam(key: ParamKey, value: number): number {
-  if (key === "temperature") {
-    return Math.round(Math.min(TEMPERATURE_RANGE.max, Math.max(TEMPERATURE_RANGE.min, value)));
-  }
-  const spec = PARAMS.find((p) => p.key === key)!;
+  const spec = specOf(key);
   const clamped = Math.min(spec.max, Math.max(spec.min, value));
-  return key === "exposure" ? Math.round(clamped * 100) / 100 : Math.round(clamped);
+  if (spec.step >= 1) return Math.round(clamped);
+  const per = Math.round(1 / spec.step);
+  return Math.round(clamped * per) / per;
+}
+
+/** Whether `value` is away from Lightroom's default: the spec's, or for white
+    balance (whose default is as shot) the photo's as-shot value. False when
+    there is nothing to compare with. */
+export function awayFromDefault(
+  key: ParamKey,
+  value: number,
+  asShot?: { temperature: number; tint: number },
+): boolean {
+  const spec = specOf(key);
+  const reference = spec.neutral ?? (key === "temperature" || key === "tint" ? asShot?.[key] : undefined);
+  if (reference == null || !Number.isFinite(reference) || !Number.isFinite(value)) return false;
+  return Math.abs(snapParam(key, value) - snapParam(key, reference)) > 1e-6;
 }
 
 /** "+12", "-8", "0" (never "-0"); `decimals` fixed, so "+0.35" and "0.00". */
@@ -59,11 +97,16 @@ export function formatSigned(value: number, decimals = 0): string {
   return `${rounded > 0 ? "+" : "-"}${Math.abs(rounded).toFixed(decimals)}`;
 }
 
-/** A slider value as Lightroom shows it, with the unit where one helps. */
+/** A value as Lightroom shows it, with the unit where one helps: "5200 K",
+    "+0.35 EV", "+12", "40", "1.0", "On". */
 export function formatParam(key: ParamKey, value: number): string {
   if (key === "temperature") return `${Math.round(value)} K`;
-  if (key === "exposure") return `${formatSigned(value, 2)} EV`;
-  return formatSigned(value);
+  const spec = specOf(key);
+  if (isSwitch(spec)) return value >= 0.5 ? "On" : "Off";
+  const decimals = decimalsOf(spec);
+  const factor = 10 ** decimals;
+  const shown = spec.min < 0 ? formatSigned(value, decimals) : (Math.round(value * factor) / factor).toFixed(decimals);
+  return key === "exposure" ? `${shown} EV` : shown;
 }
 
 const trim = (s: string) => s.replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");

@@ -1,4 +1,4 @@
-These are {n} versions of the same photograph, labelled {labels}. They differ only in global adjustments, and their labels and order are random.
+These are {n} versions of the same photograph, labelled {labels}. They differ only in their develop settings (tone, colour and local contrast), and their labels and order are random.
 
 Camera: {camera}. Shot at {shot}.
 

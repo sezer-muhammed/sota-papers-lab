@@ -12,9 +12,12 @@ use tokio::sync::OnceCell;
 use super::work::{Span, blocking, ms};
 use crate::decode::{RawFrame, decode};
 use crate::develop::develop_scene;
-use crate::types::{Gpu, Scene};
+use crate::finish::{self, LensCorrection};
+use crate::lens::{self, LensSettings};
+use crate::types::{Gpu, Params, Scene};
 
-/// RAWs kept: about 40 to 150 MB each (the mosaic plus the preview images).
+/// RAWs kept: about 40 to 150 MB each (the mosaic plus the preview images,
+/// twice when lens-corrected).
 const ENTRIES: usize = 4;
 
 static DEVELOPED: Lru<Photo> = Lru::new(ENTRIES);
@@ -23,7 +26,49 @@ static DEVELOPED: Lru<Photo> = Lru::new(ENTRIES);
 /// search and display images.
 pub(super) struct Photo {
     pub frame: RawFrame,
-    pub scene: Scene,
+    /// As developed, without lens corrections: the photo's info, and what
+    /// renders when Lens Corrections are off.
+    pub scene: Arc<Scene>,
+    /// The camera's lens correction data, when the file carries it.
+    pub lens: Option<lens::LensCorrection>,
+    /// `scene` corrected, per lens setting asked for so far.
+    corrected: Mutex<Vec<(LensSettings, Arc<Scene>)>>,
+}
+
+impl Photo {
+    fn new(frame: RawFrame, scene: Scene, lens: Option<lens::LensCorrection>) -> Self {
+        Self {
+            frame,
+            scene: Arc::new(scene),
+            lens,
+            corrected: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The search and display images to render `p` from: with the lens
+    /// corrections `p` switches on ([`finish::correct_scene`]), made on first
+    /// use and kept. GPU work: call it on the blocking pool.
+    pub fn scene_for(&self, gpu: &Gpu, p: &Params) -> Result<Arc<Scene>> {
+        let settings = LensCorrection::new(p, &self.scene.info).settings();
+        if !settings.profile && !settings.lateral_ca {
+            return Ok(self.scene.clone());
+        }
+        // Held while correcting (a few milliseconds), so concurrent runs
+        // on one photo correct it once.
+        let mut corrected = self
+            .corrected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, scene)) = corrected.iter().find(|(s, _)| *s == settings) {
+            return Ok(scene.clone());
+        }
+        let scene = match finish::correct_scene(gpu, &self.scene, self.lens.as_ref(), p)? {
+            Some(scene) => Arc::new(scene),
+            None => self.scene.clone(),
+        };
+        corrected.push((settings, scene.clone()));
+        Ok(scene)
+    }
 }
 
 pub(super) struct Loaded {
@@ -50,6 +95,7 @@ pub(super) async fn developed(cx: &RunCx, raw: &str, gpu: &Gpu, span: Span) -> R
             let (photo, decode_ms, develop_ms) = blocking(cx, span, move |r| {
                 r.progress(0.05, "Decoding the RAW file");
                 let frame = decode(&bytes)?;
+                let lens = lens::lens_profile(&bytes);
                 drop(bytes);
                 let decode_ms = ms(started);
                 r.check()?;
@@ -61,7 +107,11 @@ pub(super) async fn developed(cx: &RunCx, raw: &str, gpu: &Gpu, span: Span) -> R
                     "Decoded {} {}, {}x{}, in {decode_ms:.0} ms; developed in {develop_ms:.0} ms",
                     frame.info.make, frame.info.model, frame.width, frame.height
                 ));
-                Ok((Photo { frame, scene }, decode_ms, develop_ms))
+                r.log(match &lens {
+                    Some(lens) => format!("Lens correction data: {}", lens.summary()),
+                    None => "No lens correction data in the file".to_owned(),
+                });
+                Ok((Photo::new(frame, scene, lens), decode_ms, develop_ms))
             })
             .await?;
             timings = Some((decode_ms, develop_ms));

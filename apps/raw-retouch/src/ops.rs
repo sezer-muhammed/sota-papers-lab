@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use spl_core::{ArtifactRef, Op, Result, RunCx};
 use ts_rs::TS;
 
+use crate::finish;
 use crate::render::RenderEngine;
 use crate::types::{Params, RawInfo};
 use export::{Shown, display, put_jpeg};
@@ -53,7 +54,8 @@ pub struct InspectInput {
 #[ts(export, export_to = "raw-retouch/")]
 pub struct InspectOutput {
     pub info: RawInfo,
-    /// As-shot white balance, every other slider at zero.
+    /// As-shot white balance and Lightroom's defaults, except Detail and
+    /// Lens Corrections: this photo's automatic values.
     pub neutral: Params,
     /// Display-size JPEG at neutral settings, upright.
     pub preview: ArtifactRef,
@@ -70,7 +72,7 @@ pub struct ExportOptions {
     /// Full-resolution 16-bit TIFF (large).
     #[serde(default)]
     pub tiff16: bool,
-    /// Lightroom / Camera Raw XMP sidecar with the sliders.
+    /// Lightroom / Camera Raw XMP sidecar with every develop setting.
     #[serde(default = "yes")]
     pub xmp: bool,
 }
@@ -169,7 +171,7 @@ pub struct Timings {
 #[ts(export, export_to = "raw-retouch/")]
 pub struct AutoOutput {
     pub info: RawInfo,
-    /// The chosen edit, in Lightroom units.
+    /// The chosen edit, in Lightroom units: every develop setting.
     pub params: Params,
     /// Id of the chosen candidate.
     pub chosen: String,
@@ -215,6 +217,9 @@ pub struct RenderInput {
 #[derive(Debug, Serialize, JsonSchema, TS)]
 #[ts(export, export_to = "raw-retouch/")]
 pub struct RenderOutput {
+    /// What was rendered: the input's settings clamped to Lightroom's
+    /// ranges and rounded to its steps, as the XMP has them.
+    pub params: Params,
     /// Display-size JPEG, upright.
     pub preview: ArtifactRef,
     pub jpeg: Option<ArtifactRef>,
@@ -245,11 +250,16 @@ impl Op for Inspect {
         .await?;
         ensure_live(cx)?;
         let info = loaded.photo.scene.info.clone();
-        let neutral = Params::neutral(info.as_shot_temperature, info.as_shot_tint).quantized();
+        let neutral = finish::with_auto(
+            &Params::neutral(info.as_shot_temperature, info.as_shot_tint),
+            &info,
+        )
+        .quantized();
         let photo = loaded.photo.clone();
         let shown = blocking(cx, timeline.span(Stage::Render), move |r| {
             r.progress(0.0, "Rendering as shot");
-            let mut engine = RenderEngine::new(&gpu, &photo.scene)?;
+            let scene = photo.scene_for(&gpu, &neutral)?;
+            let mut engine = RenderEngine::new(&gpu, &scene)?;
             display(&mut engine, &neutral, photo.scene.info.orientation)
         })
         .await?;
@@ -307,7 +317,8 @@ impl Op for Render {
         let preview_gpu = gpu.clone();
         let Shown { upright, jpeg } = blocking(cx, timeline.span(Stage::Render), move |r| {
             r.progress(0.0, "Rendering the preview");
-            let mut engine = RenderEngine::new(&preview_gpu, &photo.scene)?;
+            let scene = photo.scene_for(&preview_gpu, &params)?;
+            let mut engine = RenderEngine::new(&preview_gpu, &scene)?;
             display(&mut engine, &params, photo.scene.info.orientation)
         })
         .await?;
@@ -332,6 +343,7 @@ impl Op for Render {
         }
         cx.progress(1.0, "Done");
         Ok(RenderOutput {
+            params,
             preview,
             jpeg: files.jpeg,
             tiff: files.tiff,

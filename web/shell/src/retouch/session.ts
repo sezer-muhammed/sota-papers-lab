@@ -5,7 +5,7 @@ import type { Params } from "@spl/bindings/raw-retouch/Params";
 import type { RenderInput } from "@spl/bindings/raw-retouch/RenderInput";
 import { describeError, isUnauthorized } from "../api";
 import { isRawFileName } from "./files";
-import { sameParams } from "./format";
+import { completeParams, sameParams } from "./format";
 import {
   asAutoInput,
   asAutoOutput,
@@ -1061,16 +1061,16 @@ function restorePhoto(saved: SavedPhoto): Photo {
   const manual: ManualState | undefined =
     m && isParams(m.base) && isParams(m.params)
       ? {
-          base: m.base,
-          params: m.params,
+          base: completeParams(m.base),
+          params: completeParams(m.params),
           preview: str(m.previewId)
-            ? { id: m.previewId!, params: isParams(m.previewParams) ? m.previewParams : m.params }
+            ? { id: m.previewId!, params: completeParams(isParams(m.previewParams) ? m.previewParams : m.params) }
             : undefined,
           export: exportRunId
             ? {
                 status: "running",
                 runId: exportRunId,
-                params: isParams(m.exportParams) ? m.exportParams : m.params,
+                params: completeParams(isParams(m.exportParams) ? m.exportParams : m.params),
                 progress: null,
                 cancelling: false,
               }

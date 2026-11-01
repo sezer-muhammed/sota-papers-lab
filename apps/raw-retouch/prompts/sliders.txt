@@ -1,0 +1,39 @@
+[basic]
+Basic panel:
+- temperature: white balance in kelvin. Higher warms the image (more yellow), lower cools it (more blue).
+- tint: -150 to +150. Positive adds magenta, negative adds green.
+- exposure: in stops (EV). +1.00 is twice as bright; it moves mostly the midtones.
+- contrast: -100 to +100. Steepens or flattens the midtones.
+- highlights: -100 to +100. Negative recovers bright areas such as skies and skin highlights.
+- shadows: -100 to +100. Positive opens up dark areas.
+- whites: -100 to +100. Moves the white point; positive makes the brightest tones brighter.
+- blacks: -100 to +100. Moves the black point; negative deepens the blacks.
+- vibrance: -100 to +100. Boosts muted colours more than saturated ones and protects skin.
+- saturation: -100 to +100. Scales every colour equally; use it sparingly.
+[tone_curve]
+Tone curve, applied after the Basic panel. Each region slider (-100 to +100) bends one part of the tonal range; 5 to 20 is usually plenty:
+- curve_highlights: the brightest tones. Negative holds back bright skies and skin; positive makes highlights glow.
+- curve_lights: the upper midtones. Positive brightens and adds snap; negative calms them.
+- curve_darks: the lower midtones. Negative deepens them; positive opens them.
+- curve_shadows: the darkest tones. Positive lifts them toward a matte, faded look; negative makes them denser.
+Lights up and darks down is a gentle S-curve: more contrast without clipping either end.
+[presence]
+Presence (local contrast):
+- texture: -100 to +100. Fine detail such as skin pores, foliage and fabric. Negative smooths skin; stay within about 15 either way.
+- clarity: -100 to +100. Midtone local contrast: positive adds punch and depth to landscapes and architecture but ages skin, so keep it low or negative on portraits. Rarely beyond +25.
+- dehaze: -100 to +100. Positive cuts atmospheric haze and deepens skies; negative adds haze for a soft, dreamy look. Only where the scene asks for it, rarely beyond 20 either way.
+[color_mixer]
+Color Mixer, per hue band: red, orange (skin), yellow, green (foliage), aqua, blue (sky and water), purple and magenta. List only the bands you change; every other band keeps its value. Per band, -100 to +100:
+- hue: shifts the band toward its neighbours (green: negative is more yellow, positive more aqua).
+- saturation: how colourful the band is.
+- luminance: how bright the band is.
+Typical moves: blue luminance -10 to -25 with blue saturation +5 to +15 for a deeper sky; green and yellow saturation -5 to -15 to calm loud foliage; orange luminance +5 to +10 with orange saturation -5 for brighter, softer skin.
+[calibration]
+Calibration, the camera's base colour rendering for the whole image. Leave it out unless the colour character needs it, and list only what you change (-100 to +100):
+- shadow_tint: green (negative) or magenta (positive) in the shadows only.
+- red_primary_hue: shifts reds and skin toward orange (positive) or magenta (negative).
+- red_primary_saturation: richer or calmer reds and skin.
+- green_primary_hue: shifts greens and yellows toward yellow (negative) or cyan (positive).
+- green_primary_saturation: richer or calmer greens and yellows.
+- blue_primary_hue: shifts blues toward cyan (negative) or purple (positive).
+- blue_primary_saturation: richer or calmer colour across the image; +5 to +15 enriches most colours gently.

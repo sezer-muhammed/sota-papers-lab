@@ -3,6 +3,7 @@ import type { Params } from "./Params";
 
 export type PlannedLook = { name: string, rationale: string, 
 /**
- * Absolute Lightroom values, clamped to the bounds given to `plan`.
+ * Absolute Lightroom values, clamped to the bounds given to `plan`;
+ * settings Claude did not set come from auto.
  */
 params: Params, };

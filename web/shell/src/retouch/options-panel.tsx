@@ -109,7 +109,7 @@ export function OptionsPanel({
             checked={options.xmp}
             onCheckedChange={(xmp) => onChange({ xmp })}
             label="XMP sidecar"
-            description="The ten sliders for Lightroom or Camera Raw, next to the RAW."
+            description="Every develop setting for Lightroom or Camera Raw, next to the RAW."
           />
           <Switch
             checked={options.tiff16}

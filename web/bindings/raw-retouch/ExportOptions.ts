@@ -10,6 +10,6 @@ jpeg: boolean, jpeg_quality: number,
  */
 tiff16: boolean, 
 /**
- * Lightroom / Camera Raw XMP sidecar with the sliders.
+ * Lightroom / Camera Raw XMP sidecar with every develop setting.
  */
 xmp: boolean, };

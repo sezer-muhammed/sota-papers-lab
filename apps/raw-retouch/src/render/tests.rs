@@ -686,8 +686,10 @@ fn blur3(w: usize, h: usize, src: &[f32]) -> Vec<f32> {
 /// colour, without per-pixel texture and noise) and the mean signed
 /// difference (any systematic shift). Rendering before or after resampling
 /// differs by nature on sub-pixel detail (Jensen's inequality on the tone
-/// curve), and the export also has its chroma noise removed; the raw bound
-/// is 2/255 for neutral renders and 2.5/255 for a strong edit.
+/// curve); the raw bound is 2/255 for neutral renders and 2.5/255 for a
+/// strong edit. Detail is off (the preview's sharpening and noise reduction,
+/// `finish::finish_preview`, have no counterpart in `full::render`), so this
+/// compares the renders themselves; the old fixed finishing is reported.
 #[test]
 #[ignore]
 fn gpu_full_matches_display() {
@@ -695,7 +697,12 @@ fn gpu_full_matches_display() {
     for file in SAMPLES {
         let s = testkit::load(file);
         let mut e = engine(&gpu, &s);
-        let n = neutral(&s.scene);
+        let n = Params {
+            sharpening: 0.0,
+            luminance_nr: 0.0,
+            color_nr: 0.0,
+            ..neutral(&s.scene)
+        };
         for (label, p) in [
             ("neutral", n),
             (
@@ -739,16 +746,13 @@ fn gpu_full_matches_display() {
                         / (dw * dh) as f64
                 })
                 .collect();
-            let bare = full::Finish {
-                sharpen: 0.0,
-                chroma_nr: false,
-            };
-            let plain = full::render_with(&gpu, &s.scene, &s.half, &p, &*s.color, bare).unwrap();
-            let raw_bare = mad(&shrink16(&plain, DISPLAY_EDGE, true).2, &shown);
+            let fixed = full::Finish::default();
+            let old = full::render_with(&gpu, &s.scene, &s.half, &p, &*s.color, fixed).unwrap();
+            let raw_old = mad(&shrink16(&old, DISPLAY_EDGE, true).2, &shown);
             println!(
                 "{file} {label}: full {}x{} in {ms:.0} ms; downscaled vs display(): MAD {raw:.2}/255, \
-                 {look:.2} after a 3x3 blur, mean signed {:+.2} {:+.2} {:+.2} (without sharpening and \
-                 chroma NR: MAD {raw_bare:.2})",
+                 {look:.2} after a 3x3 blur, mean signed {:+.2} {:+.2} {:+.2} (with the old fixed \
+                 sharpening and chroma NR: MAD {raw_old:.2})",
                 full.width, full.height, signed[0], signed[1], signed[2],
             );
             let bound = if label == "neutral" { 2.0 } else { 2.5 };

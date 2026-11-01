@@ -28,14 +28,25 @@ const NR_SIGMA: f32 = 1.5;
 const NR_L: f32 = 0.05;
 const NR_AB: f32 = 0.02;
 
-/// Output finishing; tests switch it off to measure what it adds.
+/// The render's own output finishing: a fixed capture sharpening and
+/// chroma noise reduction. Off in production, where Lightroom's Detail panel
+/// ([`crate::finish::finish_full`]) does that work from the photo's
+/// settings; tests switch it on to compare.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Finish {
     pub(crate) sharpen: f32,
     pub(crate) chroma_nr: bool,
 }
 
+impl Finish {
+    pub(crate) const OFF: Self = Self {
+        sharpen: 0.0,
+        chroma_nr: false,
+    };
+}
+
 impl Default for Finish {
+    /// The fixed finishing the export had before the Detail panel.
     fn default() -> Self {
         Self {
             sharpen: SHARP_AMOUNT,
@@ -44,6 +55,8 @@ impl Default for Finish {
     }
 }
 
+/// The export render without finishing: Detail follows in
+/// [`crate::finish::finish_full`].
 pub(crate) fn render(
     gpu: &Gpu,
     scene: &Scene,
@@ -51,7 +64,7 @@ pub(crate) fn render(
     params: &Params,
     color: &dyn CameraColor,
 ) -> Result<Rgb16Image> {
-    render_with(gpu, scene, full, params, color, Finish::default())
+    render_with(gpu, scene, full, params, color, Finish::OFF)
 }
 
 pub(crate) fn render_with(
