@@ -1,5 +1,7 @@
 # Local Linux machine with an NVIDIA GPU:
 #   SPL_GIT_SHA=$(git rev-parse --short HEAD) docker compose -f deploy/compose.yaml up -d --build
+name: sota-papers-lab
+
 services:
   spl:
     build:

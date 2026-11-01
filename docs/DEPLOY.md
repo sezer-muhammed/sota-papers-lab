@@ -19,6 +19,19 @@ curl localhost:7070/v1/health
 
 Bare metal: `pnpm install && pnpm build && SPL_WEB_DIR=web/shell/dist cargo run --release -p spl-cli -- serve`.
 
+### Tailnet-only (no token)
+
+Reachable only from devices on your Tailscale network; nothing is published on the LAN:
+
+```sh
+cd deploy
+printf 'COMPOSE_FILE=compose.yaml:compose.tailnet.yaml\nSPL_TAILNET_IP=%s\n' "$(tailscale ip -4)" > .env
+SPL_GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
+```
+
+Open `http://<machine>.<tailnet>.ts.net:7070`. Update with `git pull && docker compose up -d --build`
+(Rust and pnpm caches persist between builds).
+
 Data (SQLite file + artifacts) lives in `./data` (bind-mounted to `/var/lib/spl`).
 
 ## Cloud GPU VM

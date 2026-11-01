@@ -1,0 +1,15 @@
+# Tailnet-only: no published ports. spl binds straight to this machine's
+# Tailscale IP, so only devices on your tailnet can reach it and no token is
+# needed. If the container starts before Tailscale is up (boot), the bind
+# fails, the container exits and `restart: unless-stopped` retries it.
+#
+# Put this in deploy/.env (git-ignored) and run `docker compose up -d --build`
+# from deploy/:
+#   COMPOSE_FILE=compose.yaml:compose.tailnet.yaml
+#   SPL_TAILNET_IP=<output of `tailscale ip -4`>
+services:
+  spl:
+    network_mode: host
+    ports: !reset []
+    environment:
+      SPL_BIND: ${SPL_TAILNET_IP:?set SPL_TAILNET_IP to this machine's Tailscale IP}:${SPL_PORT:-7070}
