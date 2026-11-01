@@ -77,8 +77,10 @@ export function CompareView({
   return (
     <figure
       className={cn("mx-auto w-full", className)}
-      // Tall photos stay within the viewport: the width follows from a 72vh height cap.
-      style={{ maxWidth: `calc(72vh * ${safeRatio})` }}
+      // Tall photos stay within the viewport: the width follows from a 72vh
+      // height cap, or the --compare-max-h a parent sets (the photo page
+      // lowers it so the scopes fit beside the sliders).
+      style={{ maxWidth: `calc(var(--compare-max-h, 72vh) * ${safeRatio})` }}
     >
       <div
         ref={frame}

@@ -34,4 +34,5 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm --filter @spl/shell test
       - run: pnpm build
