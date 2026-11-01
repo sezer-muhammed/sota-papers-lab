@@ -130,6 +130,10 @@ pub struct RankVerdict {
     pub agreement: f32,
     pub reasons: String,
     pub scene: Option<String>,
+    /// One short critique per candidate, by candidate index (None when no
+    /// call wrote one).
+    #[serde(default)]
+    pub notes: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +276,7 @@ impl Claude {
                     agreement: 1.0,
                     reasons: "Only one candidate.".into(),
                     scene: None,
+                    notes: vec![None],
                 });
             }
             _ if n > LABELS.len() => {
@@ -310,12 +315,22 @@ impl Claude {
             .map(|c| c.scene.as_str())
             .find(|s| !s.is_empty())
             .map(str::to_owned);
+        let notes = (0..n)
+            .map(|c| {
+                calls
+                    .iter()
+                    .filter_map(|call| call.notes.get(&c))
+                    .find(|note| !note.is_empty())
+                    .cloned()
+            })
+            .collect();
         Ok(RankVerdict {
             order,
             winner,
             agreement,
             reasons,
             scene,
+            notes,
         })
     }
 

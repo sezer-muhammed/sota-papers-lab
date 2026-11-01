@@ -19,6 +19,10 @@ use_claude: boolean,
  */
 model: string, 
 /**
+ * `claude --effort`: "low", "medium" or "high". Lower answers sooner.
+ */
+effort: string, 
+/**
  * Claude proposes up to three looks before the search.
  */
 plan: boolean, 

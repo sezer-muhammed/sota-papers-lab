@@ -1,12 +1,26 @@
 //! The app's ops and their wire types (also the UI's TypeScript bindings).
 //! Owner: integration.
+//!
+//! Every op decodes and develops its RAW once per process (an LRU of the
+//! four most recent files, so live slider previews skip straight to the
+//! render), keeps CUDA and heavy CPU work on the blocking pool, and stores
+//! what it makes as artifacts: display-size JPEGs for people and Claude,
+//! full-resolution JPEG and TIFF, and an XMP sidecar.
+
+mod cache;
+mod export;
+mod pipeline;
+mod work;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use spl_core::{ArtifactRef, Op, Result, RunCx};
 use ts_rs::TS;
 
+use crate::render::RenderEngine;
 use crate::types::{Params, RawInfo};
+use export::{Shown, display, put_jpeg};
+use work::{Stage, Timeline, blocking, ensure_live, open_gpu, stem, unless_cancelled};
 
 fn yes() -> bool {
     true
@@ -14,6 +28,10 @@ fn yes() -> bool {
 
 fn default_model() -> String {
     "opus".into()
+}
+
+fn default_effort() -> String {
+    "medium".into()
 }
 
 fn default_evals() -> u32 {
@@ -83,6 +101,9 @@ pub struct AutoInput {
     /// `claude --model` alias: "opus", "sonnet", ...
     #[serde(default = "default_model")]
     pub model: String,
+    /// `claude --effort`: "low", "medium" or "high". Lower answers sooner.
+    #[serde(default = "default_effort")]
+    pub effort: String,
     /// Claude proposes up to three looks before the search.
     #[serde(default = "yes")]
     pub plan: bool,
@@ -215,8 +236,30 @@ impl Op for Inspect {
     type Output = InspectOutput;
 
     async fn run(&self, cx: &RunCx, input: InspectInput) -> Result<InspectOutput> {
-        let _ = (cx, input);
-        unimplemented!("raw_retouch.inspect")
+        let timeline = Timeline::new(&[(Stage::Load, 4.0), (Stage::Render, 1.0)]);
+        let gpu = open_gpu(cx).await?;
+        let loaded = unless_cancelled(
+            cx,
+            cache::developed(cx, &input.raw, &gpu, timeline.span(Stage::Load)),
+        )
+        .await?;
+        ensure_live(cx)?;
+        let info = loaded.photo.scene.info.clone();
+        let neutral = Params::neutral(info.as_shot_temperature, info.as_shot_tint).quantized();
+        let photo = loaded.photo.clone();
+        let shown = blocking(cx, timeline.span(Stage::Render), move |r| {
+            r.progress(0.0, "Rendering as shot");
+            let mut engine = RenderEngine::new(&gpu, &photo.scene)?;
+            display(&mut engine, &neutral, photo.scene.info.orientation)
+        })
+        .await?;
+        let preview = put_jpeg(cx, shown.jpeg).await?;
+        cx.progress(1.0, "Done");
+        Ok(InspectOutput {
+            info,
+            neutral,
+            preview,
+        })
     }
 }
 
@@ -231,8 +274,7 @@ impl Op for Auto {
     type Output = AutoOutput;
 
     async fn run(&self, cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
-        let _ = (cx, input);
-        unimplemented!("raw_retouch.auto")
+        pipeline::run(cx, input).await
     }
 }
 
@@ -246,7 +288,57 @@ impl Op for Render {
     type Output = RenderOutput;
 
     async fn run(&self, cx: &RunCx, input: RenderInput) -> Result<RenderOutput> {
-        let _ = (cx, input);
-        unimplemented!("raw_retouch.render")
+        let params = input.params.quantized();
+        let full = input.size == RenderSize::Full;
+        let files_wanted = full && (input.export.jpeg || input.export.tiff16 || input.export.xmp);
+        let timeline = Timeline::new(&[
+            (Stage::Load, 4.0),
+            (Stage::Render, 1.0),
+            (Stage::Export, if files_wanted { 8.0 } else { 0.0 }),
+        ]);
+        let gpu = open_gpu(cx).await?;
+        let loaded = unless_cancelled(
+            cx,
+            cache::developed(cx, &input.raw, &gpu, timeline.span(Stage::Load)),
+        )
+        .await?;
+        ensure_live(cx)?;
+        let photo = loaded.photo.clone();
+        let preview_gpu = gpu.clone();
+        let Shown { upright, jpeg } = blocking(cx, timeline.span(Stage::Render), move |r| {
+            r.progress(0.0, "Rendering the preview");
+            let mut engine = RenderEngine::new(&preview_gpu, &photo.scene)?;
+            display(&mut engine, &params, photo.scene.info.orientation)
+        })
+        .await?;
+        let preview = put_jpeg(cx, jpeg).await?;
+        let stem = stem(input.filename.as_deref());
+        let (mut width, mut height) = (upright.width as u32, upright.height as u32);
+        let mut files = export::Files::default();
+        if files_wanted {
+            ensure_live(cx)?;
+            files = export::export(
+                cx,
+                &gpu,
+                &loaded.photo,
+                &params,
+                &input.export,
+                timeline.span(Stage::Export),
+            )
+            .await?;
+            if let (Some(_), Some((w, h))) = (&files.jpeg, files.size) {
+                (width, height) = (w, h);
+            }
+        }
+        cx.progress(1.0, "Done");
+        Ok(RenderOutput {
+            preview,
+            jpeg: files.jpeg,
+            tiff: files.tiff,
+            xmp: files.xmp,
+            stem,
+            width,
+            height,
+        })
     }
 }

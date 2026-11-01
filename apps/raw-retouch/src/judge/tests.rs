@@ -770,6 +770,74 @@ mod fake_cli {
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
     }
 
+    /// A stand-in that answers `output` only once `calls` CLI processes are
+    /// running at the same time (each marks its start with a file of its
+    /// own), and fails after 5 s otherwise.
+    fn together(dir: &Path, calls: usize, output: &Value) -> PathBuf {
+        let behaviour = [
+            r#"touch "$d/started.$$""#.to_owned(),
+            "i=0".to_owned(),
+            format!(
+                r#"while [ "$(ls "$d" | grep -c '^started\.')" -lt {calls} ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done"#
+            ),
+            format!(
+                r#"if [ "$(ls "$d" | grep -c '^started\.')" -lt {calls} ]; then echo 'ran alone' >&2; exit 1; fi"#
+            ),
+            "cat <<'EOF'".to_owned(),
+            result_line(output, 0.1),
+            "EOF".to_owned(),
+        ]
+        .join("\n");
+        fake(dir, &behaviour)
+    }
+
+    #[tokio::test]
+    async fn rank_asks_both_orders_at_once_and_keeps_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = json!({
+            "notes": [
+                {"label": "A", "note": "note A"},
+                {"label": "B", "note": "note B"},
+                {"label": "C", "note": ""},
+            ],
+            "ranking": ["B", "A", "C"],
+            "reasons": "The middle one.",
+            "scene": "A test card.",
+        });
+        let claude = Claude::with_bin(together(dir.path(), 2, &output), options(None, 30));
+        let images = [flat_image(10), flat_image(20), flat_image(30)];
+        let verdict = claude.rank(&brief(), &images).await.unwrap();
+        // Shown A, B, C = 0, 1, 2 and then 2, 1, 0: B (1) wins both orders.
+        assert_eq!(verdict.order, [1, 0, 2]);
+        assert_eq!((verdict.winner, verdict.agreement), (1, 1.0));
+        // An empty note gives way to the other order's note on that candidate.
+        assert_eq!(
+            verdict.notes,
+            [
+                Some("note A".to_owned()),
+                Some("note B".to_owned()),
+                Some("note A".to_owned())
+            ]
+        );
+        assert_eq!(verdict.scene.as_deref(), Some("A test card."));
+        assert_eq!(claude.usage().calls, 2);
+    }
+
+    #[tokio::test]
+    async fn compare_asks_both_orders_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = json!({"assessment": "The brighter version.", "better": "B"});
+        let claude = Claude::with_bin(together(dir.path(), 2, &output), options(None, 30));
+        let verdict = claude
+            .compare(&brief(), &flat_image(1), &flat_image(2))
+            .await
+            .unwrap();
+        // "B" in both orders: b once, a once.
+        assert_eq!((verdict.votes, verdict.votes_for_b), (2, 1));
+        assert!(!verdict.prefer_b);
+        assert_eq!(claude.usage().calls, 2);
+    }
+
     #[tokio::test]
     async fn a_hung_cli_is_killed_at_the_timeout() {
         let dir = tempfile::tempdir().unwrap();
