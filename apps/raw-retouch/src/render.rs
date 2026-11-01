@@ -220,7 +220,7 @@ impl Preview {
         // SAFETY: arguments match `prep_kernel` in cuda/render.cu; buffers hold
         // n pixels (the aux plane only when written).
         unsafe { b.launch(cfg) }.cuda("prep_kernel")?;
-        let pres = presence::preview_planes(gpu, &px, img.width, img.height)?;
+        let pres = presence::preview_planes(gpu, &px, img.width, img.height, y_row)?;
         Ok(Self {
             width: img.width,
             height: img.height,
