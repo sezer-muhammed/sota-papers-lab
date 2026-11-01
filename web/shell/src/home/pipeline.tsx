@@ -31,7 +31,7 @@ const STEPS = [
   },
   {
     title: "Export",
-    body: "A full-resolution JPEG, a 16-bit TIFF if you want one, and an XMP sidecar with every setting under its Lightroom name.",
+    body: "A full-resolution JPEG and PNG (8- or 16-bit), a 16-bit TIFF if you want one, and an XMP sidecar with every setting under its Lightroom name.",
     number: "1.1–3.1 s",
   },
 ];
