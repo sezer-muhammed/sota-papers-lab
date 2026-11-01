@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Usage: gs-oracle <op> in.npz out.npz | batch DIR | check <op> in.npz out.npz
+#        | compare a.npz b.npz | example <op> out.npz | selftest [--json f] | list
+# gsplat reference ops for kernel tests. Schemas: benchmarks/image-to-3d/ORACLE.md
+exec "$(dirname "$(realpath "$0")")/gs-ref" --entry /opt/spl-bench/oracle.py "$@"
