@@ -4,10 +4,13 @@
 //! is linear in its own units.
 //!
 //! The cube's dimensions are a chosen set of [`Params`] fields: by default
-//! those [`PARAM_SPECS`] marks `searched` (the Basic panel today), or whole
-//! groups ([`Space::with_groups`]). Every other field is held where the box
-//! fixes it (`lo`, which equals `hi` there).
+//! those [`PARAM_SPECS`] marks `searched` (all but Detail and Lens), whole
+//! groups ([`Space::with_groups`]), or one search stage's fields with the
+//! rest held at a given point ([`Space::fixing`]). Every other field is
+//! held where the box fixes it (`lo`, which equals `hi` there), and a
+//! field the box fixes is never a dimension.
 
+use super::priors::{FIRST, PRIORS};
 use crate::types::{LinearImage, PARAM_SPECS, ParamGroup, ParamSpec, Params};
 
 #[derive(Debug, Clone)]
@@ -35,12 +38,53 @@ impl Space {
     }
 
     /// The box over every field of `groups`.
-    #[allow(dead_code)]
     pub(crate) fn with_groups(lo: Params, hi: Params, groups: &[ParamGroup]) -> Self {
         Self::with_dims(lo, hi, ParamSpec::indices_of(groups))
     }
 
+    /// The box over the fields `dims` (indices into [`Params::to_array`])
+    /// with every other field fixed at `at`, clamped into this box: one
+    /// search stage around a point.
+    pub(crate) fn fixing(&self, dims: &[usize], at: &Params) -> Self {
+        let at = self.clamp(at).to_array();
+        let (mut lo, mut hi) = (self.lo.to_array(), self.hi.to_array());
+        for i in (0..Params::COUNT).filter(|i| !dims.contains(i)) {
+            lo[i] = at[i];
+            hi[i] = at[i];
+        }
+        Self::with_dims(
+            Params::from_array(lo),
+            Params::from_array(hi),
+            dims.to_vec(),
+        )
+    }
+
+    /// This box narrowed, for every field with an expert prior, to `stds`
+    /// of its standard deviation around `at` (on Lightroom's whole-unit
+    /// grid): the prior's trust region. In such a box one unit of the cube
+    /// is about as far, in prior cost, along every new setting, so CMA-ES's
+    /// round step size suits them all, and no evaluation goes to settings
+    /// the prior would reject anyway.
+    pub(crate) fn around(&self, at: &Params, stds: f32) -> Self {
+        let at = self.clamp(at).to_array();
+        let (mut lo, mut hi) = (self.lo.to_array(), self.hi.to_array());
+        for (k, prior) in PRIORS.iter().enumerate() {
+            let i = FIRST + k;
+            let reach = stds * prior.std;
+            lo[i] = lo[i].max((at[i] - reach).ceil()).min(at[i].max(lo[i]));
+            hi[i] = hi[i].min((at[i] + reach).floor()).max(at[i].min(hi[i]));
+        }
+        Self::with_dims(
+            Params::from_array(lo),
+            Params::from_array(hi),
+            self.dims.clone(),
+        )
+    }
+
+    /// The box over the fields `dims`, less those it fixes (`lo == hi`).
     fn with_dims(lo: Params, hi: Params, mut dims: Vec<usize>) -> Self {
+        let (l, h) = (lo.to_array(), hi.to_array());
+        dims.retain(|&i| i < Params::COUNT && l[i] < h[i]);
         dims.sort_unstable();
         dims.dedup();
         Self {

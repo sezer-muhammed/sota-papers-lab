@@ -22,7 +22,7 @@ use std::time::Instant;
 use rawler::decoders::RawDecodeParams;
 use rawler::rawsource::RawSource;
 
-use super::{Candidate, SearchConfig, evaluate, run, warm_shift};
+use super::{Candidate, Hues, SearchConfig, evaluate, hues, priors, run, warm_shift};
 use crate::auto::auto_params;
 use crate::decode::decode;
 use crate::develop::develop_scene;
@@ -235,7 +235,7 @@ fn tune_every_sample() {
     let round = env_or("SPL_TUNE_ROUND", "latest");
     let out = PathBuf::from(env_or("SPL_TUNE_OUT", "/out/tune")).join(&round);
     std::fs::create_dir_all(&out).expect("create output directory");
-    let evals: usize = env_or("SPL_TUNE_EVALS", "1500")
+    let evals: usize = env_or("SPL_TUNE_EVALS", "2000")
         .parse()
         .expect("SPL_TUNE_EVALS");
     let cfg = SearchConfig {
@@ -315,6 +315,7 @@ fn tune_one(gpu: &Gpu, path: &Path, cfg: &SearchConfig, out: &Path) -> Row {
         "   decode {decode_ms:.0} ms, develop {develop_ms:.0} ms, engine {engine_ms:.0} ms | search {search_ms:.0} ms, {} evaluations, {rate:.0} evals/s",
         result.evaluations
     );
+    println!("   colours {}", colours(&Hues::of(&scene)));
     if let (Some((_, _, ev)), Some(m)) = (calibration, measured) {
         println!("   camera  {} | neutral matches at {ev:+.2} EV", m.line());
     } else {
@@ -366,6 +367,7 @@ fn tune_one(gpu: &Gpu, path: &Path, cfg: &SearchConfig, out: &Path) -> Row {
         renders.push(img);
         describe(&mut txt, c, as_shot);
         println!("   {}", one_line(c, as_shot));
+        println!("   {:14}   + {}", "", settings(&c.params));
     }
     // Renders: neutral, auto, then the looks in order (natural first).
     let natural_at = 2;
@@ -614,6 +616,48 @@ fn sliders(p: &Params, as_shot: (f32, f32)) -> String {
     )
 }
 
+/// The settings beyond the Basic panel that are not zero, with short names.
+fn settings(p: &Params) -> String {
+    let a = p.to_array();
+    let short = |name: &str| {
+        name.replace("curve_", "curve.")
+            .replace("saturation_", "sat.")
+            .replace("luminance_", "lum.")
+            .replace("hue_", "hue.")
+            .replace("_primary_saturation", "P.sat")
+            .replace("_primary_hue", "P.hue")
+    };
+    let parts: Vec<String> = (Params::BASIC..priors::END)
+        .filter(|&i| a[i] != 0.0)
+        .map(|i| format!("{} {:+.0}", short(Params::NAMES[i]), a[i]))
+        .collect();
+    if parts.is_empty() {
+        "no other settings".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// The colour profile: each band's share (and colourfulness) and skin.
+fn colours(h: &Hues) -> String {
+    const NAMES: [&str; hues::BANDS] = [
+        "red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta",
+    ];
+    let bands: Vec<String> = (0..hues::BANDS)
+        .filter(|&b| h.mass[b] >= 0.005)
+        .map(|b| {
+            let searched = if h.searched(b) { "" } else { " (fixed)" };
+            format!(
+                "{} {:.1}% C/L {:.2}{searched}",
+                NAMES[b],
+                100.0 * h.mass[b],
+                h.chroma[b]
+            )
+        })
+        .collect();
+    format!("{} | skin {:.1}%", bands.join(", "), 100.0 * h.skin)
+}
+
 fn stats_line(s: &Stats) -> String {
     format!(
         "p01 {:.3} p05 {:.3} p50 {:.3} p95 {:.3} p99 {:.3} mean {:.3} | hi {:.4} new {:.4} lo {:.4} | col {:.1} C95 {:.3} oog {:.4} cast {:+.4} {:+.4} | struct {:.3} lc {:.4}",
@@ -666,6 +710,7 @@ fn describe(txt: &mut String, c: &Candidate, as_shot: (f32, f32)) {
     );
     let _ = writeln!(txt, "  params {:?}", c.params);
     let _ = writeln!(txt, "  {}", sliders(&c.params, as_shot));
+    let _ = writeln!(txt, "  {}", settings(&c.params));
     let _ = writeln!(txt, "  {}", stats_line(&c.stats));
     let terms: Vec<String> = c
         .score

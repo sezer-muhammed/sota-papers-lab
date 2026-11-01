@@ -3,12 +3,19 @@
 //! space) plus a few colour numbers; the "render" is a tone pipeline that
 //! reacts to every slider the way a real one does (exposure shifts the
 //! percentiles, highlights pull the top and the clipping down, saturation
-//! raises chroma and gamut excursions, white balance moves the cast) and
-//! costs microseconds.
+//! raises chroma and gamut excursions, white balance moves the cast, the
+//! tone curve bends its region, clarity and texture raise local contrast,
+//! dehaze deepens the blacks, a band's saturation raises chroma by the
+//! band's share of the image) and costs microseconds.
 
 use spl_core::Result;
 
-use super::{Evaluator, warm_shift};
+use super::hues::BANDS;
+use super::priors::{
+    BLUE_SAT, CLARITY, CURVE_DARKS, CURVE_HIGHLIGHTS, CURVE_LIGHTS, CURVE_SHADOWS, DEHAZE,
+    GREEN_SAT, LUM, RED_SAT, SAT, TEXTURE,
+};
+use super::{Evaluator, Hues, warm_shift};
 use crate::color::ColorModel;
 use crate::objective::smoothstep;
 use crate::types::{LinearImage, Params, RawInfo, Scene, Stats};
@@ -25,6 +32,10 @@ pub(crate) struct Synthetic {
     raw_clipped: f32,
     chroma: f32,
     cast: (f32, f32),
+    /// Coloured samples: linear Rec.2020 tints (luminance 1) by sample index.
+    tints: Vec<Option<[f32; 3]>>,
+    /// The colour profile the scene's search image measures.
+    hues: Hues,
     /// Fail every call after this many (None = never), to test error paths.
     pub(crate) fail_after: Option<usize>,
     /// Return NaN stats for parameter sets with exposure above this.
@@ -52,6 +63,8 @@ impl Synthetic {
             raw_clipped,
             chroma,
             cast,
+            tints: vec![None; SAMPLES],
+            hues: Hues::default(),
             fail_after: None,
             nan_above: None,
             calls: 0,
@@ -64,11 +77,51 @@ impl Synthetic {
         Self::new(0.07, 0.95, 0.05, (0.002, 0.006))
     }
 
-    /// A scene whose search image holds these luminances as grey pixels, so
-    /// `bounds` reads the same key this stand-in renders.
+    /// Daylight with colour: a blue sky in the bright quarter (below the
+    /// clipped samples), foliage in the dark third and some skin between.
+    pub(crate) fn colourful() -> Self {
+        Self::daylight().with_tints(&[
+            (44..58, [0.55, 1.05, 2.4]),
+            (0..18, [0.7, 1.25, 0.35]),
+            (26..34, [1.9, 0.75, 0.5]),
+        ])
+    }
+
+    /// The samples in each range tinted (a linear Rec.2020 colour scaled to
+    /// the sample's luminance), so the scene's image holds those colours.
+    pub(crate) fn with_tints(mut self, tints: &[(std::ops::Range<usize>, [f32; 3])]) -> Self {
+        for (range, rgb) in tints {
+            let y = 0.2627 * rgb[0] + 0.678 * rgb[1] + 0.0593 * rgb[2];
+            for i in range.clone() {
+                self.tints[i] = Some(rgb.map(|c| c / y));
+            }
+        }
+        self.hues = Hues::of(&self.scene());
+        self
+    }
+
+    /// A scene whose search image holds these luminances (grey or tinted
+    /// pixels), so `bounds` reads the same key this stand-in renders.
     pub(crate) fn scene(&self) -> Scene {
-        let data = self.lum.iter().flat_map(|v| [*v; 3]).collect();
         let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let color = ColorModel::new(identity, None);
+        let m = color.rec2020_from_cam(self.as_shot_temperature);
+        let cam_from =
+            crate::color::invert(&m.map(|r| r.map(f64::from))).expect("invertible camera matrix");
+        let data = self
+            .lum
+            .iter()
+            .zip(&self.tints)
+            .flat_map(|(v, tint)| match tint {
+                None => [*v; 3],
+                Some(rgb) => {
+                    let rgb = rgb.map(|c| f64::from(c * *v));
+                    let cam: [f64; 3] =
+                        std::array::from_fn(|r| (0..3).map(|c| cam_from[r][c] * rgb[c]).sum());
+                    cam.map(|c| (c as f32).clamp(0.0, 0.97))
+                }
+            })
+            .collect();
         Scene {
             info: RawInfo {
                 make: "Sony".into(),
@@ -86,7 +139,7 @@ impl Synthetic {
                 as_shot_tint: self.as_shot_tint,
                 raw_clipped_fraction: self.raw_clipped,
             },
-            color: ColorModel::new(identity, None),
+            color,
             wb_as_shot: [2.0, 1.0, 1.6],
             search: LinearImage {
                 width: 8,
@@ -113,6 +166,19 @@ impl Synthetic {
             p.blacks / 100.0,
             p.contrast / 100.0,
         );
+        let a = p.to_array();
+        let curve = [
+            a[CURVE_SHADOWS],
+            a[CURVE_DARKS],
+            a[CURVE_LIGHTS],
+            a[CURVE_HIGHLIGHTS],
+        ]
+        .map(|v| v / 100.0);
+        let dehaze = a[DEHAZE] / 100.0;
+        // Band luminance moves the mean by each band's share.
+        let band_lum: f32 = (0..BANDS)
+            .map(|k| self.hues.mass[k] * a[LUM + k] / 100.0)
+            .sum();
         let tone = |lum: f32| {
             let y = lum * gain;
             let t = (y * (1.0 + y / white2) / (1.0 + y)).min(1.0);
@@ -122,6 +188,13 @@ impl Synthetic {
             v += w * 0.12 * smoothstep(0.6, 1.0, v);
             v += b * 0.08 * (1.0 - smoothstep(0.0, 0.3, v));
             v = 0.45 + (v - 0.45) * (1.0 + 0.4 * c);
+            // Tone curve regions: a bump over each quarter of the range.
+            for (r, amount) in curve.iter().enumerate() {
+                let centre = 0.125 + 0.25 * r as f32;
+                v += amount * 0.08 * (1.0 - ((v - centre) / 0.25).abs()).max(0.0);
+            }
+            v -= dehaze * 0.08 * (1.0 - smoothstep(0.0, 0.5, v));
+            v += 0.1 * band_lum;
             v.clamp(0.0, 1.0)
         };
         let out: Vec<(f32, bool)> = self.lum.iter().map(|l| (tone(*l), *l >= 1.0)).collect();
@@ -143,7 +216,14 @@ impl Synthetic {
         let saturation = 1.0 + p.saturation / 100.0;
         let room = (1.0 - self.chroma / 0.2).clamp(0.0, 1.0);
         let lightness = (mean / 0.4).clamp(0.05, 2.0);
-        let common = saturation * (1.0 + 0.15 * c) * lightness;
+        let bands: f32 = (0..BANDS)
+            .map(|k| self.hues.mass[k] * a[SAT + k] / 100.0)
+            .sum();
+        let calibration = 0.004 * a[BLUE_SAT] + 0.002 * (a[RED_SAT] + a[GREEN_SAT]);
+        let common = saturation
+            * (1.0 + 0.15 * c + 0.15 * dehaze)
+            * (1.0 + bands + calibration).max(0.1)
+            * lightness;
         let chroma_mean = self.chroma * common * (1.0 + 0.6 * vibrance * room);
         let chroma_p95 = 2.4 * self.chroma * common * (1.0 + 0.25 * vibrance);
 
@@ -189,7 +269,9 @@ impl Synthetic {
             cast_a: self.cast.0 + 0.0006 * (p.tint - self.as_shot_tint),
             cast_b: self.cast.1 + 0.0005 * warm_shift(self.as_shot_temperature, p.temperature),
             structure: structure.clamp(0.0, 1.0),
-            local_contrast: 0.3 * std * (1.0 + 0.25 * c),
+            local_contrast: 0.3
+                * std
+                * (1.0 + 0.25 * c + 0.4 * a[CLARITY] / 100.0 + 0.2 * a[TEXTURE] / 100.0).max(0.1),
             entropy,
         }
     }

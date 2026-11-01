@@ -7,9 +7,24 @@
 //! boost and white balance stays as shot unless the cast is strong. Auto
 //! seeds the search, centres its over-editing penalty and is always among
 //! the finalists, so it aims to be safe rather than bold.
+//!
+//! Beyond the Basic panel: the parametric Tone Curve stays flat (the Basic
+//! sliders already shape tone); Texture and Clarity get the small positive
+//! values experts use (PPR10K: Clarity +5, Texture +1 to +3), Clarity more
+//! on flat, low-contrast scenes and both less at high ISO, where they lift
+//! noise; Dehaze only on a scene the statistics call hazy (raised black
+//! point, compressed range, little local contrast). The Color Mixer gets
+//! the experts' skin move (orange a little less saturated and lighter),
+//! scaled by how much skin-like colour the photo holds and smaller than
+//! theirs; Calibration stays at zero. Detail and Lens Corrections come from
+//! the file's metadata (`finish`), not from here.
 
-use crate::objective::{adapted_p50, darkness, luma_quantile, noise_factor, smoothstep};
-use crate::search::{bounds, clamp_params, sane_temperature, warmed};
+use crate::objective::{
+    SceneContext, adapted_p50, darkness, luma_quantile, noise_factor, smoothstep,
+};
+use crate::search::hues::ORANGE;
+use crate::search::priors::{CLARITY, DEHAZE, LUM, SAT, TEXTURE};
+use crate::search::{Hues, bounds, clamp_params, sane_temperature, warmed};
 use crate::types::{Params, Scene, Stats};
 
 /// Median luma auto aims for, about where Lightroom Auto lands.
@@ -69,17 +84,60 @@ const CAST_TOL_COOL: f32 = 0.015;
 const MIRED_PER_CAST_B: f32 = 2000.0;
 const TINT_PER_CAST_A: f32 = 1500.0;
 const WB_SHARE: f32 = 0.5;
+/// Clarity on every photo, plus up to this much more on a flat one: local
+/// contrast (`Stats::local_contrast` of the neutral render) from the first
+/// value (ordinary) down to the second (flat).
+const CLARITY_BASE: f32 = 5.0;
+const CLARITY_FLAT: f32 = 10.0;
+const FLAT_LOCAL: (f32, f32) = (0.05, 0.015);
+/// Texture on a clean file.
+const TEXTURE_BASE: f32 = 4.0;
+/// Share of Clarity kept at full noise (ISO 6400 and up); Texture keeps none.
+const CLARITY_NOISY: f32 = 0.5;
+/// Dehaze at full haze. Haze needs all three: a raised black point (p01),
+/// a compressed range (p95 - p05) and little local contrast.
+const DEHAZE_MAX: f32 = 25.0;
+const HAZE_P01: (f32, f32) = (0.10, 0.22);
+const HAZE_SPREAD: (f32, f32) = (0.62, 0.42);
+const HAZE_LOCAL: (f32, f32) = (0.035, 0.015);
+/// The skin move at full skin presence: Orange Saturation and Luminance
+/// (PPR10K's experts: -5 to -15 and +7 to +33).
+const SKIN_SATURATION: f32 = -5.0;
+const SKIN_LUMINANCE: f32 = 8.0;
 
 /// Auto for this photo, inside its search box.
 pub fn auto_params(neutral: &Stats, scene: &Scene) -> Params {
-    let guess = auto_from_stats(
-        neutral,
-        scene.info.as_shot_temperature,
-        scene.info.as_shot_tint,
-        scene.info.iso,
+    let guess = with_colour(
+        auto_from_stats(
+            neutral,
+            scene.info.as_shot_temperature,
+            scene.info.as_shot_tint,
+            scene.info.iso,
+        ),
+        &Hues::of(scene),
     );
     let (lo, hi) = bounds(scene);
     clamp_params(&guess, &lo, &hi)
+}
+
+/// Auto as the objective sees it: [`auto_from_stats`] plus the colour moves
+/// the photo's colours call for, not clamped to the search box.
+pub fn auto_from_context(cx: &SceneContext) -> Params {
+    with_colour(
+        auto_from_stats(&cx.neutral, cx.as_shot_temperature, cx.as_shot_tint, cx.iso),
+        &cx.hues,
+    )
+}
+
+/// `p` with the Color Mixer's skin move for these colours, and nothing in
+/// the bands the photo does not hold.
+fn with_colour(p: Params, hues: &Hues) -> Params {
+    let mut a = p.to_array();
+    let skin = hues.skin_presence();
+    a[SAT + ORANGE] = SKIN_SATURATION * skin;
+    a[LUM + ORANGE] = SKIN_LUMINANCE * skin;
+    hues.fix(&mut a);
+    legal(Params::from_array(a))
 }
 
 /// Auto from the neutral render's stats and the as-shot white balance,
@@ -155,6 +213,21 @@ pub fn auto_from_stats(
     let temperature = warmed(as_shot_temperature, -WB_SHARE * MIRED_PER_CAST_B * excess_b);
     let tint = as_shot_tint - WB_SHARE * TINT_PER_CAST_A * excess_a;
 
+    // Presence: mild clarity and texture, more clarity on flat scenes, less
+    // of both on noisy files; dehaze only on hazy scenes.
+    let local = or(neutral.local_contrast, 0.04);
+    let flat = smoothstep(FLAT_LOCAL.0, FLAT_LOCAL.1, local);
+    let clarity = (CLARITY_BASE + CLARITY_FLAT * flat) * (1.0 - (1.0 - CLARITY_NOISY) * noise);
+    let texture = TEXTURE_BASE * (1.0 - noise);
+    let haze = smoothstep(HAZE_P01.0, HAZE_P01.1, p01)
+        * smoothstep(HAZE_SPREAD.0, HAZE_SPREAD.1, spread)
+        * smoothstep(HAZE_LOCAL.0, HAZE_LOCAL.1, local);
+    let mut a = Params::neutral(temperature, tint).to_array();
+    a[TEXTURE] = texture;
+    a[CLARITY] = clarity;
+    a[DEHAZE] = DEHAZE_MAX * haze;
+    let rest = Params::from_array(a);
+
     legal(Params {
         temperature,
         tint,
@@ -166,7 +239,7 @@ pub fn auto_from_stats(
         blacks,
         vibrance,
         saturation,
-        ..Params::neutral(temperature, tint)
+        ..rest
     })
 }
 
@@ -319,5 +392,72 @@ mod tests {
         assert_eq!(p, legal(p));
         let black = auto(&Stats::default());
         assert!(black.exposure > 0.0 && black.exposure <= 5.0);
+    }
+
+    #[test]
+    fn presence_is_mild_crisper_on_flat_scenes_and_dehazes_only_haze() {
+        let mut ordinary = stats(0.03, 0.08, 0.44, 0.85, 0.93);
+        ordinary.local_contrast = 0.06;
+        let o = auto(&ordinary);
+        assert_eq!((o.texture, o.clarity, o.dehaze), (4.0, 5.0, 0.0));
+        assert_eq!(
+            (
+                o.curve_shadows,
+                o.curve_darks,
+                o.curve_lights,
+                o.curve_highlights
+            ),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+        // Flat but not hazy (deep blacks): more clarity, no dehaze.
+        let mut flat = ordinary.clone();
+        flat.local_contrast = 0.012;
+        let f = auto(&flat);
+        assert!(f.clarity >= 14.0 && f.dehaze == 0.0, "{f:?}");
+        // Fog: raised black point, compressed range, little local contrast.
+        let mut fog = stats(0.25, 0.3, 0.5, 0.7, 0.75);
+        fog.local_contrast = 0.01;
+        let g = auto(&fog);
+        assert!(g.dehaze > 20.0 && g.dehaze <= 25.0, "{g:?}");
+        // High ISO: texture off, clarity halved.
+        let noisy = auto_from_stats(&ordinary, 5200.0, 8.0, Some(12800));
+        assert_eq!((noisy.texture, noisy.clarity), (0.0, 2.5));
+        // Calibration and the Color Mixer stay at zero without colour facts.
+        let a = o.to_array();
+        assert!((crate::search::priors::HUE..crate::search::priors::END).all(|i| a[i] == 0.0));
+    }
+
+    #[test]
+    fn skin_gets_the_experts_gentle_move_only_where_it_is() {
+        use crate::search::hues::BANDS;
+        let mut hues = Hues {
+            mass: [0.0, 0.12, 0.03, 0.2, 0.0, 0.25, 0.0, 0.0],
+            chroma: [0.15; BANDS],
+            skin: 0.08,
+            skin_bands: [0.2, 0.7, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        let cx = |hues: Hues| SceneContext {
+            as_shot_temperature: 5200.0,
+            as_shot_tint: 8.0,
+            neutral: stats(0.03, 0.08, 0.44, 0.85, 0.93),
+            raw_clipped_fraction: 0.0,
+            iso: Some(200),
+            hues,
+        };
+        let portrait = auto_from_context(&cx(hues));
+        assert_eq!(
+            (portrait.saturation_orange, portrait.luminance_orange),
+            (-5.0, 8.0)
+        );
+        assert_eq!(portrait.hue_orange, 0.0);
+        assert_eq!(portrait.blue_primary_saturation, 0.0);
+        // The Basic panel is auto_from_stats's.
+        let basic = auto_from_stats(&cx(hues).neutral, 5200.0, 8.0, Some(200));
+        assert_eq!(portrait.basic(), basic.basic());
+        // A landscape without skin gets no colour move at all.
+        hues.skin = 0.0;
+        hues.mass[1] = 0.0;
+        let land = auto_from_context(&cx(hues));
+        assert_eq!((land.saturation_orange, land.luminance_orange), (0.0, 0.0));
     }
 }

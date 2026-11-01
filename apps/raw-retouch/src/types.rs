@@ -317,13 +317,14 @@ pub const PARAM_SPECS: [ParamSpec; Params::COUNT] = [
         "Highlights",
         "ParametricHighlights",
         ToneCurve,
-    ),
-    ParamSpec::slider("curve_lights", "Lights", "ParametricLights", ToneCurve),
-    ParamSpec::slider("curve_darks", "Darks", "ParametricDarks", ToneCurve),
-    ParamSpec::slider("curve_shadows", "Shadows", "ParametricShadows", ToneCurve),
-    ParamSpec::slider("texture", "Texture", "Texture", Presence),
-    ParamSpec::slider("clarity", "Clarity", "Clarity2012", Presence),
-    ParamSpec::slider("dehaze", "Dehaze", "Dehaze", Presence),
+    )
+    .searched(),
+    ParamSpec::slider("curve_lights", "Lights", "ParametricLights", ToneCurve).searched(),
+    ParamSpec::slider("curve_darks", "Darks", "ParametricDarks", ToneCurve).searched(),
+    ParamSpec::slider("curve_shadows", "Shadows", "ParametricShadows", ToneCurve).searched(),
+    ParamSpec::slider("texture", "Texture", "Texture", Presence).searched(),
+    ParamSpec::slider("clarity", "Clarity", "Clarity2012", Presence).searched(),
+    ParamSpec::slider("dehaze", "Dehaze", "Dehaze", Presence).searched(),
     ParamSpec::slider("hue_red", "Red Hue", "HueAdjustmentRed", ColorMixer),
     ParamSpec::slider(
         "hue_orange",
@@ -357,97 +358,113 @@ pub const PARAM_SPECS: [ParamSpec; Params::COUNT] = [
         "Red Saturation",
         "SaturationAdjustmentRed",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "saturation_orange",
         "Orange Saturation",
         "SaturationAdjustmentOrange",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "saturation_yellow",
         "Yellow Saturation",
         "SaturationAdjustmentYellow",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "saturation_green",
         "Green Saturation",
         "SaturationAdjustmentGreen",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "saturation_aqua",
         "Aqua Saturation",
         "SaturationAdjustmentAqua",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "saturation_blue",
         "Blue Saturation",
         "SaturationAdjustmentBlue",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "saturation_purple",
         "Purple Saturation",
         "SaturationAdjustmentPurple",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "saturation_magenta",
         "Magenta Saturation",
         "SaturationAdjustmentMagenta",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "luminance_red",
         "Red Luminance",
         "LuminanceAdjustmentRed",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "luminance_orange",
         "Orange Luminance",
         "LuminanceAdjustmentOrange",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "luminance_yellow",
         "Yellow Luminance",
         "LuminanceAdjustmentYellow",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "luminance_green",
         "Green Luminance",
         "LuminanceAdjustmentGreen",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "luminance_aqua",
         "Aqua Luminance",
         "LuminanceAdjustmentAqua",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "luminance_blue",
         "Blue Luminance",
         "LuminanceAdjustmentBlue",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "luminance_purple",
         "Purple Luminance",
         "LuminanceAdjustmentPurple",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "luminance_magenta",
         "Magenta Luminance",
         "LuminanceAdjustmentMagenta",
         ColorMixer,
-    ),
+    )
+    .searched(),
     ParamSpec::slider("shadow_tint", "Shadows Tint", "ShadowTint", Calibration),
     ParamSpec::slider("red_primary_hue", "Red Primary Hue", "RedHue", Calibration),
     ParamSpec::slider(
@@ -455,7 +472,8 @@ pub const PARAM_SPECS: [ParamSpec; Params::COUNT] = [
         "Red Primary Saturation",
         "RedSaturation",
         Calibration,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "green_primary_hue",
         "Green Primary Hue",
@@ -467,7 +485,8 @@ pub const PARAM_SPECS: [ParamSpec; Params::COUNT] = [
         "Green Primary Saturation",
         "GreenSaturation",
         Calibration,
-    ),
+    )
+    .searched(),
     ParamSpec::slider(
         "blue_primary_hue",
         "Blue Primary Hue",
@@ -479,7 +498,8 @@ pub const PARAM_SPECS: [ParamSpec; Params::COUNT] = [
         "Blue Primary Saturation",
         "BlueSaturation",
         Calibration,
-    ),
+    )
+    .searched(),
     ParamSpec::slider("sharpening", "Sharpening", "Sharpness", Detail)
         .range(0.0, 150.0, 1.0)
         .default(Some(40.0)),
@@ -592,8 +612,10 @@ param_arrays!(
 impl Params {
     /// Every field.
     pub const COUNT: usize = 56;
-    /// The Basic panel: the first `BASIC` fields, the ones the search
-    /// varies today and Claude plans and adjusts.
+    /// The Basic panel: the first `BASIC` fields, the ones Claude plans and
+    /// adjusts. The search varies these and every other field
+    /// [`PARAM_SPECS`] marks `searched`: the Tone Curve, Presence, the Color
+    /// Mixer's saturation and luminance and the primaries' saturation.
     pub const BASIC: usize = 10;
     /// Field names in [`PARAM_SPECS`] order; the first [`Params::BASIC`]
     /// are the Basic panel.
