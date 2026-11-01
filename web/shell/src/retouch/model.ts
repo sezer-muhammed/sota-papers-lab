@@ -6,7 +6,7 @@ import type { InspectOutput } from "@spl/bindings/raw-retouch/InspectOutput";
 import type { Params } from "@spl/bindings/raw-retouch/Params";
 import type { RawInfo } from "@spl/bindings/raw-retouch/RawInfo";
 import type { RenderOutput } from "@spl/bindings/raw-retouch/RenderOutput";
-import { PARAM_KEYS, safeFileName, stemOf } from "./format";
+import { BASIC_KEYS, completeParams, safeFileName, stemOf } from "./format";
 import type { RetouchOptions } from "./options";
 
 /* One photo's journey: upload → inspect (metadata and a neutral preview) →
@@ -224,14 +224,16 @@ function isRef(value: unknown): boolean {
   return isObject(value) && typeof value.id === "string";
 }
 
+/** Params with at least the Basic panel. Runs recorded before the other
+    panels existed lack them; `completeParams` fills in Lightroom's defaults. */
 export function isParams(value: unknown): value is Params {
-  return isObject(value) && PARAM_KEYS.every((key) => typeof value[key] === "number");
+  return isObject(value) && BASIC_KEYS.every((key) => typeof value[key] === "number");
 }
 
 export function asInspectOutput(value: unknown): InspectOutput | undefined {
-  return isObject(value) && isObject(value.info) && isParams(value.neutral) && isRef(value.preview)
-    ? (value as InspectOutput)
-    : undefined;
+  if (!isObject(value) || !isObject(value.info) || !isParams(value.neutral) || !isRef(value.preview)) return undefined;
+  const output = value as InspectOutput;
+  return { ...output, neutral: completeParams(output.neutral) };
 }
 
 function isCandidate(value: unknown): value is CandidateSummary {
@@ -261,7 +263,8 @@ export function asAutoOutput(value: unknown): AutoOutput | undefined {
   const output = value as AutoOutput;
   return {
     ...output,
-    candidates: output.candidates.filter(isCandidate),
+    params: completeParams(output.params),
+    candidates: output.candidates.filter(isCandidate).map((c) => ({ ...c, params: completeParams(c.params) })),
     judge: isObject(output.judge) ? output.judge : null,
     timings: isObject(output.timings) ? output.timings : { decode_ms: 0, develop_ms: 0, search_ms: 0, judge_ms: 0, export_ms: 0, total_ms: 0 },
   };

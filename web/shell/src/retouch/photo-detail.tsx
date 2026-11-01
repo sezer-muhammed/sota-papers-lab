@@ -492,7 +492,8 @@ function Fact({ label, title, value }: { label: string; title?: string; value: s
   );
 }
 
-/* Lightroom's Basic panel. Auto: the values shown in the comparison (the
+/* Lightroom's Develop panels (Basic, Tone Curve, Color Mixer, Detail, Lens
+   Corrections, Calibration). Auto: the values shown in the comparison (the
    chosen edit, a selected candidate, or as shot before a retouch). Manual:
    sliders with a live preview, Reset, and a full-size export. */
 function BasicPanel({
@@ -540,7 +541,7 @@ function BasicPanel({
   return (
     <Surface tone="flat" className="overflow-hidden">
       <PanelHeader
-        title="Basic"
+        title="Develop"
         action={
           <SegmentedControl
             label="Edit mode"
@@ -567,6 +568,8 @@ function ManualEditor({ photo, session }: { photo: Photo; session: RetouchSessio
   const exporting = manual.export?.status === "running";
   const stale = !manual.preview || !sameParams(manual.preview.params, manual.params);
   const atBase = sameParams(manual.params, manual.base);
+  const info = photoInfo(photo);
+  const asShot = info ? { temperature: info.as_shot_temperature, tint: info.as_shot_tint } : undefined;
   const status = manual.error
     ? manual.error
     : stale
@@ -575,7 +578,13 @@ function ManualEditor({ photo, session }: { photo: Photo; session: RetouchSessio
 
   return (
     <div className="space-y-4">
-      <AdjustSliders base={manual.base} params={manual.params} onChange={(params) => session.setManual(photo.key, params)} />
+      <AdjustSliders
+        base={manual.base}
+        baseName={photo.result ? "auto value" : "as-shot value"}
+        asShot={asShot}
+        params={manual.params}
+        onChange={(params) => session.setManual(photo.key, params)}
+      />
       <p aria-live="polite" className={text.caption}>
         {status}
       </p>
