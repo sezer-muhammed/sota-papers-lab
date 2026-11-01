@@ -35,14 +35,6 @@ export function sameHashScroll(event: MouseEvent<HTMLAnchorElement>) {
   jumpTo("host");
 }
 
-/** Brings the Apps panel's token form into view and focuses its input. */
-export function focusTokenInput() {
-  scrollToId("apps");
-  requestAnimationFrame(() =>
-    document.getElementById("spl-token-input")?.focus({ preventScroll: true }),
-  );
-}
-
 /** Ref for a control that goes away once its action works (a Retry). If focus
     is inside it when it unmounts, focus moves to the closest `within` ancestor
     instead of dropping to <body>. Layout cleanups run before React removes the

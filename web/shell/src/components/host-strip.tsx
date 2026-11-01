@@ -58,7 +58,7 @@ export function HostStrip({
   state,
 }: {
   health: Loaded<Health>;
-  /** Reloads health, ops and runs (and the newest run's detail after a failure). */
+  /** Reloads the host's health. */
   refreshAll: () => void;
   state: HomeHostState;
 }) {
@@ -132,7 +132,7 @@ export function HostStrip({
               aria-disabled={health.loading}
               onClick={refresh}
             >
-              <span className="sr-only">Refresh host, apps and runs</span>
+              <span className="sr-only">Refresh host status</span>
             </Button>
           )}
         </div>
