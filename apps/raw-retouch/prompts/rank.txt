@@ -1,0 +1,13 @@
+These are {n} versions of the same photograph, labelled {labels}. They differ only in global adjustments, and their labels and order are random.
+
+Camera: {camera}. Shot at {shot}.
+
+{images}
+
+Rank all {n} versions from best to worst as finished photographs. Use your checklist: exposure, highlight and shadow detail, white balance and skin, colour, signs of over-processing, and mood. Compare them side by side; some differences are subtle.
+
+Answer with:
+- notes: for every label, a few words on its strengths and faults.
+- ranking: every label exactly once, best first.
+- reasons: two or three sentences on why your first choice is the best finished photograph and what holds the others back. Describe versions by how they look (for example "the brighter version"), never by label: the reader cannot see the labels.
+- scene: one line on what the photo shows and its light.

@@ -1,0 +1,29 @@
+Plan the edit of this RAW photograph. Our renderer follows the Basic panel of Lightroom Classic, in Lightroom's own units:
+- temperature: white balance in kelvin. Higher warms the image (more yellow), lower cools it (more blue).
+- tint: -150 to +150. Positive adds magenta, negative adds green.
+- exposure: in stops (EV). +1.00 is twice as bright; it moves mostly the midtones.
+- contrast: -100 to +100. Steepens or flattens the midtones.
+- highlights: -100 to +100. Negative recovers bright areas such as skies and skin highlights.
+- shadows: -100 to +100. Positive opens up dark areas.
+- whites: -100 to +100. Moves the white point; positive makes the brightest tones brighter.
+- blacks: -100 to +100. Moves the black point; negative deepens the blacks.
+- vibrance: -100 to +100. Boosts muted colours more than saturated ones and protects skin.
+- saturation: -100 to +100. Scales every colour equally; use it sparingly.
+
+Camera: {camera}. Shot at {shot}.
+
+Image "Neutral" is the camera's as-shot white balance with every other slider at 0. Image "Auto" is our automatic first guess, a starting point rather than a target, rendered with: {auto}.
+
+{images}
+
+Measurements of the Neutral render (brightness from 0 = black to 1 = white; clip values are shares of pixels; the luma histogram runs from black to white):
+{stats}
+
+Allowed range of each slider for this photo:
+{bounds}
+
+Propose up to three looks for this photograph, each a complete set of slider values. Every look must be tasteful and natural enough to print, and the looks must be visibly different from each other: for example a faithful natural rendering, a vivid or punchy one, and a mood that suits the subject (warm and soft, cool and crisp, bright and airy, or dark and moody). First fix what the photo needs, such as exposure, highlight or shadow detail and white balance. Prefer moderate values and make large moves only where the image clearly needs them.
+
+Answer with:
+- analysis: one or two sentences on what the photo shows, its light, and what it needs.
+- looks: up to three, each with a short name, a one-sentence rationale, and settings giving absolute values for all ten sliders.
