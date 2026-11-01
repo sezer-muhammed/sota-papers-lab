@@ -53,14 +53,17 @@ export class SplClient {
     return this.request<RunRecord>("POST", "/v1/runs", body);
   }
 
-  /** Starts an op and resolves at once with the run in "running" state.
+  /** Starts an op and resolves at once with the run "running", or "queued"
+      while the host already runs its limit of ops (they start in order).
       Poll `runDetail(id)` for progress and the result. */
   startRun(op: string, input: unknown = {}) {
     const body: RunRequest = { op, input, wait: false };
     return this.request<RunRecord>("POST", "/v1/runs", body);
   }
 
-  /** Asks a running op to stop; it ends as "cancelled". */
+  /** Asks a queued or running op to stop and resolves with the run as it is
+      now; it ends as "cancelled" shortly after. Rejects with 409 when the run
+      has already ended. */
   cancelRun(id: string) {
     return this.request<RunRecord>("POST", `/v1/runs/${encodeURIComponent(id)}/cancel`);
   }

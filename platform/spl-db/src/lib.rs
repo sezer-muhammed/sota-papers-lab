@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use spl_core::{Result, bail};
 
 pub use migrations::{Migration, ORACLE, POSTGRES, SQLITE};
-pub use model::{ArtifactRecord, MetricRecord, NewRun, RunRecord, RunStatus};
+pub use model::{ArtifactRecord, MetricRecord, NewRun, RunArtifact, RunRecord, RunStatus};
 pub use sqlite::SqliteStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +44,10 @@ pub trait Store: Send + Sync {
     async fn get_run(&self, id: &str) -> Result<Option<RunRecord>>;
     /// Newest first.
     async fn list_runs(&self, op_id: Option<&str>, limit: u32) -> Result<Vec<RunRecord>>;
+    /// Marks every `queued` or `running` run as `failed` with `error_message`
+    /// and returns how many changed. A server calls it once at startup: runs
+    /// a previous process left unfinished will never finish.
+    async fn fail_unfinished_runs(&self, error_message: &str, finished_at_ms: i64) -> Result<u64>;
 
     /// Idempotent: artifacts are content-addressed.
     async fn put_artifact(&self, artifact: &ArtifactRecord) -> Result<()>;
@@ -55,6 +59,8 @@ pub trait Store: Send + Sync {
         direction: &str,
         slot_name: &str,
     ) -> Result<()>;
+    /// Ordered by direction, then slot name (as text).
+    async fn list_run_artifacts(&self, run_id: &str) -> Result<Vec<RunArtifact>>;
 
     async fn add_metrics(&self, metrics: &[MetricRecord]) -> Result<()>;
     async fn list_metrics(&self, run_id: &str) -> Result<Vec<MetricRecord>>;

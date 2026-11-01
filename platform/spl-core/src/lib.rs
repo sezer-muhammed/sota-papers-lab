@@ -18,3 +18,6 @@ pub use registry::Registry;
 
 pub use anyhow::{Context, Error, Result, anyhow, bail};
 pub use schemars::JsonSchema;
+/// The type of [`RunCx::cancel`], re-exported so hosts and ops need no
+/// direct `tokio-util` dependency.
+pub use tokio_util::sync::CancellationToken;

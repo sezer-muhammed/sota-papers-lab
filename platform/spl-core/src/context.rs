@@ -35,6 +35,8 @@ pub struct RunCx {
     pub run_id: String,
     pub artifacts: Arc<dyn ArtifactStore>,
     pub resources: Resources,
+    /// Fires when someone asks the host to stop this run. Long loops poll
+    /// [`RunCx::is_cancelled`]; blocking work takes a clone of the token.
     pub cancel: CancellationToken,
     events: EventSink,
 }
@@ -46,11 +48,29 @@ impl RunCx {
         resources: Resources,
         events: EventSink,
     ) -> Self {
+        Self::with_cancel(
+            run_id,
+            artifacts,
+            resources,
+            events,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Like [`RunCx::new`], with a token the host keeps, so it can cancel
+    /// the run from outside (`POST /v1/runs/{id}/cancel`).
+    pub fn with_cancel(
+        run_id: String,
+        artifacts: Arc<dyn ArtifactStore>,
+        resources: Resources,
+        events: EventSink,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             run_id,
             artifacts,
             resources,
-            cancel: CancellationToken::new(),
+            cancel,
             events,
         }
     }

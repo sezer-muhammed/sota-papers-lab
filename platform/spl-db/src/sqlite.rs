@@ -8,7 +8,9 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
 };
 
-use crate::{ArtifactRecord, Backend, MetricRecord, NewRun, RunRecord, RunStatus, SQLITE, Store};
+use crate::{
+    ArtifactRecord, Backend, MetricRecord, NewRun, RunArtifact, RunRecord, RunStatus, SQLITE, Store,
+};
 
 /// Single-file database for one machine (local Linux box or one cloud VM).
 pub struct SqliteStore {
@@ -179,6 +181,20 @@ impl Store for SqliteStore {
             .collect()
     }
 
+    async fn fail_unfinished_runs(&self, error_message: &str, finished_at_ms: i64) -> Result<u64> {
+        let done = sqlx::query(
+            "UPDATE spl_runs SET status = ?, error_message = ?, finished_at_ms = ? WHERE status IN (?, ?)",
+        )
+        .bind(RunStatus::Failed.as_str())
+        .bind(error_message)
+        .bind(finished_at_ms)
+        .bind(RunStatus::Queued.as_str())
+        .bind(RunStatus::Running.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     async fn put_artifact(&self, a: &ArtifactRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO spl_artifacts (id, kind, media_type, size_bytes, uri, meta_json, created_at_ms)
@@ -236,6 +252,26 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn list_run_artifacts(&self, run_id: &str) -> Result<Vec<RunArtifact>> {
+        sqlx::query(
+            "SELECT run_id, artifact_id, direction, slot_name FROM spl_run_artifacts
+             WHERE run_id = ? ORDER BY direction, slot_name",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| -> Result<RunArtifact> {
+            Ok(RunArtifact {
+                run_id: row.try_get("run_id")?,
+                artifact_id: row.try_get("artifact_id")?,
+                direction: row.try_get("direction")?,
+                slot_name: row.try_get("slot_name")?,
+            })
+        })
+        .collect()
     }
 
     async fn add_metrics(&self, metrics: &[MetricRecord]) -> Result<()> {
@@ -327,6 +363,90 @@ mod tests {
         assert_eq!(store.list_runs(Some("demo.echo"), 10).await?.len(), 1);
         assert_eq!(store.list_runs(Some("other.op"), 10).await?.len(), 0);
         assert_eq!(store.list_metrics("r1").await?[0].value, 31.5);
+        Ok(())
+    }
+
+    fn new_run(id: &str) -> NewRun {
+        NewRun {
+            id: id.into(),
+            op_id: "demo.echo".into(),
+            input: serde_json::json!({}),
+            host_name: None,
+            git_sha: None,
+            env: None,
+            created_at_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn unfinished_runs_fail_and_finished_ones_stay() -> Result<()> {
+        let store = crate::connect("sqlite::memory:").await?;
+        for id in ["queued", "running", "done"] {
+            store.create_run(&new_run(id)).await?;
+        }
+        store.start_run("running", 2).await?;
+        store.start_run("done", 2).await?;
+        store
+            .finish_run("done", RunStatus::Succeeded, None, None, 3)
+            .await?;
+
+        assert_eq!(store.fail_unfinished_runs("host restarted", 9).await?, 2);
+        for id in ["queued", "running"] {
+            let run = store.get_run(id).await?.expect("run exists");
+            assert_eq!(run.status, RunStatus::Failed);
+            assert_eq!(run.error_message.as_deref(), Some("host restarted"));
+            assert_eq!(run.finished_at_ms, Some(9));
+        }
+        let done = store.get_run("done").await?.expect("run exists");
+        assert_eq!(done.status, RunStatus::Succeeded);
+        assert_eq!(done.finished_at_ms, Some(3));
+        assert_eq!(store.fail_unfinished_runs("again", 10).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_artifact_links_round_trip() -> Result<()> {
+        let store = crate::connect("sqlite::memory:").await?;
+        store.create_run(&new_run("r1")).await?;
+        for id in ["a1", "a2"] {
+            store
+                .put_artifact(&ArtifactRecord {
+                    id: id.into(),
+                    kind: "blob".into(),
+                    media_type: "text/plain".into(),
+                    size_bytes: 1,
+                    uri: format!("file:///{id}"),
+                    meta: Some(serde_json::json!({ "filename": "a.txt" })),
+                    created_at_ms: 1,
+                })
+                .await?;
+        }
+        store.link_artifact("r1", "a2", "output", "out-1").await?;
+        store.link_artifact("r1", "a1", "output", "out-0").await?;
+        store.link_artifact("r1", "a1", "input", "raw").await?;
+
+        let links = store.list_run_artifacts("r1").await?;
+        let slots: Vec<_> = links
+            .iter()
+            .map(|l| {
+                (
+                    l.direction.as_str(),
+                    l.slot_name.as_str(),
+                    l.artifact_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            slots,
+            [
+                ("input", "raw", "a1"),
+                ("output", "out-0", "a1"),
+                ("output", "out-1", "a2")
+            ]
+        );
+        assert!(store.list_run_artifacts("other").await?.is_empty());
+        let meta = store.get_artifact("a1").await?.and_then(|a| a.meta);
+        assert_eq!(meta, Some(serde_json::json!({ "filename": "a.txt" })));
         Ok(())
     }
 }

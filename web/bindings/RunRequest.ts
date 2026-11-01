@@ -2,7 +2,8 @@
 
 export type RunRequest = { op: string, input: unknown, 
 /**
- * `false`: answer at once with the run in `running` state and keep
- * working; poll `GET /v1/runs/{id}` for progress. Default `true`.
+ * `false`: answer at once (202) with the run `running`, or `queued`
+ * while other runs hold every slot, and keep working; poll
+ * `GET /v1/runs/{id}` for progress. Default `true`.
  */
 wait?: boolean, };

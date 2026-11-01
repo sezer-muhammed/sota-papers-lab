@@ -34,6 +34,53 @@ Open `http://<machine>.<tailnet>.ts.net:7070`. Update with `git pull && docker c
 
 Data (SQLite file + artifacts) lives in `./data` (bind-mounted to `/var/lib/spl`).
 
+When `spl serve` starts, it marks runs that the previous process left
+`queued` or `running` as `failed` ("host restarted"): nothing would ever
+finish them. It stops promptly on SIGTERM (`docker stop`).
+
+### Claude inside the container (opt-in)
+
+Ops that ask Claude for judgments (`raw_retouch.auto`) run the `claude` CLI on
+the GPU host user's subscription login. `deploy/compose.claude.yaml` runs the
+container as that user, with the same `HOME`, and mounts only what the native
+CLI needs at the same absolute paths: `~/.claude` read-write (credentials are
+refreshed there in place, shared with the host's CLI), `~/.claude.json`
+read-only, `~/.local/share/claude` and `~/.local/bin` read-only. The file
+comments explain each mount.
+
+Once, because the root-run container created `data/` as root: build the new
+image, stop the service so nothing writes during the change, and hand the
+data to your user.
+
+```sh
+cd deploy
+SPL_GIT_SHA=$(git rev-parse --short HEAD) docker compose build
+docker compose stop spl
+docker run --rm -v "$PWD/../data:/d" busybox chown -R "$(id -u):$(id -g)" /d
+```
+
+Then add the override to `COMPOSE_FILE` in `deploy/.env` and start it:
+
+```sh
+# deploy/.env (tailnet setup; without it: compose.yaml:compose.claude.yaml)
+COMPOSE_FILE=compose.yaml:compose.tailnet.yaml:compose.claude.yaml
+# Only when `id -u` / `id -g` print something other than 1000:
+# SPL_UID=1001
+# SPL_GID=1001
+```
+
+```sh
+docker compose up -d
+docker compose exec -w /tmp spl claude -p "Reply OK" --model sonnet --output-format json --tools ""
+```
+
+Run `docker compose` as that user, never with `sudo`: the override takes
+`HOME` from your shell. It sets `SPL_CLAUDE_BIN=$HOME/.local/bin/claude`,
+puts `$HOME/.local/bin` on `PATH` and sets `DISABLE_AUTOUPDATER=1` (the host's
+CLI updates the mounted binaries). Do not set `ANTHROPIC_API_KEY`: it would
+switch the CLI to billed API use. To go back to running as root, drop
+`compose.claude.yaml` from `COMPOSE_FILE`; root can still use the data.
+
 ## Cloud GPU VM
 
 1. Build and push the image (`just docker`, then tag for your registry).
@@ -61,3 +108,6 @@ SPL_API=http://localhost:7070 pnpm dev  # or the UI with hot reload
 | `SPL_DATABASE_URL` | `sqlite://…` (later `postgres://…`, `oracle://…`) | `sqlite://./data/spl.db` |
 | `SPL_WEB_DIR` | built UI to serve | unset |
 | `SPL_AUTH_TOKEN` | bearer token required on `/v1/*` (not `/v1/health`) | unset |
+| `SPL_MAX_CONCURRENT_RUNS` | ops executing at once; further runs wait as `queued`, in order | `3` |
+| `SPL_MAX_UPLOAD_MB` | largest `POST /v1/artifacts` body, in MiB (held in memory while hashed) | `1024` |
+| `SPL_CLAUDE_BIN` | `claude` CLI that ops call; else `PATH`, then `~/.local/bin/claude` | unset (`compose.claude.yaml` sets it) |

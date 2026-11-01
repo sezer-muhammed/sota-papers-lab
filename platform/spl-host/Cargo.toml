@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +21,12 @@ tower-http.workspace = true
 tracing.workspace = true
 ts-rs.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+schemars.workspace = true
+tempfile = "3"
+# `ServiceExt::oneshot` drives the router in tests without a socket.
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true
