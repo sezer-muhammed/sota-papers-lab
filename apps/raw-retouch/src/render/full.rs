@@ -92,7 +92,7 @@ pub(crate) fn render_with(
         0
     };
     let amount = finish.sharpen;
-    let halo = sharp_rad.max(nr_rad) as usize;
+    let halo = (sharp_rad.max(nr_rad) as usize).max(presence::halo_rows(w, h, params));
     let rows_in_max = (STRIP_ROWS + 2 * halo).min(h);
     let plane = w * rows_in_max;
 
@@ -142,12 +142,13 @@ pub(crate) fn render_with(
                 rows: rows_in,
                 y0: y_in,
                 full_height: h,
-                display_px: &display.px,
+                y_row,
                 display_planes: &display.pres,
                 display_width: display.width,
                 display_height: display.height,
                 sx,
                 sy,
+                active: presence::active(params),
             },
         )?;
         let pres_on = pres.flag();
