@@ -6,9 +6,13 @@ export { Card, CardDescription, CardFooter, CardHeader, CardTitle, cardVariants 
 export { DataPanel } from "./components/data-panel";
 export { Gauge } from "./components/gauge";
 export { IconTile } from "./components/icon-tile";
+export { ProgressBar } from "./components/progress-bar";
+export { RangeInput } from "./components/range-input";
+export { SegmentedControl, type SegmentedOption } from "./components/segmented-control";
 export { Skeleton } from "./components/skeleton";
 export { StatusSignal } from "./components/status-signal";
 export { SectionHeader, Surface } from "./components/surface";
+export { Switch } from "./components/switch";
 export { text } from "./components/typography";
 export { cn } from "./lib/cn";
 export { applyTheme, readTheme, type ThemePreference } from "./lib/theme";

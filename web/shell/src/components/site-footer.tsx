@@ -23,6 +23,9 @@ export function SiteFooter({ version }: { version?: string }) {
           <a className={linkClass} href="#/">
             home
           </a>
+          <a className={linkClass} href="#/retouch">
+            retouch
+          </a>
           <a className={linkClass} href="#/ops">
             ops
           </a>

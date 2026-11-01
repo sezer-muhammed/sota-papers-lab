@@ -36,6 +36,15 @@ different brand mark.
 
 `Button`, `ButtonLink`, `Card` (+ header/title/description/footer), `Surface`, `SectionHeader`, `DataPanel` (titled panel: Surface + SectionHeader + body), `ActionBar` (wrapping row of actions), `Skeleton` (shimmer placeholder), `IconTile` (40px icon or label tile), `Badge`, `StatusSignal`, `Gauge`, `BrandLogo`/`BrandMark`, `text` (type scale), `cn`.
 
+Controls:
+
+- `ProgressBar`: 4px neutral bar (gray-1000 fill, not a status colour); determinate with `value` 0–1, the shared indeterminate sweep without. Always give it a `label`.
+- `Switch`: an on/off setting with label and optional description; on is the action blue. A real `<label>` for a `role="switch"` button.
+- `SegmentedControl`: two to five exclusive choices (a model, a count, a mode) on native radios, so arrow keys and screen readers work as a radio group.
+- `RangeInput`: native range in the system look (`.ds-range`): 4px track, 14px neutral thumb, focus ring on the thumb. The fill starts at `origin` (0 for a bipolar slider); `track` swaps in a token gradient, e.g. white balance blue→amber.
+
+Pages with app-specific views (the Retouch page, `#/retouch`) compose these; photos and other user content may carry their own colours, and labels laid over a photo use a translucent black chip with white text so they read on any image.
+
 ## Motion
 
 Reveal and stagger on scroll, ping for live status, skeleton shimmer, indeterminate bar, check draw. All disabled under `prefers-reduced-motion`.

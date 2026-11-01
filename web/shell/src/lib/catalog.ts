@@ -9,6 +9,11 @@ export const APP_CAP = 8;
 /** Op rows per app card before "+N more ops". */
 export const OP_ROWS = 3;
 
+/** Apps with a page of their own in the shell, by app id. */
+export const APP_PAGES: Record<string, { href: string; label: string }> = {
+  raw_retouch: { href: "#/retouch", label: "Open Retouch" },
+};
+
 /* An app is the op id prefix before the first dot ("device_info.list" →
    "device_info"). The host has no app endpoint; this is derived from ops. */
 export type AppSummary = { id: string; ops: OpDescriptor[]; lastRun?: RunRecord; runCount: number };

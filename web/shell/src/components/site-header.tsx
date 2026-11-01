@@ -9,6 +9,7 @@ import { sameHashScroll } from "../lib/scroll";
 
 const nav: { page: Route["page"]; href: string; label: string }[] = [
   { page: "home", href: "#/", label: "Home" },
+  { page: "retouch", href: "#/retouch", label: "Retouch" },
   { page: "ops", href: "#/ops", label: "Ops" },
   { page: "runs", href: "#/runs", label: "Runs" },
 ];

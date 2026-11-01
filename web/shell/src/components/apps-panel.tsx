@@ -18,7 +18,7 @@ import {
   text,
 } from "@spl/ui";
 import { describeError, type Loaded } from "../api";
-import { APP_CAP, OP_ROWS, initials, matchesApp, type AppSummary } from "../lib/catalog";
+import { APP_CAP, APP_PAGES, OP_ROWS, initials, matchesApp, type AppSummary } from "../lib/catalog";
 import { absoluteTime, plural, relativeTime } from "../lib/format";
 import { CopyCommand } from "./copy-command";
 import { RetryNotice, WaitingNotice } from "./notice";
@@ -213,6 +213,7 @@ function AppCard({
   const shown = app.ops.slice(0, OP_ROWS);
   const more = app.ops.length - shown.length;
   const run = app.lastRun;
+  const page = APP_PAGES[app.id];
 
   return (
     <Card depth="base" className={cn("flex flex-col", single && "xl:col-span-2")}>
@@ -244,6 +245,11 @@ function AppCard({
           >
             +{plural(more, "more op")}
           </a>
+        ) : null}
+        {page ? (
+          <ButtonLink href={page.href} icon={ArrowRight} size="sm" className="mt-3">
+            {page.label}
+          </ButtonLink>
         ) : null}
       </div>
       <CardFooter className="flex items-center justify-between gap-3">

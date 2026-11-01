@@ -32,6 +32,22 @@ export function isUnauthorized(error: unknown) {
   return error instanceof SplError && error.status === 401;
 }
 
+/** GETs an artifact with the bearer token. On a host that sets SPL_AUTH_TOKEN,
+    <img> and download links cannot send the header, so pages fetch the bytes
+    this way and show them as blob URLs. */
+export async function fetchArtifact(id: string, signal?: AbortSignal): Promise<Blob> {
+  const token = readToken();
+  const response = await fetch(client.artifactUrl(id), {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal,
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => null);
+    throw new SplError(response.status, detail?.error ?? response.statusText);
+  }
+  return response.blob();
+}
+
 /** What useLoad returns. A reload keeps the last data and error until it settles;
     when calls overlap, only the latest one settles them. */
 export type Loaded<T> = {

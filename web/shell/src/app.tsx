@@ -6,10 +6,12 @@ import { TokenPrompt } from "./components/token-prompt";
 import { scrollToId } from "./lib/scroll";
 import { HomePage } from "./pages/home";
 import { OpsPage } from "./pages/ops";
+import { RetouchPage } from "./pages/retouch";
 import { RunsPage } from "./pages/runs";
 
 export type Route =
   | { page: "home"; focus?: "host" }
+  | { page: "retouch"; photo?: string }
   | { page: "ops"; opId?: string }
   | { page: "runs"; runId?: string };
 
@@ -21,12 +23,13 @@ const decode = (s: string) => {
   }
 };
 
-/* "#/ops/<op>", "#/runs/<id>", "#/host" (old "#/overview"); "", "#/home" and
-   anything unknown are Home. A new object on every call, so the same hash
-   twice still re-runs route effects. */
+/* "#/retouch/<photo>", "#/ops/<op>", "#/runs/<id>", "#/host" (old
+   "#/overview"); "", "#/home" and anything unknown are Home. A new object on
+   every call, so the same hash twice still re-runs route effects. */
 function routeFromHash(hash = window.location.hash): Route {
   const [head = "", ...rest] = hash.replace(/^#\/?/, "").split("/");
   const param = rest.length ? decode(rest.join("/")) || undefined : undefined;
+  if (head === "retouch") return { page: "retouch", photo: param };
   if (head === "ops") return { page: "ops", opId: param };
   if (head === "runs") return { page: "runs", runId: param };
   if (head === "host" || head === "overview") return { page: "home", focus: "host" };
@@ -35,6 +38,7 @@ function routeFromHash(hash = window.location.hash): Route {
 
 const titles: Record<Route["page"], string> = {
   home: "SOTA Papers Lab",
+  retouch: "Retouch · SOTA Papers Lab",
   ops: "Ops · SOTA Papers Lab",
   runs: "Runs · SOTA Papers Lab",
 };
@@ -85,6 +89,8 @@ export function App() {
             <h1 className="sr-only">SOTA Papers Lab</h1>
             <TokenPrompt />
           </>
+        ) : route.page === "retouch" ? (
+          <RetouchPage photoKey={route.photo} />
         ) : route.page === "ops" ? (
           <OpsPage initialOpId={route.opId} />
         ) : route.page === "runs" ? (

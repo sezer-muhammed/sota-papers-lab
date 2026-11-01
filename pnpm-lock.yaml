@@ -22,6 +22,9 @@ importers:
 
   web/shell:
     dependencies:
+      '@spl/bindings':
+        specifier: workspace:*
+        version: link:../bindings
       '@spl/sdk':
         specifier: workspace:*
         version: link:../sdk
