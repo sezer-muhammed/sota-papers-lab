@@ -36,6 +36,7 @@ import { ArtifactImage } from "./images";
 import { INSTRUCTION_EXAMPLES, InstructionField, UsedInstruction } from "./instruction";
 import {
   filesOf,
+  instructionNote,
   isActive,
   neutralId,
   photoInfo,
@@ -260,6 +261,7 @@ function InstructionPanel({
 }) {
   const fallback = cleanInstruction(defaultInstruction);
   const used = usedInstruction(photo.result);
+  const note = instructionNote(photo.result);
   return (
     <Surface tone="flat" className="overflow-hidden">
       <PanelHeader title="Edit wanted" />
@@ -282,6 +284,7 @@ function InstructionPanel({
             <div className="space-y-1">
               <p className={text.eyebrowSm}>This result followed</p>
               <UsedInstruction instruction={used} />
+              {note ? <p className={text.meta}>{note}</p> : null}
             </div>
           ) : (
             <p className={text.meta}>This result had no instruction.</p>

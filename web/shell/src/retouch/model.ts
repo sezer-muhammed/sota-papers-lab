@@ -292,7 +292,13 @@ export function asRenderOutput(value: unknown): RenderOutput | undefined {
 
 /** The instruction a run followed, as the host recorded it. */
 export function usedInstruction(result: AutoResult | undefined): string | undefined {
-  const value = result?.input?.instruction;
+  const value = result?.output.instruction ?? result?.input?.instruction;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/** How the host followed the instruction (by Claude or by keywords). */
+export function instructionNote(result: AutoResult | undefined): string | undefined {
+  const value = result?.output.instruction_note;
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
