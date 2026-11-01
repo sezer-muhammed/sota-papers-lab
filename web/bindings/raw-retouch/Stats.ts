@@ -46,6 +46,7 @@ structure: number,
  */
 local_contrast: number, 
 /**
- * Shannon entropy of the luma histogram, in bits.
+ * Shannon entropy of the 64-bin luma histogram, in bits: 0 (one
+ * tone) to 6 (every bin equally full).
  */
 entropy: number, };

@@ -7,6 +7,13 @@
 //! `reports/Automatic RAW photo retouching.md`: render fast, constrain hard,
 //! judge pairwise.
 //!
+//! Ops ([`ops`]): `raw_retouch.inspect` (metadata and a neutral preview),
+//! `raw_retouch.auto` (the whole pipeline, Claude optional) and
+//! `raw_retouch.render` (given sliders, as a live preview or the full-size
+//! files). A process keeps its four most recently developed RAWs, so the
+//! page's slider previews after an auto run skip decoding. See the app's
+//! README for inputs, stages and limits.
+//!
 //! Module owners (one per module, so work can proceed in parallel):
 //! develop = decode, color, develop, cuda/develop.cu;
 //! render = render, cuda/render.cu;

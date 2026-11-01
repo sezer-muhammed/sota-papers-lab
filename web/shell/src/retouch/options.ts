@@ -2,9 +2,14 @@ import type { AutoInput } from "@spl/bindings/raw-retouch/AutoInput";
 
 /** The Retouch page's settings, saved per browser. They shape the next
     raw_retouch.auto runs; a run that has started keeps its own. */
+export const EFFORTS = ["low", "medium", "high"] as const;
+export type Effort = (typeof EFFORTS)[number];
+
 export type RetouchOptions = {
   useClaude: boolean;
   model: "opus" | "sonnet";
+  /** How long Claude thinks per call: lower answers sooner. */
+  effort: Effort;
   plan: boolean;
   refine: boolean;
   jpeg: boolean;
@@ -18,6 +23,7 @@ export type RetouchOptions = {
 export const DEFAULT_OPTIONS: RetouchOptions = {
   useClaude: true,
   model: "opus",
+  effort: "medium",
   plan: true,
   refine: true,
   jpeg: true,
@@ -48,6 +54,7 @@ export function normalizeOptions(value: unknown): RetouchOptions {
   return {
     useClaude: bool(v.useClaude, d.useClaude),
     model: v.model === "sonnet" || v.model === "opus" ? v.model : d.model,
+    effort: EFFORTS.find((e) => e === v.effort) ?? d.effort,
     plan: bool(v.plan, d.plan),
     refine: bool(v.refine, d.refine),
     jpeg: bool(v.jpeg, d.jpeg),
@@ -85,6 +92,7 @@ export function autoInput(options: RetouchOptions, raw: string, filename: string
     filename,
     use_claude: options.useClaude,
     model: options.model,
+    effort: options.effort,
     plan: options.useClaude && options.plan,
     refine: options.useClaude && options.refine,
     evals_per_look: options.evalsPerLook,

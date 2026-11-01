@@ -9,6 +9,12 @@ const models = [
   { value: "sonnet" as const, label: "Sonnet" },
 ];
 
+const efforts = [
+  { value: "low" as const, label: "Low" },
+  { value: "medium" as const, label: "Medium" },
+  { value: "high" as const, label: "High" },
+];
+
 const parallelChoices = Array.from({ length: LIMITS.parallel.max - LIMITS.parallel.min + 1 }, (_, i) => {
   const n = String(LIMITS.parallel.min + i);
   return { value: n, label: n };
@@ -55,6 +61,15 @@ export function OptionsPanel({
               options={models}
               disabled={!claude}
               onChange={(model) => onChange({ model })}
+            />
+          </Row>
+          <Row label="Effort" disabled={!claude}>
+            <SegmentedControl
+              label="Claude effort"
+              value={options.effort}
+              options={efforts}
+              disabled={!claude}
+              onChange={(effort) => onChange({ effort })}
             />
           </Row>
           <Switch

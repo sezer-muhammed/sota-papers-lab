@@ -211,7 +211,8 @@ pub struct Stats {
     pub structure: f32,
     /// Mean local standard deviation of luma at a mid scale.
     pub local_contrast: f32,
-    /// Shannon entropy of the luma histogram, in bits.
+    /// Shannon entropy of the 64-bin luma histogram, in bits: 0 (one
+    /// tone) to 6 (every bin equally full).
     pub entropy: f32,
 }
 
