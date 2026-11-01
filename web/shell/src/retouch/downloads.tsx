@@ -72,7 +72,8 @@ export function FileList({ className, files }: { className?: string; files: Fina
 export function XmpNote({ className }: { className?: string }) {
   return (
     <p className={cn(text.caption, className)}>
-      The XMP sets Lightroom's Basic sliders to these values. Lightroom renders them with its own engine, so
+      The XMP sets Lightroom's develop settings (Basic, Tone Curve, Color Mixer, Detail, Lens Corrections,
+      Calibration) to these values. Lightroom renders them with its own engine, so
       the result approximates this JPEG; put the .xmp next to the RAW with the same name before importing.
     </p>
   );

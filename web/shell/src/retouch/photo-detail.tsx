@@ -50,7 +50,7 @@ import { PhaseSignal, PhotoActions, PhotoProgress, phaseColor } from "./status";
 const photoHref = (key: string) => `#/retouch/${encodeURIComponent(key)}`;
 
 /* One photo, large: before/after, the candidates, Claude's reasoning, the
-   Basic panel (the chosen values, or sliders to adjust them), the scopes of
+   Develop panels (the chosen values, or sliders to adjust them), the scopes of
    what is compared, downloads and timings. Keyed by photo, so view state
    starts fresh for each one. */
 export function PhotoDetail({
@@ -185,7 +185,7 @@ export function PhotoDetail({
         </div>
 
         <div className="space-y-5">
-          <BasicPanel
+          <DevelopPanel
             photo={photo}
             mode={mode}
             onMode={setMode}
@@ -492,10 +492,11 @@ function Fact({ label, title, value }: { label: string; title?: string; value: s
   );
 }
 
-/* Lightroom's Basic panel. Auto: the values shown in the comparison (the
+/* Lightroom's Develop panels (Basic, Tone Curve, Color Mixer, Detail, Lens
+   Corrections, Calibration). Auto: the values shown in the comparison (the
    chosen edit, a selected candidate, or as shot before a retouch). Manual:
    sliders with a live preview, Reset, and a full-size export. */
-function BasicPanel({
+function DevelopPanel({
   canAdjust,
   candidate,
   mode,
@@ -517,7 +518,11 @@ function BasicPanel({
 
   let body: ReactNode;
   if (mode === "manual") {
-    body = photo.manual ? <ManualEditor photo={photo} session={session} /> : <Skeleton className="h-64" />;
+    body = photo.manual ? (
+      <ManualEditor photo={photo} session={session} asShot={asShot} />
+    ) : (
+      <Skeleton className="h-64" />
+    );
   } else {
     const shown = candidate?.params ?? result?.params ?? neutral;
     const caption = candidate
@@ -540,7 +545,7 @@ function BasicPanel({
   return (
     <Surface tone="flat" className="overflow-hidden">
       <PanelHeader
-        title="Basic"
+        title="Develop"
         action={
           <SegmentedControl
             label="Edit mode"
@@ -562,7 +567,15 @@ function BasicPanel({
   );
 }
 
-function ManualEditor({ photo, session }: { photo: Photo; session: RetouchSession }) {
+function ManualEditor({
+  asShot,
+  photo,
+  session,
+}: {
+  asShot?: { temperature: number; tint: number };
+  photo: Photo;
+  session: RetouchSession;
+}) {
   const manual = photo.manual!;
   const exporting = manual.export?.status === "running";
   const stale = !manual.preview || !sameParams(manual.preview.params, manual.params);
@@ -575,7 +588,12 @@ function ManualEditor({ photo, session }: { photo: Photo; session: RetouchSessio
 
   return (
     <div className="space-y-4">
-      <AdjustSliders base={manual.base} params={manual.params} onChange={(params) => session.setManual(photo.key, params)} />
+      <AdjustSliders
+        asShot={asShot}
+        base={manual.base}
+        params={manual.params}
+        onChange={(params) => session.setManual(photo.key, params)}
+      />
       <p aria-live="polite" className={text.caption}>
         {status}
       </p>
