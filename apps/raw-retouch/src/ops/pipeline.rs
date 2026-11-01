@@ -251,6 +251,11 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
     ensure_live(cx)?;
     let planned = !proposals.is_empty();
     let mut looks = base_looks(instruction.is_some(), &routed, planned, &first.auto);
+    // Looks built from keywords aim inside the box, so the search can
+    // reach them (Claude's are already inside).
+    for anchor in looks.iter_mut().filter_map(|l| l.anchor.as_mut()) {
+        *anchor = search::clamp_params(anchor, &lo, &hi).quantized();
+    }
     let mut rationales: HashMap<String, String> = HashMap::new();
     for (i, look) in proposals.iter().enumerate() {
         let id = format!("claude-{}", i + 1);

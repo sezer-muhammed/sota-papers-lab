@@ -1448,7 +1448,8 @@ mod fake_cli {
                         assert_eq!(v.looks[0].name, "Silver");
                     }
                     "refine" => {
-                        claude.refine(&photo, &img, &auto, &lo, &hi).await.unwrap();
+                        let v = claude.refine(&photo, &img, &auto, &lo, &hi).await.unwrap();
+                        assert_eq!(v.rationale, "Fine.", "a \"none\" change says nothing");
                     }
                     "rank" => {
                         let images = [flat_image(10), flat_image(20)];

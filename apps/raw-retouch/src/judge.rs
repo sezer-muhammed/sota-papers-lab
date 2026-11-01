@@ -448,7 +448,14 @@ impl Claude {
                 |r: &RefineReply| ranges.values(&r.settings).map(|_| ()),
             )
             .await?;
-        let rationale = [reply.assessment.trim(), reply.change.trim()]
+        // The prompt asks for "none" when nothing changes: no sentence.
+        let change = reply.change.trim();
+        let change = if change.trim_end_matches('.').eq_ignore_ascii_case("none") {
+            ""
+        } else {
+            change
+        };
+        let rationale = [reply.assessment.trim(), change]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
