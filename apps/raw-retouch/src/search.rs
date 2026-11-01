@@ -211,12 +211,21 @@ pub fn clamp_params(p: &Params, lo: &Params, hi: &Params) -> Params {
 /// exposure, highlights to -100 and shadows to +85 for high dynamic range
 /// or clipped RAWs. Every bound sits on Lightroom's step grid, so
 /// quantizing an in-box value keeps it in the box.
+///
+/// Settings the search does not vary are fixed (`low == high`): Lightroom's
+/// defaults, except Detail and Lens Corrections, which are this photo's
+/// automatic values ([`crate::finish::with_auto`]). So every candidate
+/// carries them into its previews, export and XMP.
 pub fn bounds(scene: &Scene) -> (Params, Params) {
-    bounds_for(
+    let (lo, hi) = bounds_for(
         scene.info.as_shot_temperature,
         scene.info.as_shot_tint,
         scene.info.raw_clipped_fraction,
         LinearKey::measure(&scene.search),
+    );
+    (
+        crate::finish::with_auto(&lo, &scene.info),
+        crate::finish::with_auto(&hi, &scene.info),
     )
 }
 
@@ -261,6 +270,7 @@ fn bounds_for(
         blacks: BLACKS.0,
         vibrance: VIBRANCE.0,
         saturation: SATURATION.0,
+        ..Params::neutral(temperature, tint)
     };
     let hi = Params {
         temperature: warmed(temperature, WARM_SHIFT.1).floor(),
@@ -273,6 +283,7 @@ fn bounds_for(
         blacks: BLACKS.1,
         vibrance: VIBRANCE.1,
         saturation: SATURATION.1,
+        ..Params::neutral(temperature, tint)
     };
     (lo, hi)
 }
@@ -654,7 +665,7 @@ fn seeds(look: &LookSpec, auto: &Params, space: &Space, seed: u64) -> Vec<Params
     }
     out.extend(expert_means(auto));
     out.extend(
-        halton::scrambled(HALTON_SEEDS, Params::COUNT, derived_seed(seed, 2))
+        halton::scrambled(HALTON_SEEDS, space.dims().len(), derived_seed(seed, 2))
             .iter()
             .map(|u| space.params_at(u)),
     );
@@ -677,6 +688,7 @@ fn expert_means(base: &Params) -> Vec<Params> {
                 blacks: m(5),
                 vibrance: m(6),
                 saturation: m(7),
+                ..*base
             }
         })
         .collect()
@@ -849,6 +861,7 @@ mod tests {
             blacks: -10.0,
             vibrance: 20.0,
             saturation: -4.0,
+            ..Params::neutral(5200.0, 0.0)
         };
         let back = space.params_at(&space.unit_of(&p));
         for (a, b) in p.to_array().iter().zip(back.to_array()) {

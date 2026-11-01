@@ -10,7 +10,8 @@ use spl_core::{Result, anyhow};
 
 use super::layout::*;
 use super::{BASELINE_EV, CameraColor};
-use crate::types::Params;
+use super::{color_mixer, presence, tone_curve};
+use crate::types::{PARAM_SPECS, Params};
 
 /// log2(0.18).
 pub(crate) const LOG2_GREY: f64 = -2.473_931_188_332_412;
@@ -356,6 +357,11 @@ impl Reference {
             }
         };
         let slider = |v: f32| pick(v, 0.0, -100.0, 100.0);
+        // Beyond the Basic panel: legal range, Lightroom's default for NaN.
+        let mut rest = p.to_array();
+        for (v, s) in rest.iter_mut().zip(&PARAM_SPECS).skip(Params::BASIC) {
+            *v = pick(*v, s.neutral.unwrap_or(0.0), s.min, s.max);
+        }
         Params {
             temperature: pick(
                 p.temperature,
@@ -377,6 +383,7 @@ impl Reference {
             blacks: slider(p.blacks),
             vibrance: slider(p.vibrance),
             saturation: slider(p.saturation),
+            ..Params::from_array(rest)
         }
     }
 }
@@ -399,7 +406,8 @@ pub(crate) fn pack(
         if d.is_finite() && d > 0.0 { d } else { 1.0 }
     });
     let m = color.rec2020_from_cam(p.temperature);
-    let m = if finite33(&m) { m } else { reference.m0 };
+    let mut m = if finite33(&m) { m } else { reference.m0 };
+    color_mixer::calibrate(&p, &mut m);
     // Clipped pixels get one multiplier for all channels, the largest, so
     // they stay neutral and at least as bright as before.
     let neutral = delta.iter().copied().fold(1.0f32, f32::max);
@@ -430,6 +438,9 @@ pub(crate) fn pack(
     for (i, v) in out[ENDS_OFF..ENDS_OFF + LOCAL_N].iter_mut().enumerate() {
         *v = ends.delta(LOCAL_B0 as f64 + i as f64 * db) as f32;
     }
+    presence::pack(&p, &mut out[P_PRES..P_PRES + P_PRES_N]);
+    tone_curve::pack(&p, &mut out[CURVE_OFF..CURVE_OFF + CURVE_LEN]);
+    color_mixer::pack(&p, &mut out[MIXER_OFF..MIXER_OFF + MIXER_LEN]);
 }
 
 /// sRGB encoding of a display-linear value.

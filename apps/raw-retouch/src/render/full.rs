@@ -10,6 +10,7 @@ use spl_gpu::cudarc::driver::{LaunchConfig, PushKernelArg};
 use super::curves::{Anchors, Reference, pack};
 use super::grid::BaseGrid;
 use super::layout::CAND_STRIDE;
+use super::presence::{self, Strip};
 use super::{Aux, CameraColor, CudaContextExt, Kernels, Preview, blocks, check_image};
 use crate::types::{Gpu, LinearImage, Params, Rgb16Image, Scene};
 
@@ -133,6 +134,23 @@ pub(crate) fn render_with(
         let [lp, ap, bp, lh, ah, bh] = &mut planes[..] else {
             unreachable!("six planes")
         };
+        let pres = presence::strip_planes(
+            gpu,
+            &Strip {
+                rgb: &rgb,
+                width: w,
+                rows: rows_in,
+                y0: y_in,
+                full_height: h,
+                display_px: &display.px,
+                display_planes: &display.pres,
+                display_width: display.width,
+                display_height: display.height,
+                sx,
+                sy,
+            },
+        )?;
+        let pres_on = pres.flag();
         {
             let mut b = s.launch_builder(&k.full);
             b.arg(&rgb).arg(&wi).arg(&rows_i).arg(&y_in_i);
@@ -146,8 +164,10 @@ pub(crate) fn render_with(
                 .arg(&y_row[1])
                 .arg(&y_row[2])
                 .arg(&dev_cand);
+            b.arg(&pres.data).arg(&pres_on);
             b.arg(&mut *lp).arg(&mut *ap).arg(&mut *bp);
-            // SAFETY: arguments match `full_kernel`; every buffer holds n_in pixels.
+            // SAFETY: arguments match `full_kernel`; every buffer holds n_in
+            // pixels (`pres` a float4 each when `pres_on`).
             unsafe { b.launch(cfg(n_in)) }.cuda("full_kernel")?;
         }
         {

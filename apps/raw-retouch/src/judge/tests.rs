@@ -50,6 +50,7 @@ fn bounds() -> (Params, Params) {
         blacks: -60.0,
         vibrance: -30.0,
         saturation: -40.0,
+        ..Params::neutral(5200.0, 0.0)
     };
     let hi = Params {
         temperature: 8000.0,
@@ -62,6 +63,7 @@ fn bounds() -> (Params, Params) {
         blacks: 30.0,
         vibrance: 60.0,
         saturation: 50.0,
+        ..Params::neutral(5200.0, 0.0)
     };
     (lo, hi)
 }
@@ -236,6 +238,7 @@ fn refine_keeps_untouched_sliders_exactly() {
         blacks: 0.0,
         vibrance: 45.0,
         saturation: 40.0,
+        ..Params::neutral(5200.0, 0.0)
     };
     let reply = [5600.0, 4.0, 0.46, 35.0, -10.0, 10.0, 20.0, 0.0, 45.0, 25.0];
     let p = Ranges::new(&lo, &hi).adjust(&current, reply);
@@ -266,7 +269,7 @@ fn schemas_carry_bounds_and_labels() {
         settings["properties"]["highlights"],
         json!({"type": "integer", "minimum": -100, "maximum": 30})
     );
-    assert_eq!(settings["required"], json!(Params::NAMES));
+    assert_eq!(settings["required"], json!(&Params::NAMES[..Params::BASIC]));
     assert_eq!(plan["properties"]["looks"]["maxItems"], 3);
     assert_eq!(
         refine_schema(&ranges)["properties"]["settings"],
@@ -703,6 +706,7 @@ mod fake_cli {
             blacks: 0.0,
             vibrance: 45.0,
             saturation: 40.0,
+            ..Params::neutral(5200.0, 0.0)
         };
         let img = flat_image(90);
 
@@ -1156,6 +1160,7 @@ mod live {
             blacks: -6.0,
             vibrance: 15.0,
             saturation: 0.0,
+            ..Params::neutral(5200.0, 0.0)
         };
         let (neutral, auto_image) = (judged(Look::Flat), judged(Look::Good));
         let (t, u) = (Instant::now(), live.claude.usage());
@@ -1205,6 +1210,7 @@ mod live {
             blacks: 0.0,
             vibrance: 45.0,
             saturation: 40.0,
+            ..Params::neutral(5200.0, 0.0)
         };
         let image = judged(Look::Oversaturated);
         let (t, u) = (Instant::now(), live.claude.usage());

@@ -2,7 +2,7 @@
 //! `#define` of the same name there; `layout_matches_cuda` checks them.
 
 /// Floats per packed parameter set.
-pub(crate) const CAND_STRIDE: usize = 928;
+pub(crate) const CAND_STRIDE: usize = 1504;
 /// Camera -> Rec.2020 matrix with the white-balance delta folded in (3x3, row-major).
 pub(crate) const P_A1: usize = 0;
 /// The same matrix for fully clipped pixels, which stay neutral.
@@ -13,6 +13,9 @@ pub(crate) const P_GAIN: usize = 18;
 pub(crate) const P_BSHIFT: usize = 19;
 pub(crate) const P_VIB: usize = 20;
 pub(crate) const P_SAT: usize = 21;
+/// Texture, Clarity and Dehaze: `P_PRES_N` floats packed by `render/presence.rs`.
+pub(crate) const P_PRES: usize = 22;
+pub(crate) const P_PRES_N: usize = 8;
 /// Global tone curve: display-linear output at scene EV TONE_U0..=TONE_U1 (relative to grey).
 pub(crate) const TONE_OFF: usize = 32;
 pub(crate) const TONE_N: usize = 512;
@@ -25,6 +28,12 @@ pub(crate) const LOCAL_B0: f32 = -16.0;
 pub(crate) const LOCAL_B1: f32 = 8.0;
 /// Whites/Blacks: EV added at the pixel's own luminance EV, sampled like LOCAL.
 pub(crate) const ENDS_OFF: usize = 736;
+/// Parametric tone curve: `CURVE_LEN` floats packed by `render/tone_curve.rs`.
+pub(crate) const CURVE_OFF: usize = 928;
+pub(crate) const CURVE_LEN: usize = 288;
+/// Color Mixer and Calibration: `MIXER_LEN` floats packed by `render/color_mixer.rs`.
+pub(crate) const MIXER_OFF: usize = 1216;
+pub(crate) const MIXER_LEN: usize = 288;
 
 /// Bilateral grid: padding nodes on every side, and the log2-luminance axis.
 pub(crate) const GRID_PAD: usize = 2;
@@ -95,11 +104,17 @@ mod tests {
             ("P_BSHIFT", P_BSHIFT),
             ("P_VIB", P_VIB),
             ("P_SAT", P_SAT),
+            ("P_PRES", P_PRES),
+            ("P_PRES_N", P_PRES_N),
             ("TONE_OFF", TONE_OFF),
             ("TONE_N", TONE_N),
             ("LOCAL_OFF", LOCAL_OFF),
             ("LOCAL_N", LOCAL_N),
             ("ENDS_OFF", ENDS_OFF),
+            ("CURVE_OFF", CURVE_OFF),
+            ("CURVE_LEN", CURVE_LEN),
+            ("MIXER_OFF", MIXER_OFF),
+            ("MIXER_LEN", MIXER_LEN),
             ("GRID_PAD", GRID_PAD),
             ("LUMA_BINS", LUMA_BINS),
             ("CHROMA_BINS", CHROMA_BINS),
@@ -148,9 +163,11 @@ mod tests {
             assert!(
                 TONE_OFF + TONE_N <= LOCAL_OFF
                     && LOCAL_OFF + LOCAL_N <= ENDS_OFF
-                    && ENDS_OFF + LOCAL_N <= CAND_STRIDE
+                    && ENDS_OFF + LOCAL_N <= CURVE_OFF
+                    && CURVE_OFF + CURVE_LEN <= MIXER_OFF
+                    && MIXER_OFF + MIXER_LEN <= CAND_STRIDE
             )
         };
-        const { assert!(P_SAT < TONE_OFF) };
+        const { assert!(P_SAT < P_PRES && P_PRES + P_PRES_N <= TONE_OFF) };
     }
 }

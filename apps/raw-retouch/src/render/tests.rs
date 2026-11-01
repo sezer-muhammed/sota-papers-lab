@@ -565,6 +565,7 @@ fn random_params(n: usize, around: Params, seed: u64) -> Vec<Params> {
             blacks: 100.0 * next(),
             vibrance: 100.0 * next(),
             saturation: 100.0 * next(),
+            ..around
         })
         .collect()
 }

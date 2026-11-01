@@ -28,7 +28,7 @@ use crate::judge::{
 use crate::objective::LookSpec;
 use crate::render::RenderEngine;
 use crate::search::{self, Candidate, SearchConfig};
-use crate::types::{Gpu, Params, Stats};
+use crate::types::{Gpu, PARAM_SPECS, Params, Stats};
 
 /// Images Claude ranks at once: the finalists and the neutral render.
 const MAX_SHOWN: usize = 7;
@@ -668,16 +668,17 @@ fn plural(n: u32, one: &str, many: &str) -> String {
 }
 
 /// "5450 K, tint +3, exposure +0.35, contrast +10, highlights -30" for the
-/// log: white balance and exposure always, other sliders when not zero.
+/// log: white balance and exposure always, other settings when not at
+/// Lightroom's default.
 fn describe(p: &Params) -> String {
     let mut parts = vec![
         format!("{:.0} K", p.temperature),
         format!("tint {:+.0}", p.tint),
         format!("exposure {:+.2}", p.exposure),
     ];
-    for (name, value) in Params::NAMES.iter().zip(p.to_array()).skip(3) {
-        if value != 0.0 {
-            parts.push(format!("{name} {value:+.0}"));
+    for (spec, value) in PARAM_SPECS.iter().zip(p.to_array()).skip(3) {
+        if Some(value) != spec.neutral {
+            parts.push(format!("{} {value:+.0}", spec.key));
         }
     }
     parts.join(", ")

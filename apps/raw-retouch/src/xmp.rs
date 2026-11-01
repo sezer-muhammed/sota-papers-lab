@@ -135,6 +135,7 @@ mod tests {
             blacks: -5.0,
             vibrance: 20.0,
             saturation: -0.3,
+            ..Params::neutral(5200.0, 0.0)
         }
     }
 
@@ -184,6 +185,7 @@ mod tests {
             blacks: f32::from_bits(0x8000_0000), // -0.0
             vibrance: 99.5,
             saturation: -99.5,
+            ..Params::neutral(5200.0, 0.0)
         };
         let xmp = sidecar(&wild, &info("SONY", "ILCE-7M3"));
         let attrs = check_well_formed(&xmp).unwrap();

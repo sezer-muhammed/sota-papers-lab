@@ -166,25 +166,14 @@ pub fn auto_from_stats(
         blacks,
         vibrance,
         saturation,
+        ..Params::neutral(temperature, tint)
     })
 }
 
 /// Clamped to Lightroom's ranges but not rounded: the search quantizes
 /// whatever it renders.
 fn legal(p: Params) -> Params {
-    let whole = |v: f32| v.clamp(-100.0, 100.0);
-    Params {
-        temperature: p.temperature.clamp(2000.0, 50000.0),
-        tint: p.tint.clamp(-150.0, 150.0),
-        exposure: p.exposure.clamp(-5.0, 5.0),
-        contrast: whole(p.contrast),
-        highlights: whole(p.highlights),
-        shadows: whole(p.shadows),
-        whites: whole(p.whites),
-        blacks: whole(p.blacks),
-        vibrance: whole(p.vibrance),
-        saturation: whole(p.saturation),
-    }
+    p.clamped()
 }
 
 #[cfg(test)]

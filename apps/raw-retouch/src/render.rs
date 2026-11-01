@@ -15,28 +15,65 @@
 //! per batch of parameter sets; [`render_full`] adds capture sharpening and
 //! chroma noise reduction at full resolution and upsamples the display
 //! image's base layer, so the export matches [`RenderEngine::display`].
+//!
+//! Settings beyond the Basic panel plug in through hooks with owners of
+//! their own: the parametric tone curve (`render/tone_curve.rs`,
+//! `cuda/tone_curve.cu`), the Color Mixer and Calibration
+//! (`render/color_mixer.rs`, `cuda/color_mixer.cu`), Texture, Clarity and
+//! Dehaze (`render/presence.rs`, `cuda/presence.cu`), and Detail and Lens
+//! Corrections after rendering ([`crate::finish`]). The `.cu` hook files are
+//! spliced into `cuda/render.cu` to make one NVRTC source, [`SOURCE`].
 
+mod color_mixer;
 mod curves;
+#[cfg(test)]
+mod fingerprint;
 mod full;
 mod grid;
 mod layout;
+mod presence;
 mod stats;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]
 mod tests;
+mod tone_curve;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use spl_core::{Result, anyhow};
 use spl_gpu::cudarc::driver::sys::CUdevice_attribute;
 use spl_gpu::cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
 
 use crate::color::ColorModel;
-use crate::types::{Gpu, LinearImage, Params, Rgb8Image, Rgb16Image, Scene, Stats};
+use crate::finish::{self, Detail, LensCorrection};
+use crate::types::{Gpu, LinearImage, Params, RawInfo, Rgb8Image, Rgb16Image, Scene, Stats};
 use curves::{Anchors, Reference, pack};
 use grid::BaseGrid;
 use layout::{CAND_STRIDE, N_SUMS, PART_U32, STATS_THREADS};
+use presence::Planes;
+
+/// The line of `cuda/render.cu` after which the hook files go.
+const HOOKS: &str = "// HOOKS:";
+
+/// The renderer's NVRTC source: `cuda/render.cu` with its hook files
+/// inserted after its `HOOKS` line, ahead of `render_core`.
+pub(crate) static SOURCE: LazyLock<String> = LazyLock::new(|| {
+    let render = include_str!("../cuda/render.cu");
+    let at = render.find(HOOKS).expect("cuda/render.cu has a HOOKS line");
+    let at = at + render[at..].find('\n').map_or(render.len() - at, |n| n + 1);
+    [
+        &render[..at],
+        include_str!("../cuda/tone_curve.cu"),
+        "\n",
+        include_str!("../cuda/color_mixer.cu"),
+        "\n",
+        include_str!("../cuda/presence.cu"),
+        "\n",
+        &render[at..],
+    ]
+    .concat()
+});
 
 /// EV added at Exposure 0 so a normally exposed RAW renders like the
 /// camera's JPEG (middle grey near 0.46 sRGB). The integrator calibrates it
@@ -87,7 +124,7 @@ struct Kernels {
 
 impl Kernels {
     fn load(gpu: &Gpu) -> Result<Self> {
-        let module = gpu.module("render", include_str!("../cuda/render.cu"))?;
+        let module = gpu.module("render", &SOURCE)?;
         let f = |name: &str| module.load_function(name).cuda(name);
         Ok(Self {
             prep: f("prep_kernel")?,
@@ -134,6 +171,8 @@ struct Preview {
     px: CudaSlice<f32>,
     /// Per-pixel extra plane chosen by [`Aux`].
     aux: CudaSlice<f32>,
+    /// Texture/Clarity/Dehaze planes (`render/presence.rs`).
+    pres: Planes,
     out8: Option<CudaSlice<u8>>,
 }
 
@@ -181,11 +220,13 @@ impl Preview {
         // SAFETY: arguments match `prep_kernel` in cuda/render.cu; buffers hold
         // n pixels (the aux plane only when written).
         unsafe { b.launch(cfg) }.cuda("prep_kernel")?;
+        let pres = presence::preview_planes(gpu, &px, img.width, img.height)?;
         Ok(Self {
             width: img.width,
             height: img.height,
             px,
             aux: aux_plane,
+            pres,
             out8: None,
         })
     }
@@ -198,14 +239,17 @@ impl Preview {
             Some(buf) => buf,
             empty => empty.insert(s.alloc_zeros::<u8>(3 * n).cuda("alloc output")?),
         };
+        let pres_on = self.pres.flag();
         let mut b = s.launch_builder(&k.render8);
-        b.arg(&self.px).arg(&w).arg(&h).arg(cand).arg(&mut *out8);
+        b.arg(&self.px).arg(&self.pres.data).arg(&pres_on);
+        b.arg(&w).arg(&h).arg(cand).arg(&mut *out8);
         let cfg = LaunchConfig {
             grid_dim: (blocks(n, 256), 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: arguments match `render8_kernel`; `cand` holds one packed candidate.
+        // SAFETY: arguments match `render8_kernel`; `cand` holds one packed
+        // candidate; `pres` holds a float4 per pixel when `pres_on`.
         unsafe { b.launch(cfg) }.cuda("render8_kernel")?;
         let data = s.clone_dtoh(&*out8).cuda("download render")?;
         Ok(Rgb8Image {
@@ -220,6 +264,7 @@ impl Preview {
 /// the GPU so a candidate costs about a millisecond.
 pub struct RenderEngine {
     gpu: Gpu,
+    info: RawInfo,
     kernels: Kernels,
     color: Arc<dyn CameraColor>,
     reference: Reference,
@@ -285,6 +330,7 @@ impl RenderEngine {
         s.synchronize().cuda("engine setup")?;
         Ok(Self {
             gpu: gpu.clone(),
+            info: scene.info.clone(),
             kernels,
             color,
             reference,
@@ -328,8 +374,11 @@ impl RenderEngine {
             self.search.height as i32,
             chunks as i32,
         );
+        let pres_on = self.search.pres.flag();
         let mut b = s.launch_builder(&self.kernels.stats);
-        b.arg(&self.search.px).arg(&self.search.aux).arg(&w).arg(&h);
+        b.arg(&self.search.px).arg(&self.search.aux);
+        b.arg(&self.search.pres.data).arg(&pres_on);
+        b.arg(&w).arg(&h);
         b.arg(&self.dev_cands)
             .arg(&c)
             .arg(&mut self.dev_u32)
@@ -400,11 +449,22 @@ impl RenderEngine {
             .cuda("upload candidates")
     }
 
-    /// Display-size sRGB render, unrotated.
+    /// Display-size sRGB render, unrotated, with Detail and Lens
+    /// Corrections ([`finish::finish_preview`]).
     pub fn display(&mut self, params: &Params) -> Result<Rgb8Image> {
         self.upload_candidates(std::slice::from_ref(params))?;
-        self.display
-            .render8(&self.gpu, &self.kernels, &self.dev_cands)
+        let mut img = self
+            .display
+            .render8(&self.gpu, &self.kernels, &self.dev_cands)?;
+        let scale = img.width as f32 / self.info.width.max(1) as f32;
+        finish::finish_preview(
+            &self.gpu,
+            &mut img,
+            &Detail::of(params),
+            &LensCorrection::new(params, &self.info),
+            scale,
+        )?;
+        Ok(img)
     }
 
     /// Search-size sRGB render, unrotated.
@@ -416,12 +476,20 @@ impl RenderEngine {
 }
 
 /// Full-resolution render with output sharpening and chroma noise
-/// reduction. Looks the same as [`RenderEngine::display`] for the same params.
+/// reduction, then Detail and Lens Corrections ([`finish::finish_full`]).
+/// Looks the same as [`RenderEngine::display`] for the same params.
 pub fn render_full(
     gpu: &Gpu,
     scene: &Scene,
     full: &LinearImage,
     params: &Params,
 ) -> Result<Rgb16Image> {
-    full::render(gpu, scene, full, params, &scene.color)
+    let mut img = full::render(gpu, scene, full, params, &scene.color)?;
+    finish::finish_full(
+        gpu,
+        &mut img,
+        &Detail::of(params),
+        &LensCorrection::new(params, &scene.info),
+    )?;
+    Ok(img)
 }

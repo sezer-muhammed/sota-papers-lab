@@ -8,16 +8,29 @@
 // Contrast), Highlights/Shadows by base layer, and Whites/Blacks by pixel
 // luminance. The kernels hold no slider logic of their own, so the CPU tests
 // of the slider shapes describe exactly what renders.
+//
+// The settings beyond the Basic panel live in hook files, each with its own
+// owner: cuda/tone_curve.cu (parametric tone curve), cuda/color_mixer.cu
+// (Color Mixer, Calibration's shadows tint) and cuda/presence.cu (Texture,
+// Clarity, Dehaze). render.rs splices them in at the HOOKS line below, so
+// they see everything above it. render_core calls each hook at a fixed point
+// only when its file defines the hook's switch (TONE_CURVE_HOOK,
+// COLOR_MIXER_HOOK, PRESENCE_HOOK): even an empty inlined call can change
+// how NVVM fuses multiply-adds around it, so a stub that is off keeps the
+// output bit for bit. Each hook reads its own region of the candidate,
+// packed by the Rust file of the same name under src/render/.
 // Every #define below mirrors a constant in src/render/layout.rs; a unit test
 // keeps the two in step.
 
-#define CAND_STRIDE 928
+#define CAND_STRIDE 1504
 #define P_A1 0
 #define P_A2 9
 #define P_GAIN 18
 #define P_BSHIFT 19
 #define P_VIB 20
 #define P_SAT 21
+#define P_PRES 22
+#define P_PRES_N 8
 #define TONE_OFF 32
 #define TONE_N 512
 #define TONE_U0 (-16.0f)
@@ -27,6 +40,10 @@
 #define LOCAL_B0 (-16.0f)
 #define LOCAL_B1 (8.0f)
 #define ENDS_OFF 736
+#define CURVE_OFF 928
+#define CURVE_LEN 288
+#define MIXER_OFF 1216
+#define MIXER_LEN 288
 
 #define GRID_PAD 2
 #define GRID_Z0 (-14.0f)
@@ -202,10 +219,13 @@ __device__ float slice_base(const float* __restrict__ grid, int nx, int ny, int 
     return (s + GRID_PRIOR * l) / (w + GRID_PRIOR);
 }
 
+// HOOKS: render.rs inserts cuda/tone_curve.cu, cuda/color_mixer.cu and cuda/presence.cu here.
+
 // One pixel from camera RGB (as-shot white balance, 1 = clip) to Oklab after
 // vibrance and saturation, before gamut mapping. `base` is the pixel's base
-// layer: smoothed log2 luminance at exposure 0 and as-shot white balance.
-__device__ Lab render_core(const float* __restrict__ P, float r, float g, float b, float base) {
+// layer: smoothed log2 luminance at exposure 0 and as-shot white balance;
+// `q` its presence planes.
+__device__ Lab render_core(const float* __restrict__ P, float r, float g, float b, float base, float4 q) {
     r = sane(r);
     g = sane(g);
     b = sane(b);
@@ -250,6 +270,9 @@ __device__ Lab render_core(const float* __restrict__ P, float r, float g, float 
         y *= e;
         z *= e;
     }
+#ifdef PRESENCE_HOOK
+    presence_apply(P, q, base, x, y, z);
+#endif
     // Global tone on the largest and smallest channel, the middle one keeping
     // its relative place: hue holds, and colours fade toward white as their
     // brightest channel reaches it instead of clipping.
@@ -264,6 +287,9 @@ __device__ Lab render_core(const float* __restrict__ P, float r, float g, float 
     } else {
         x = y = z = thi;
     }
+#ifdef TONE_CURVE_HOOK
+    tone_curve_apply(P + CURVE_OFF, x, y, z);
+#endif
     Lab o;
     rec2020_to_oklab(x, y, z, o);
     float C = sqrtf(o.a * o.a + o.b * o.b);
@@ -279,7 +305,15 @@ __device__ Lab render_core(const float* __restrict__ P, float r, float g, float 
         o.a *= f;
         o.b *= f;
     }
+#ifdef COLOR_MIXER_HOOK
+    color_mixer_apply(P + MIXER_OFF, o);
+#endif
     return o;
+}
+
+// This pixel's presence planes, or zeros when the image has none.
+__device__ __forceinline__ float4 pres_at(const float4* __restrict__ pres, int pres_on, size_t i) {
+    return pres_on ? pres[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 // Oklab -> linear sRGB in [0, 1]. Chroma is compressed toward the sRGB
@@ -381,15 +415,16 @@ __device__ float upsample_base(const float4* __restrict__ dpx, const float* __re
 }
 
 // Renders one candidate to 8-bit sRGB with dithering.
-extern "C" __global__ void render8_kernel(const float4* __restrict__ px, int w, int h,
-                                          const float* __restrict__ cand, unsigned char* __restrict__ out) {
+extern "C" __global__ void render8_kernel(const float4* __restrict__ px, const float4* __restrict__ pres,
+                                          int pres_on, int w, int h, const float* __restrict__ cand,
+                                          unsigned char* __restrict__ out) {
     __shared__ float P[CAND_STRIDE];
     for (int i = threadIdx.x; i < CAND_STRIDE; i += blockDim.x) P[i] = cand[i];
     __syncthreads();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= w * h) return;
     float4 p = px[i];
-    Lab c = render_core(P, p.x, p.y, p.z, p.w);
+    Lab c = render_core(P, p.x, p.y, p.z, p.w, pres_at(pres, pres_on, i));
     float r, g, b;
     bool oog;
     to_srgb_gamut(c, r, g, b, oog);
@@ -416,7 +451,8 @@ __device__ __forceinline__ unsigned warp_sum_u(unsigned v) {
 // histograms and counts as u32, sums as f64, all reduced in a fixed order so
 // the result is deterministic. The host adds the chunks and finishes.
 extern "C" __global__ void __launch_bounds__(STATS_THREADS)
-stats_kernel(const float4* __restrict__ px, const float* __restrict__ slum, int w, int h,
+stats_kernel(const float4* __restrict__ px, const float* __restrict__ slum, const float4* __restrict__ pres,
+             int pres_on, int w, int h,
              const float* __restrict__ cands, int chunks,
              unsigned* __restrict__ out_u32, double* __restrict__ out_f64) {
     __shared__ float P[CAND_STRIDE];
@@ -448,7 +484,7 @@ stats_kernel(const float4* __restrict__ px, const float* __restrict__ slum, int 
         if (valid) {
             const size_t i = (size_t)y * w + x;
             const float4 p = px[i];
-            Lab c = render_core(P, p.x, p.y, p.z, p.w);
+            Lab c = render_core(P, p.x, p.y, p.z, p.w, pres_at(pres, pres_on, i));
             float r, g, b;
             bool oog;
             to_srgb_gamut(c, r, g, b, oog);
@@ -569,8 +605,8 @@ stats_kernel(const float4* __restrict__ px, const float* __restrict__ slum, int 
 extern "C" __global__ void full_kernel(const float* __restrict__ rgb, int w, int rows, int y0,
                                        const float4* __restrict__ dpx, const float* __restrict__ guide, int dw, int dh,
                                        float sx, float sy, float yr, float yg, float yb,
-                                       const float* __restrict__ cand, float* __restrict__ Lp, float* __restrict__ Ap,
-                                       float* __restrict__ Bp) {
+                                       const float* __restrict__ cand, const float4* __restrict__ pres, int pres_on,
+                                       float* __restrict__ Lp, float* __restrict__ Ap, float* __restrict__ Bp) {
     __shared__ float P[CAND_STRIDE];
     for (int i = threadIdx.x; i < CAND_STRIDE; i += blockDim.x) P[i] = cand[i];
     __syncthreads();
@@ -580,7 +616,7 @@ extern "C" __global__ void full_kernel(const float* __restrict__ rgb, int w, int
     float r = sane(rgb[3 * (size_t)i]), g = sane(rgb[3 * (size_t)i + 1]), b = sane(rgb[3 * (size_t)i + 2]);
     float base = upsample_base(dpx, guide, dw, dh, ((float)x + 0.5f) * sx - 0.5f, ((float)y + 0.5f) * sy - 0.5f,
                                log2_lum(yr * r + yg * g + yb * b));
-    Lab c = render_core(P, r, g, b, base);
+    Lab c = render_core(P, r, g, b, base, pres_at(pres, pres_on, i));
     Lp[i] = c.L;
     Ap[i] = c.a;
     Bp[i] = c.b;

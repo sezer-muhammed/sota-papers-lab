@@ -19,7 +19,12 @@
 //! render = render, cuda/render.cu;
 //! search = objective, cmaes, auto, search;
 //! judge = judge, encode, xmp;
-//! integration = ops.
+//! integration = ops;
+//! detail = finish (and detail, lens, cuda/detail.cu once they exist).
+//! The render owner shares `render` with per-effect owners: tone curve =
+//! render/tone_curve.rs, cuda/tone_curve.cu; colour mixer =
+//! render/color_mixer.rs, cuda/color_mixer.cu; presence =
+//! render/presence.rs, cuda/presence.cu.
 
 pub mod auto;
 pub mod cmaes;
@@ -27,6 +32,7 @@ pub mod color;
 pub mod decode;
 pub mod develop;
 pub mod encode;
+pub mod finish;
 pub mod judge;
 pub mod objective;
 pub mod ops;

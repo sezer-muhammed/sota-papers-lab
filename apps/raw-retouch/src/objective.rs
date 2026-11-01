@@ -154,7 +154,7 @@ const INVALID_TOTAL: f32 = -1.0e6;
 /// Per-slider scale of a "full" edit, the width of the PPR10K search
 /// bounds, in [`Params`] order; temperature in mireds. Distances in these
 /// units make one exposure stop and about 20 contrast points comparable.
-const SLIDER_SCALE: [f32; Params::COUNT] = [
+const SLIDER_SCALE: [f32; Params::BASIC] = [
     120.0, 34.0, 3.7, 77.0, 127.0, 96.0, 105.0, 103.0, 58.0, 50.0,
 ];
 
@@ -340,13 +340,14 @@ pub(crate) fn noise_factor(iso: Option<u32>) -> f32 {
     })
 }
 
-/// Squared distance between two parameter sets in [`SLIDER_SCALE`] units.
+/// Squared distance between two parameter sets' Basic panels in
+/// [`SLIDER_SCALE`] units.
 pub(crate) fn distance_sq(a: &Params, b: &Params) -> f32 {
-    let (a, b) = (a.to_array(), b.to_array());
+    let (a, b) = (a.basic(), b.basic());
     let mired = |k: f32| 1.0e6 / k.max(1.0);
     let dt = (mired(a[0]) - mired(b[0])) / SLIDER_SCALE[0];
     dt * dt
-        + (1..Params::COUNT)
+        + (1..Params::BASIC)
             .map(|i| ((a[i] - b[i]) / SLIDER_SCALE[i]).powi(2))
             .sum::<f32>()
 }
@@ -354,9 +355,9 @@ pub(crate) fn distance_sq(a: &Params, b: &Params) -> f32 {
 /// A look's typical edit relative to auto, in [`Params`] order with
 /// temperature as a warm shift in mireds. Seeds the search and centres the
 /// over-editing penalty, so a moody look is not punished for being moody.
-pub(crate) fn look_offset(look: &LookSpec) -> [f32; Params::COUNT] {
+pub(crate) fn look_offset(look: &LookSpec) -> [f32; Params::BASIC] {
     if look.anchor.is_some() {
-        return [0.0; Params::COUNT];
+        return [0.0; Params::BASIC];
     }
     match look.id.as_str() {
         "vivid" => [0.0, 0.0, 0.0, 18.0, -5.0, 0.0, 0.0, -10.0, 25.0, 8.0],
@@ -364,18 +365,18 @@ pub(crate) fn look_offset(look: &LookSpec) -> [f32; Params::COUNT] {
         "moody" => [
             0.0, 0.0, -0.45, 12.0, -25.0, -5.0, -10.0, -20.0, -8.0, -12.0,
         ],
-        _ => [0.0; Params::COUNT],
+        _ => [0.0; Params::BASIC],
     }
 }
 
 /// `base` moved by `factor` times `offset` (see [`look_offset`]).
-pub(crate) fn offset_params(base: &Params, offset: &[f32; Params::COUNT], factor: f32) -> Params {
-    let mut a = base.to_array();
+pub(crate) fn offset_params(base: &Params, offset: &[f32; Params::BASIC], factor: f32) -> Params {
+    let mut a = base.basic();
     a[0] = warmed(base.temperature, factor * offset[0]);
     for (v, d) in a.iter_mut().zip(offset).skip(1) {
         *v += factor * d;
     }
-    Params::from_array(a)
+    base.with_basic(a)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -520,7 +521,7 @@ pub(crate) struct Objective {
     /// The look's typical edit, taken off before the expert prior: the
     /// experts retouched for a natural look, and a vivid edit is not an
     /// unusual natural one.
-    prior_offset: [f32; Params::COUNT],
+    prior_offset: [f32; Params::BASIC],
     reference: Reference,
     clip_hi_limit: f32,
     clip_lo_limit: f32,
@@ -591,7 +592,7 @@ impl Objective {
         };
 
         let prior_offset = match mode {
-            Mode::Anchor(_) => [0.0; Params::COUNT],
+            Mode::Anchor(_) => [0.0; Params::BASIC],
             Mode::Look(_) => look_offset(look),
         };
         // A look that asks for more colour gets room above its own band.

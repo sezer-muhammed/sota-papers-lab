@@ -2,13 +2,20 @@
 //! in. Temperature is laid out linearly in mireds, the scale on which equal
 //! steps look equally strong at any colour temperature; every other slider
 //! is linear in its own units.
+//!
+//! The cube's dimensions are a chosen set of [`Params`] fields: by default
+//! those [`PARAM_SPECS`] marks `searched` (the Basic panel today), or whole
+//! groups ([`Space::with_groups`]). Every other field is held where the box
+//! fixes it (`lo`, which equals `hi` there).
 
-use crate::types::{LinearImage, Params};
+use crate::types::{LinearImage, PARAM_SPECS, ParamGroup, ParamSpec, Params};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Space {
     pub(crate) lo: Params,
     pub(crate) hi: Params,
+    /// Indices into [`Params::to_array`] of the searched fields, ascending.
+    dims: Vec<usize>,
     /// Mireds of the coolest (`lo`) and warmest (`hi`) temperature.
     cool_mired: f64,
     warm_mired: f64,
@@ -19,60 +26,87 @@ fn mired(kelvin: f32) -> f64 {
 }
 
 impl Space {
+    /// The box over every field [`PARAM_SPECS`] marks `searched`.
     pub(crate) fn new(lo: Params, hi: Params) -> Self {
+        let dims = (0..Params::COUNT)
+            .filter(|&i| PARAM_SPECS[i].searched)
+            .collect();
+        Self::with_dims(lo, hi, dims)
+    }
+
+    /// The box over every field of `groups`.
+    #[allow(dead_code)]
+    pub(crate) fn with_groups(lo: Params, hi: Params, groups: &[ParamGroup]) -> Self {
+        Self::with_dims(lo, hi, ParamSpec::indices_of(groups))
+    }
+
+    fn with_dims(lo: Params, hi: Params, mut dims: Vec<usize>) -> Self {
+        dims.sort_unstable();
+        dims.dedup();
         Self {
             lo,
             hi,
+            dims,
             cool_mired: mired(lo.temperature),
             warm_mired: mired(hi.temperature),
         }
     }
 
-    /// Unit-cube coordinates of `p`, clamped into the box.
+    /// Indices into [`Params::to_array`] of the cube's dimensions, in order.
+    pub(crate) fn dims(&self) -> &[usize] {
+        &self.dims
+    }
+
+    /// Unit-cube coordinates of `p`, clamped into the box: one per
+    /// dimension.
     pub(crate) fn unit_of(&self, p: &Params) -> Vec<f64> {
         let (v, lo, hi) = (p.to_array(), self.lo.to_array(), self.hi.to_array());
-        let mut u = Vec::with_capacity(Params::COUNT);
-        let span = self.cool_mired - self.warm_mired;
-        u.push(if span.abs() < 1e-9 {
-            0.5
-        } else {
-            (self.cool_mired - mired(v[0])) / span
-        });
-        for i in 1..Params::COUNT {
+        let u = self.dims.iter().map(|&i| {
+            if i == 0 {
+                let span = self.cool_mired - self.warm_mired;
+                return if span.abs() < 1e-9 {
+                    0.5
+                } else {
+                    (self.cool_mired - mired(v[0])) / span
+                };
+            }
             let span = f64::from(hi[i] - lo[i]);
-            u.push(if span.abs() < 1e-9 {
+            if span.abs() < 1e-9 {
                 0.5
             } else {
                 f64::from(v[i] - lo[i]) / span
-            });
-        }
-        u.iter()
-            .map(|x| {
-                if x.is_finite() {
-                    x.clamp(0.0, 1.0)
-                } else {
-                    0.5
-                }
-            })
-            .collect()
+            }
+        });
+        u.map(|x| {
+            if x.is_finite() {
+                x.clamp(0.0, 1.0)
+            } else {
+                0.5
+            }
+        })
+        .collect()
     }
 
-    /// The parameter set at unit-cube coordinates `u` (clamped into the box).
+    /// The parameter set at unit-cube coordinates `u` (clamped into the
+    /// box); fields outside the cube's dimensions take `lo`.
     pub(crate) fn params_at(&self, u: &[f64]) -> Params {
         let (lo, hi) = (self.lo.to_array(), self.hi.to_array());
-        let at = |i: usize| {
-            u.get(i)
+        let at = |d: usize| {
+            u.get(d)
                 .copied()
                 .filter(|x| x.is_finite())
                 .unwrap_or(0.5)
                 .clamp(0.0, 1.0)
         };
-        let mut a = [0.0f32; Params::COUNT];
-        let m = self.cool_mired - at(0) * (self.cool_mired - self.warm_mired);
-        a[0] = ((1.0e6 / m) as f32).max(lo[0]).min(hi[0]);
-        for i in 1..Params::COUNT {
-            let v = f64::from(lo[i]) + at(i) * f64::from(hi[i] - lo[i]);
-            a[i] = (v as f32).max(lo[i]).min(hi[i]);
+        let mut a = lo;
+        for (d, &i) in self.dims.iter().enumerate() {
+            a[i] = if i == 0 {
+                let m = self.cool_mired - at(d) * (self.cool_mired - self.warm_mired);
+                ((1.0e6 / m) as f32).max(lo[0]).min(hi[0])
+            } else {
+                let v = f64::from(lo[i]) + at(d) * f64::from(hi[i] - lo[i]);
+                (v as f32).max(lo[i]).min(hi[i])
+            };
         }
         Params::from_array(a)
     }

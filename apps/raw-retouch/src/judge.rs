@@ -1108,8 +1108,8 @@ struct Settings {
 }
 
 impl Settings {
-    /// In [`Params::NAMES`] order.
-    fn values(&self) -> [f64; Params::COUNT] {
+    /// In [`Params::NAMES`] order (the Basic panel).
+    fn values(&self) -> [f64; Params::BASIC] {
         [
             self.temperature,
             self.tint,
@@ -1128,7 +1128,7 @@ impl Settings {
 const EXPOSURE: usize = 2;
 
 /// Lightroom's legal range per slider, in [`Params::NAMES`] order.
-const LEGAL: [(f64, f64); Params::COUNT] = [
+const LEGAL: [(f64, f64); Params::BASIC] = [
     (2000.0, 50000.0),
     (-150.0, 150.0),
     (-5.0, 5.0),
@@ -1142,29 +1142,35 @@ const LEGAL: [(f64, f64); Params::COUNT] = [
 ];
 
 /// Lightroom's steps per unit: whole kelvin and slider units, 0.01 EV.
-const STEPS_PER_UNIT: [f64; Params::COUNT] = [1.0, 1.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+const STEPS_PER_UNIT: [f64; Params::BASIC] = [1.0, 1.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 
-/// The box Claude may move in: per slider, inclusive bounds on Lightroom's
-/// grid, rounded inward so every value on the grid inside them is legal.
+/// The box Claude may move in: per Basic slider, inclusive bounds on
+/// Lightroom's grid, rounded inward so every value on the grid inside them
+/// is legal. Claude sets only the Basic panel; every other setting comes
+/// from the search box (`base`, its low corner, where the box fixes them).
 struct Ranges {
-    lo: [f64; Params::COUNT],
-    hi: [f64; Params::COUNT],
+    lo: [f64; Params::BASIC],
+    hi: [f64; Params::BASIC],
+    base: Params,
 }
 
 impl Ranges {
     fn new(lo: &Params, hi: &Params) -> Self {
-        let (lo, hi) = (lo.to_array(), hi.to_array());
-        let bounds: [(f64, f64); Params::COUNT] =
+        let base = *lo;
+        let (lo, hi) = (lo.basic(), hi.basic());
+        let bounds: [(f64, f64); Params::BASIC] =
             std::array::from_fn(|i| grid_bounds(i, lo[i], hi[i]));
         Self {
             lo: bounds.map(|b| b.0),
             hi: bounds.map(|b| b.1),
+            base,
         }
     }
 
     /// Claude's values on Lightroom's grid, clamped into the box.
-    fn fit(&self, values: [f64; Params::COUNT]) -> Params {
-        Params::from_array(std::array::from_fn(|i| self.fit_one(i, values[i])))
+    fn fit(&self, values: [f64; Params::BASIC]) -> Params {
+        self.base
+            .with_basic(std::array::from_fn(|i| self.fit_one(i, values[i])))
     }
 
     fn fit_one(&self, i: usize, value: f64) -> f32 {
@@ -1179,9 +1185,9 @@ impl Ranges {
 
     /// Like [`Ranges::fit`], except that sliders Claude kept (equal to the
     /// current value on Lightroom's grid) keep their exact current value.
-    fn adjust(&self, current: &Params, values: [f64; Params::COUNT]) -> Params {
-        let now = current.to_array();
-        Params::from_array(std::array::from_fn(|i| {
+    fn adjust(&self, current: &Params, values: [f64; Params::BASIC]) -> Params {
+        let now = current.basic();
+        current.with_basic(std::array::from_fn(|i| {
             let per = STEPS_PER_UNIT[i];
             let kept = (f64::from(now[i]) * per).round() == (values[i] * per).round();
             if kept {
@@ -1194,7 +1200,7 @@ impl Ranges {
 
     fn settings_schema(&self) -> Value {
         let mut properties = Map::new();
-        for (i, name) in Params::NAMES.iter().enumerate() {
+        for (i, name) in Params::NAMES[..Params::BASIC].iter().enumerate() {
             let property = if i == EXPOSURE {
                 json!({"type": "number", "minimum": self.lo[i], "maximum": self.hi[i]})
             } else {
@@ -1205,13 +1211,13 @@ impl Ranges {
         json!({
             "type": "object",
             "properties": properties,
-            "required": Params::NAMES,
+            "required": &Params::NAMES[..Params::BASIC],
             "additionalProperties": false,
         })
     }
 
     fn describe(&self) -> String {
-        Params::NAMES
+        Params::NAMES[..Params::BASIC]
             .iter()
             .enumerate()
             .map(|(i, name)| {
@@ -1262,8 +1268,8 @@ fn slider_value(i: usize, v: f64) -> String {
 
 /// "temperature 5400 K, tint +5, exposure +0.35 EV, contrast +10, ..."
 fn describe(params: &Params) -> String {
-    let values = params.quantized().to_array();
-    Params::NAMES
+    let values = params.quantized().basic();
+    Params::NAMES[..Params::BASIC]
         .iter()
         .enumerate()
         .map(|(i, name)| format!("{name} {}", slider_value(i, f64::from(values[i]))))
