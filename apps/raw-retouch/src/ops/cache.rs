@@ -25,6 +25,8 @@ static DEVELOPED: Lru<Photo> = Lru::new(ENTRIES);
 /// One RAW, decoded (for the full-resolution export) and developed to the
 /// search and display images.
 pub(super) struct Photo {
+    /// The RAW's artifact id.
+    pub raw: String,
     pub frame: RawFrame,
     /// As developed, without lens corrections: the photo's info, and what
     /// renders when Lens Corrections are off.
@@ -36,8 +38,9 @@ pub(super) struct Photo {
 }
 
 impl Photo {
-    fn new(frame: RawFrame, scene: Scene, lens: Option<lens::LensCorrection>) -> Self {
+    fn new(raw: String, frame: RawFrame, scene: Scene, lens: Option<lens::LensCorrection>) -> Self {
         Self {
+            raw,
             frame,
             scene: Arc::new(scene),
             lens,
@@ -92,6 +95,7 @@ pub(super) async fn developed(cx: &RunCx, raw: &str, gpu: &Gpu, span: Span) -> R
                 .await
                 .with_context(|| format!("read the RAW file (artifact {raw})"))?;
             let gpu = gpu.clone();
+            let raw = raw.to_owned();
             let (photo, decode_ms, develop_ms) = blocking(cx, span, move |r| {
                 r.progress(0.05, "Decoding the RAW file");
                 let frame = decode(&bytes)?;
@@ -111,7 +115,7 @@ pub(super) async fn developed(cx: &RunCx, raw: &str, gpu: &Gpu, span: Span) -> R
                     Some(lens) => format!("Lens correction data: {}", lens.summary()),
                     None => "No lens correction data in the file".to_owned(),
                 });
-                Ok((Photo::new(frame, scene, lens), decode_ms, develop_ms))
+                Ok((Photo::new(raw, frame, scene, lens), decode_ms, develop_ms))
             })
             .await?;
             timings = Some((decode_ms, develop_ms));
@@ -133,21 +137,21 @@ type Cell<V> = Arc<OnceCell<Arc<V>>>;
 
 /// A least-recently-used map of values that load once: concurrent callers
 /// for one key wait for a single load, and a failed load leaves no entry.
-struct Lru<V> {
+pub(super) struct Lru<V> {
     capacity: usize,
     /// Most recently used last.
     slots: Mutex<VecDeque<(String, Cell<V>)>>,
 }
 
 impl<V> Lru<V> {
-    const fn new(capacity: usize) -> Self {
+    pub(super) const fn new(capacity: usize) -> Self {
         Self {
             capacity,
             slots: Mutex::new(VecDeque::new()),
         }
     }
 
-    async fn get_or_load<F, Fut>(&self, key: &str, load: F) -> Result<Arc<V>>
+    pub(super) async fn get_or_load<F, Fut>(&self, key: &str, load: F) -> Result<Arc<V>>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V>>,
@@ -161,6 +165,12 @@ impl<V> Lru<V> {
             self.forget_if_empty(key, &cell);
         }
         loaded
+    }
+
+    /// Keeps `value` for `key`, now the most recent, unless the key already
+    /// has a value or a load under way (which is just as good).
+    pub(super) fn insert(&self, key: &str, value: Arc<V>) {
+        let _ = self.cell(key).set(value);
     }
 
     /// The cell for `key`, now the most recent; evicts the least recent

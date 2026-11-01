@@ -115,9 +115,29 @@ pub fn router(host: Arc<Host>, config: &Config) -> Router {
     if let Some(dir) = &config.web_dir {
         // Single-page app: unknown paths fall back to index.html.
         let spa = ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html")));
+        let spa = Router::new()
+            .fallback_service(spa)
+            .layer(middleware::map_response(revalidate_html));
         app = app.fallback_service(spa);
     }
     app.layer(TraceLayer::new_for_http())
+}
+
+/// The SPA's HTML (index.html, at any route) is revalidated on every load,
+/// so a reload after a deploy picks up the new build; the hashed assets it
+/// names keep their ordinary caching.
+async fn revalidate_html(mut response: Response) -> Response {
+    let html = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/html"));
+    if html {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    response
 }
 
 async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {

@@ -10,6 +10,15 @@ jpeg: boolean, jpeg_quality: number,
  */
 tiff16: boolean, 
 /**
+ * Full-resolution lossless PNG, sRGB. On when absent.
+ */
+png: boolean, 
+/**
+ * The PNG's bits per sample: 8 (the JPEG's pixels, losslessly) or 16;
+ * 8 when absent.
+ */
+png_bits: number, 
+/**
  * Lightroom / Camera Raw XMP sidecar with every develop setting.
  */
 xmp: boolean, };

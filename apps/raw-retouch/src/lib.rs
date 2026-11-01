@@ -18,7 +18,9 @@
 //! develop = decode, color, develop, cuda/develop.cu;
 //! render = render, cuda/render.cu;
 //! search = objective, cmaes, auto, search;
-//! judge = judge, encode, xmp;
+//! judge = judge, encode (PNG: media), xmp;
+//! media = place, RawInfo's date and position (decode), the PNG export
+//! and zoomed region renders (ops/region.rs);
 //! integration = ops;
 //! detail = finish, detail, cuda/detail.cu; lens = lens, cuda/lens.cu.
 //! The render owner shares `render` with per-effect owners: tone curve =
@@ -38,6 +40,7 @@ pub mod judge;
 pub mod lens;
 pub mod objective;
 pub mod ops;
+pub mod place;
 pub mod render;
 pub mod search;
 pub mod types;

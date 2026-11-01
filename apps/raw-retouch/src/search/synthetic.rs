@@ -135,6 +135,8 @@ impl Synthetic {
                 f_number: Some(8.0),
                 focal_length_mm: Some(35.0),
                 captured_at: None,
+                gps: None,
+                place: None,
                 as_shot_temperature: self.as_shot_temperature,
                 as_shot_tint: self.as_shot_tint,
                 raw_clipped_fraction: self.raw_clipped,

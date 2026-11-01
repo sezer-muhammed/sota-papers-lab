@@ -634,3 +634,27 @@ async fn a_restarted_server_fails_the_runs_a_previous_one_left() {
     assert_eq!(status(&finished), "succeeded");
     assert_eq!(finished["run"]["finished_at_ms"], 3);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_spa_html_is_revalidated_and_its_assets_are_not() {
+    let web = tempfile::tempdir().unwrap();
+    std::fs::write(web.path().join("index.html"), "<!doctype html><p>app</p>").unwrap();
+    std::fs::create_dir(web.path().join("assets")).unwrap();
+    std::fs::write(web.path().join("assets/app-1a2b.js"), "console.log(1)").unwrap();
+    let dir = web.path().to_owned();
+    let lab = lab(|c| c.web_dir = Some(dir)).await;
+    let get = |uri: &str| Request::builder().uri(uri).body(Body::empty()).unwrap();
+    for uri in ["/", "/index.html", "/retouch/deep/link"] {
+        let (status, headers, body) = lab.send(get(uri)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(body.starts_with(b"<!doctype html>"), "{uri}");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-cache", "{uri}");
+    }
+    let (status, headers, _) = lab.send(get("/assets/app-1a2b.js")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key(header::CACHE_CONTROL));
+    // The API keeps its own headers.
+    let (status, headers, _) = lab.send(get("/v1/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key(header::CACHE_CONTROL));
+}

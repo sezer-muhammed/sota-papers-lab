@@ -9,10 +9,11 @@ export type RenderOutput = {
  */
 params: Params, 
 /**
- * Display-size JPEG, upright.
+ * Display-size JPEG, upright; with `region`, that region at 1:1.
  */
-preview: ArtifactRef, jpeg: ArtifactRef | null, tiff: ArtifactRef | null, xmp: ArtifactRef | null, stem: string, 
+preview: ArtifactRef, jpeg: ArtifactRef | null, tiff: ArtifactRef | null, png: ArtifactRef | null, xmp: ArtifactRef | null, stem: string, 
 /**
- * Upright size of `jpeg` (or of `preview` when there is no jpeg).
+ * Upright size of the full-resolution files (or of `preview` when
+ * there are none); with `region`, the region's size after clipping.
  */
 width: number, height: number, };

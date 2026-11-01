@@ -18,7 +18,11 @@ chosen: string, candidates: Array<CandidateSummary>, judge: JudgeSummary | null,
 /**
  * Display-size JPEGs, upright: neutral settings and the chosen edit.
  */
-before: ArtifactRef, after: ArtifactRef, jpeg: ArtifactRef | null, tiff: ArtifactRef | null, xmp: ArtifactRef | null, 
+before: ArtifactRef, after: ArtifactRef, jpeg: ArtifactRef | null, tiff: ArtifactRef | null, 
+/**
+ * Full-resolution PNG (image/png); download it as `<stem>.png`.
+ */
+png: ArtifactRef | null, xmp: ArtifactRef | null, 
 /**
  * Download name stem: the RAW's file name without extension.
  */

@@ -52,7 +52,7 @@ const MISSING_LIMIT = 5;
 const SESSION_KEY = "spl-retouch-session";
 
 /** No export files: what a preview render asks for. */
-const NO_EXPORT = { jpeg: false, jpeg_quality: 95, tiff16: false, xmp: false };
+const NO_EXPORT = { jpeg: false, jpeg_quality: 95, tiff16: false, png: false, png_bits: 8, xmp: false };
 
 export type RetouchClient = Pick<SplClient, "uploadArtifact" | "startRun" | "runDetail" | "cancelRun">;
 
@@ -321,7 +321,7 @@ export class RetouchSession {
       size: "full",
       filename: photo.filename,
       // A full-size export is for the JPEG, whatever the auto options say.
-      export: { jpeg: true, jpeg_quality: o.jpegQuality, tiff16: o.tiff16, xmp: o.xmp },
+      export: { jpeg: true, jpeg_quality: o.jpegQuality, tiff16: o.tiff16, png: true, png_bits: 8, xmp: o.xmp },
     };
     const life = this.lifetime(key);
     this.setExport(key, () => ({ status: "running", params, progress: null, cancelling: false }));

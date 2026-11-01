@@ -1,4 +1,5 @@
-//! Image files: orientation, resizing, JPEG and 16-bit TIFF. Owner: judge.
+//! Image files: orientation, resizing, JPEG, 16-bit TIFF and PNG. Owner:
+//! judge (PNG: media).
 
 use std::io::Cursor;
 use std::sync::OnceLock;
@@ -270,6 +271,269 @@ pub fn tiff16(img: &Rgb16Image) -> Result<Vec<u8>> {
         .write_image::<colortype::RGB16>(w, h, &img.data[..img.width * img.height * 3])
         .map_err(|e| anyhow!("encode TIFF ({w}x{h}): {e}"))?;
     Ok(buf.into_inner())
+}
+
+/// Lossless 8-bit sRGB PNG. See [`png16`].
+pub fn png8(img: &Rgb8Image) -> Result<Vec<u8>> {
+    let (w, h) = check_size(img.width, img.height, img.data.len(), PNG_MAX)?;
+    let row = img.width * 3;
+    png(w, h, 8, png_parts(h as usize), |y, out| {
+        out.extend_from_slice(&img.data[y * row..(y + 1) * row]);
+    })
+}
+
+/// Lossless 16-bit sRGB PNG.
+///
+/// Fast rather than small: every row uses the Paeth filter, and the rows are
+/// split into one band per core, each deflated at the fastest level on its
+/// own thread and joined into one zlib stream (bands end on a sync flush,
+/// as pigz does), so a 61 MP image encodes in about a second.
+pub fn png16(img: &Rgb16Image) -> Result<Vec<u8>> {
+    let (w, h) = check_size(img.width, img.height, img.data.len(), PNG_MAX)?;
+    let row = img.width * 3;
+    png(w, h, 16, png_parts(h as usize), |y, out| {
+        out.extend(
+            img.data[y * row..(y + 1) * row]
+                .iter()
+                .flat_map(|v| v.to_be_bytes()),
+        );
+    })
+}
+
+/// PNG's own limit is 2^31 - 1 per side; this keeps a row's bytes small.
+const PNG_MAX: usize = 1 << 20;
+
+fn png_parts(height: usize) -> usize {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+    // Bands of at least 64 rows: the sync flush costs a few bytes each.
+    threads.min(height.div_ceil(64)).max(1)
+}
+
+/// A PNG of `height` rows of RGB at `depth` bits, `row(y, out)` appending
+/// row y's samples (big-endian at 16 bits), deflated in `parts` bands.
+fn png<F>(width: u32, height: u32, depth: u8, parts: usize, row: F) -> Result<Vec<u8>>
+where
+    F: Fn(usize, &mut Vec<u8>) + Sync,
+{
+    let (w, h) = (width as usize, height as usize);
+    let bpp = 3 * usize::from(depth / 8);
+    let parts = parts.clamp(1, h);
+    let per = h.div_ceil(parts);
+    let bands: Vec<(usize, usize)> = (0..h)
+        .step_by(per)
+        .map(|y0| (y0, (y0 + per).min(h)))
+        .collect();
+    let last = bands.len() - 1;
+    let deflated: Vec<Result<(Vec<u8>, u32, usize)>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = bands
+            .iter()
+            .enumerate()
+            .map(|(i, &(y0, y1))| {
+                let row = &row;
+                scope.spawn(move || deflate_band(w * bpp, bpp, y0, y1, i == last, row))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|t| {
+                t.join()
+                    .unwrap_or_else(|_| Err(anyhow!("PNG encoder thread panicked")))
+            })
+            .collect()
+    });
+
+    let mut out = Vec::with_capacity(
+        deflated
+            .iter()
+            .map(|d| d.as_ref().map_or(0, |d| d.0.len() + 12))
+            .sum::<usize>()
+            + 128,
+    );
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    // Truecolour, deflate, adaptive filtering, no interlace.
+    ihdr.extend_from_slice(&[depth, 2, 0, 0, 0]);
+    png_chunk(&mut out, b"IHDR", &[&ihdr]);
+    // sRGB, perceptual intent: colour-managed viewers show it as exported.
+    png_chunk(&mut out, b"sRGB", &[&[0]]);
+    let mut adler: Option<u32> = None;
+    for (i, band) in deflated.into_iter().enumerate() {
+        let (data, band_adler, len) = band?;
+        adler = Some(match adler {
+            None => band_adler,
+            Some(a) => adler32_combine(a, band_adler, len),
+        });
+        // One IDAT per band: the zlib header opens the first, the Adler-32
+        // of every filtered byte closes the last.
+        let header: &[u8] = if i == 0 { &[0x78, 0x01] } else { &[] };
+        let trailer = if i == last {
+            adler.unwrap_or(1).to_be_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+        png_chunk(&mut out, b"IDAT", &[header, &data, &trailer]);
+    }
+    png_chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+/// Rows `y0..y1`, Paeth-filtered and deflated as raw DEFLATE ending on a
+/// sync flush (or the final block when `last`), with the Adler-32 and
+/// length of the filtered bytes.
+fn deflate_band<F>(
+    row_bytes: usize,
+    bpp: usize,
+    y0: usize,
+    y1: usize,
+    last: bool,
+    row: &F,
+) -> Result<(Vec<u8>, u32, usize)>
+where
+    F: Fn(usize, &mut Vec<u8>),
+{
+    use flate2::{Compress, Compression, FlushCompress};
+
+    let mut deflate = Compress::new(Compression::fast(), false);
+    let mut out = Vec::with_capacity((y1 - y0) * row_bytes / 2 + 1024);
+    let mut prev = Vec::with_capacity(row_bytes);
+    let mut cur = Vec::with_capacity(row_bytes);
+    let mut filtered = Vec::with_capacity(row_bytes + 1);
+    if y0 > 0 {
+        row(y0 - 1, &mut prev);
+    }
+    let mut adler = 1u32;
+    let mut len = 0;
+    for y in y0..y1 {
+        cur.clear();
+        row(y, &mut cur);
+        paeth(&cur, (y > 0).then_some(&prev[..]), bpp, &mut filtered);
+        adler = adler32(adler, &filtered);
+        len += filtered.len();
+        compress(&mut deflate, &filtered, &mut out, FlushCompress::None)?;
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    let flush = if last {
+        FlushCompress::Finish
+    } else {
+        FlushCompress::Sync
+    };
+    compress(&mut deflate, &[], &mut out, flush)?;
+    Ok((out, adler, len))
+}
+
+/// Feeds `input` to `deflate`, growing `out` as needed, until it is all
+/// consumed and, for a flush, the flush is complete.
+fn compress(
+    deflate: &mut flate2::Compress,
+    mut input: &[u8],
+    out: &mut Vec<u8>,
+    flush: flate2::FlushCompress,
+) -> Result<()> {
+    use flate2::{FlushCompress, Status};
+
+    loop {
+        if out.capacity() - out.len() < 32 * 1024 {
+            out.reserve(out.capacity().max(64 * 1024));
+        }
+        let before = deflate.total_in();
+        let status = deflate
+            .compress_vec(input, out, flush)
+            .map_err(|e| anyhow!("deflate PNG data: {e}"))?;
+        input = &input[(deflate.total_in() - before) as usize..];
+        let room_left = out.len() < out.capacity();
+        let done = match flush {
+            FlushCompress::None => input.is_empty(),
+            FlushCompress::Finish => status == Status::StreamEnd,
+            _ => input.is_empty() && room_left,
+        };
+        if done {
+            return Ok(());
+        }
+    }
+}
+
+/// PNG filter type 4 (Paeth) of `cur` above `prev` (none for the first
+/// row), with its filter byte, into `out`.
+fn paeth(cur: &[u8], prev: Option<&[u8]>, bpp: usize, out: &mut Vec<u8>) {
+    out.clear();
+    out.push(4);
+    match prev {
+        None => {
+            // Above is zero: Paeth predicts from the left.
+            out.extend_from_slice(&cur[..bpp.min(cur.len())]);
+            out.extend(
+                cur.iter()
+                    .skip(bpp)
+                    .zip(cur)
+                    .map(|(&x, &a)| x.wrapping_sub(a)),
+            );
+        }
+        Some(up) => {
+            for i in 0..cur.len().min(bpp) {
+                out.push(cur[i].wrapping_sub(up[i]));
+            }
+            for i in bpp..cur.len() {
+                let (a, b, c) = (cur[i - bpp], up[i], up[i - bpp]);
+                let p = i16::from(a) + i16::from(b) - i16::from(c);
+                let (pa, pb, pc) = (
+                    (p - i16::from(a)).abs(),
+                    (p - i16::from(b)).abs(),
+                    (p - i16::from(c)).abs(),
+                );
+                let predicted = if pa <= pb && pa <= pc {
+                    a
+                } else if pb <= pc {
+                    b
+                } else {
+                    c
+                };
+                out.push(cur[i].wrapping_sub(predicted));
+            }
+        }
+    }
+}
+
+const ADLER_MOD: u32 = 65521;
+
+fn adler32(adler: u32, data: &[u8]) -> u32 {
+    let (mut a, mut b) = (adler & 0xffff, adler >> 16);
+    // 5552 bytes is the most that cannot overflow u32 before the modulo.
+    for block in data.chunks(5552) {
+        for &x in block {
+            a += u32::from(x);
+            b += a;
+        }
+        a %= ADLER_MOD;
+        b %= ADLER_MOD;
+    }
+    (b << 16) | a
+}
+
+/// The Adler-32 of A followed by B from theirs and B's length (zlib's
+/// `adler32_combine`).
+fn adler32_combine(first: u32, second: u32, second_len: usize) -> u32 {
+    let m = u64::from(ADLER_MOD);
+    let rem = second_len as u64 % m;
+    let (a1, b1) = (u64::from(first & 0xffff), u64::from(first >> 16));
+    let (a2, b2) = (u64::from(second & 0xffff), u64::from(second >> 16));
+    let a = (a1 + a2 + m - 1) % m;
+    let b = (rem * a1 % m + b1 + b2 + m - rem) % m;
+    ((b << 16) | a) as u32
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], parts: &[&[u8]]) {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    out.extend_from_slice(&(len as u32).to_be_bytes());
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(kind);
+    out.extend_from_slice(kind);
+    for part in parts {
+        crc.update(part);
+        out.extend_from_slice(part);
+    }
+    out.extend_from_slice(&crc.finalize().to_be_bytes());
 }
 
 fn check_size(w: usize, h: usize, len: usize, max: usize) -> Result<(u32, u32)> {
@@ -622,6 +886,149 @@ mod tests {
         assert!(tiff16(&Rgb16Image::default()).is_err());
     }
 
+    /// A PNG reader for the tests: checks the signature and every chunk's
+    /// CRC, inflates the IDATs (which checks the Adler-32) and undoes the
+    /// filters. Returns (width, height, bit depth, samples as u16).
+    fn read_png(bytes: &[u8]) -> (usize, usize, u8, Vec<u16>) {
+        use std::io::Read;
+
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let mut at = 8;
+        let (mut ihdr, mut idat, mut kinds) = (Vec::new(), Vec::new(), Vec::new());
+        while at < bytes.len() {
+            let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let kind = &bytes[at + 4..at + 8];
+            let data = &bytes[at + 8..at + 8 + len];
+            let crc = u32::from_be_bytes(bytes[at + 8 + len..at + 12 + len].try_into().unwrap());
+            assert_eq!(crc, crc32fast::hash(&bytes[at + 4..at + 8 + len]), "CRC");
+            match kind {
+                b"IHDR" => ihdr = data.to_vec(),
+                b"IDAT" => idat.extend_from_slice(data),
+                _ => {}
+            }
+            kinds.push(String::from_utf8_lossy(kind).into_owned());
+            at += 12 + len;
+        }
+        assert_eq!(kinds.first().map(String::as_str), Some("IHDR"));
+        assert_eq!(kinds.last().map(String::as_str), Some("IEND"));
+        let w = u32::from_be_bytes(ihdr[0..4].try_into().unwrap()) as usize;
+        let h = u32::from_be_bytes(ihdr[4..8].try_into().unwrap()) as usize;
+        let depth = ihdr[8];
+        assert_eq!(&ihdr[9..], &[2, 0, 0, 0]);
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(&idat[..])
+            .read_to_end(&mut raw)
+            .expect("valid zlib stream with a matching Adler-32");
+        let bpp = 3 * usize::from(depth / 8);
+        let stride = w * bpp;
+        assert_eq!(raw.len(), h * (stride + 1));
+        let mut rows: Vec<Vec<u8>> = Vec::with_capacity(h);
+        for y in 0..h {
+            let line = &raw[y * (stride + 1)..(y + 1) * (stride + 1)];
+            let mut cur = line[1..].to_vec();
+            let up = |i: usize| if y > 0 { rows[y - 1][i] } else { 0 };
+            for i in 0..stride {
+                let a = if i >= bpp { cur[i - bpp] } else { 0 };
+                let (b, c) = (up(i), if i >= bpp { up(i - bpp) } else { 0 });
+                let predicted = match line[0] {
+                    0 => 0,
+                    1 => a,
+                    2 => b,
+                    3 => ((u16::from(a) + u16::from(b)) / 2) as u8,
+                    4 => {
+                        let p = i16::from(a) + i16::from(b) - i16::from(c);
+                        let (pa, pb, pc) = (
+                            (p - i16::from(a)).abs(),
+                            (p - i16::from(b)).abs(),
+                            (p - i16::from(c)).abs(),
+                        );
+                        if pa <= pb && pa <= pc {
+                            a
+                        } else if pb <= pc {
+                            b
+                        } else {
+                            c
+                        }
+                    }
+                    f => panic!("filter {f}"),
+                };
+                cur[i] = cur[i].wrapping_add(predicted);
+            }
+            rows.push(cur);
+        }
+        let flat = rows.concat();
+        let samples = if depth == 16 {
+            flat.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_be_bytes(*b))
+                .collect()
+        } else {
+            flat.iter().map(|&v| u16::from(v)).collect()
+        };
+        (w, h, depth, samples)
+    }
+
+    #[test]
+    fn png_round_trips_at_8_and_16_bits_in_any_number_of_bands() {
+        for (w, h) in [(1, 1), (7, 3), (131, 77), (64, 300)] {
+            let img8 = test_image(w, h);
+            let img16 = Rgb16Image {
+                width: w,
+                height: h,
+                data: (0..w * h * 3).map(|i| (i * 7919 % 65536) as u16).collect(),
+            };
+            for parts in [1, 2, 3, 7, 16, 1000] {
+                let row = w * 3;
+                let bytes = png(w as u32, h as u32, 8, parts, |y, out| {
+                    out.extend_from_slice(&img8.data[y * row..(y + 1) * row]);
+                })
+                .unwrap();
+                let (rw, rh, depth, samples) = read_png(&bytes);
+                assert_eq!((rw, rh, depth), (w, h, 8));
+                assert!(
+                    samples
+                        .iter()
+                        .map(|&v| v as u8)
+                        .eq(img8.data.iter().copied()),
+                    "8-bit {w}x{h} in {parts} bands"
+                );
+                let bytes = png(w as u32, h as u32, 16, parts, |y, out| {
+                    out.extend(
+                        img16.data[y * row..(y + 1) * row]
+                            .iter()
+                            .flat_map(|v| v.to_be_bytes()),
+                    );
+                })
+                .unwrap();
+                let (rw, rh, depth, samples) = read_png(&bytes);
+                assert_eq!((rw, rh, depth), (w, h, 16));
+                assert_eq!(samples, img16.data, "16-bit {w}x{h} in {parts} bands");
+            }
+            // The public entry points pick their own band count.
+            assert_eq!(read_png(&png8(&img8).unwrap()).3.len(), w * h * 3);
+            assert_eq!(read_png(&png16(&img16).unwrap()).3, img16.data);
+        }
+        assert!(png8(&Rgb8Image::default()).is_err());
+        assert!(png16(&Rgb16Image::default()).is_err());
+    }
+
+    #[test]
+    fn adler32_matches_and_combines() {
+        let data: Vec<u8> = (0..20_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        // zlib's own: "Wikipedia" is 0x11E60398.
+        assert_eq!(adler32(1, b"Wikipedia"), 0x11E6_0398);
+        let whole = adler32(1, &data);
+        for split in [0, 1, 5552, 7777, 20_000] {
+            let (a, b) = data.split_at(split);
+            assert_eq!(
+                adler32_combine(adler32(1, a), adler32(1, b), b.len()),
+                whole,
+                "split at {split}"
+            );
+        }
+    }
+
     /// Export cost at 24 and 61 MP. Run in release on the GPU host; set
     /// SPL_TEST_OUT to keep a display-size JPEG of the result.
     #[test]
@@ -669,14 +1076,24 @@ mod tests {
             let t = Instant::now();
             let display = resize(&rgb8, 1536);
             let resize_ms = t.elapsed().as_secs_f64() * 1e3;
+            let t = Instant::now();
+            let p8 = png8(&rgb8).unwrap();
+            let png8_ms = t.elapsed().as_secs_f64() * 1e3;
+            let t = Instant::now();
+            let p16 = png16(&upright).unwrap();
+            let png16_ms = t.elapsed().as_secs_f64() * 1e3;
             println!(
                 "{w}x{h}: orient16 {orient_ms:.0} ms, to_rgb8 {dither_ms:.0} ms, \
                  jpeg q95 {jpeg95_ms:.0} ms ({:.1} MB), jpeg q88 {jpeg88_ms:.0} ms ({:.1} MB), \
-                 tiff16 {tiff_ms:.0} ms ({:.0} MB, {:.0}% of raw), resize to 1536 {resize_ms:.0} ms",
+                 tiff16 {tiff_ms:.0} ms ({:.0} MB, {:.0}% of raw), resize to 1536 {resize_ms:.0} ms, \
+                 png8 {png8_ms:.0} ms ({:.0} MB), png16 {png16_ms:.0} ms ({:.0} MB), {} threads",
                 q95.len() as f64 / 1e6,
                 q88.len() as f64 / 1e6,
                 tiff.len() as f64 / 1e6,
                 100.0 * tiff.len() as f64 / (w * h * 6) as f64,
+                p8.len() as f64 / 1e6,
+                p16.len() as f64 / 1e6,
+                png_parts(h),
             );
             assert_eq!((upright.width, upright.height), (h, w));
             if let Some(dir) = std::env::var_os("SPL_TEST_OUT") {

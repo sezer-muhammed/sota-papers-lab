@@ -155,6 +155,8 @@ mod tests {
             f_number: Some(4.0),
             focal_length_mm: Some(35.0),
             captured_at: None,
+            gps: None,
+            place: None,
             as_shot_temperature: 5200.0,
             as_shot_tint: 3.0,
             raw_clipped_fraction: 0.0,

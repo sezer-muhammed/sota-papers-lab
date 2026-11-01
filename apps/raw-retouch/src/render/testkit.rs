@@ -412,6 +412,8 @@ fn scene_from(raw: &Raw, half: &LinearImage, color: &TestColor) -> Scene {
         f_number: None,
         focal_length_mm: None,
         captured_at: None,
+        gps: None,
+        place: None,
         as_shot_temperature: t0,
         as_shot_tint: tint0,
         raw_clipped_fraction: 0.0,

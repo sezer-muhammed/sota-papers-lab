@@ -688,12 +688,34 @@ pub struct RawInfo {
     pub exposure_time_s: Option<f32>,
     pub f_number: Option<f32>,
     pub focal_length_mm: Option<f32>,
-    /// EXIF DateTimeOriginal as the camera wrote it.
+    /// When the photo was taken, ISO 8601 from EXIF DateTimeOriginal:
+    /// "2025-10-12T14:33:05", with the UTC offset ("+03:00") when the file
+    /// has OffsetTimeOriginal, else the camera's local time.
     pub captured_at: Option<String>,
+    /// Where it was taken, when the file carries a GPS position.
+    #[serde(default)]
+    pub gps: Option<Gps>,
+    /// The nearest city to `gps`, e.g. "Bornova, İzmir, Türkiye", from a
+    /// bundled offline table (`crate::place`; the position never leaves
+    /// the host).
+    #[serde(default)]
+    pub place: Option<String>,
     pub as_shot_temperature: f32,
     pub as_shot_tint: f32,
     /// Share of pixels clipped in at least one channel in the RAW (0 to 1).
     pub raw_clipped_fraction: f32,
+}
+
+/// A GPS position from the file's EXIF.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[ts(export, export_to = "raw-retouch/")]
+pub struct Gps {
+    /// Degrees, north positive.
+    pub lat: f64,
+    /// Degrees, east positive.
+    pub lon: f64,
+    /// Metres above sea level (negative below).
+    pub alt_m: Option<f64>,
 }
 
 /// Linear camera RGB, interleaved, row-major, unrotated. As-shot white

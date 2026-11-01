@@ -100,6 +100,8 @@ export function autoInput(options: RetouchOptions, raw: string, filename: string
       jpeg: options.jpeg,
       jpeg_quality: options.jpegQuality,
       tiff16: options.tiff16,
+      png: true,
+      png_bits: 8,
       xmp: options.xmp,
     },
   };

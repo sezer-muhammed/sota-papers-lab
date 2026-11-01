@@ -77,7 +77,8 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
     let stem = stem(input.filename.as_deref());
     let plan = input.use_claude && input.plan;
     let refine = input.use_claude && input.refine;
-    let full_res = input.export.jpeg || input.export.tiff16;
+    input.export.check()?;
+    let full_res = input.export.full_res();
     let timeline = Timeline::new(&[
         (Stage::Load, LOAD_S),
         (Stage::Plan, if plan { PLAN_S } else { 0.0 }),
@@ -559,6 +560,7 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
         after: after.clone(),
         jpeg: files.jpeg,
         tiff: files.tiff,
+        png: files.png,
         xmp: files.xmp,
         stem,
         timings,

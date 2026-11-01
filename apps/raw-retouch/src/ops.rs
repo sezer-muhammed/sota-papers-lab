@@ -5,11 +5,14 @@
 //! four most recent files, so live slider previews skip straight to the
 //! render), keeps CUDA and heavy CPU work on the blocking pool, and stores
 //! what it makes as artifacts: display-size JPEGs for people and Claude,
-//! full-resolution JPEG and TIFF, and an XMP sidecar.
+//! full-resolution JPEG, PNG and TIFF, an XMP sidecar, and 1:1 regions of
+//! the full-resolution render for zoomed views (`region.rs`, which keeps
+//! the latest full-resolution renders so panning only crops).
 
 mod cache;
 mod export;
 mod pipeline;
+mod region;
 mod work;
 
 use schemars::JsonSchema;
@@ -21,6 +24,7 @@ use crate::finish;
 use crate::render::RenderEngine;
 use crate::types::{Params, RawInfo};
 use export::{Shown, display, put_jpeg};
+pub use region::{MAX_REGION, Region};
 use work::{Stage, Timeline, blocking, ensure_live, open_gpu, stem, unless_cancelled};
 
 fn yes() -> bool {
@@ -41,6 +45,10 @@ fn default_evals() -> u32 {
 
 fn default_quality() -> u8 {
     95
+}
+
+fn default_png_bits() -> u8 {
+    8
 }
 
 #[derive(Debug, Deserialize, JsonSchema, TS)]
@@ -72,6 +80,13 @@ pub struct ExportOptions {
     /// Full-resolution 16-bit TIFF (large).
     #[serde(default)]
     pub tiff16: bool,
+    /// Full-resolution lossless PNG, sRGB. On when absent.
+    #[serde(default = "yes")]
+    pub png: bool,
+    /// The PNG's bits per sample: 8 (the JPEG's pixels, losslessly) or 16;
+    /// 8 when absent.
+    #[serde(default = "default_png_bits")]
+    pub png_bits: u8,
     /// Lightroom / Camera Raw XMP sidecar with every develop setting.
     #[serde(default = "yes")]
     pub xmp: bool,
@@ -83,6 +98,8 @@ impl Default for ExportOptions {
             jpeg: true,
             jpeg_quality: default_quality(),
             tiff16: false,
+            png: true,
+            png_bits: default_png_bits(),
             xmp: true,
         }
     }
@@ -182,6 +199,8 @@ pub struct AutoOutput {
     pub after: ArtifactRef,
     pub jpeg: Option<ArtifactRef>,
     pub tiff: Option<ArtifactRef>,
+    /// Full-resolution PNG (image/png); download it as `<stem>.png`.
+    pub png: Option<ArtifactRef>,
     pub xmp: Option<ArtifactRef>,
     /// Download name stem: the RAW's file name without extension.
     pub stem: String,
@@ -212,6 +231,15 @@ pub struct RenderInput {
     /// Used when `size` is "full".
     #[serde(default)]
     pub export: ExportOptions,
+    /// Render just this rectangle of the upright full-resolution image, at
+    /// 1:1 and exactly as the export has it (Detail and Lens Corrections
+    /// included), as `preview` (JPEG q92); at most 2048x2048, clipped to
+    /// the image. `size` and `export` are then ignored. The first region of
+    /// a photo and settings renders the whole image (or takes it from the
+    /// export); the next ones only crop it.
+    #[serde(default)]
+    #[ts(optional)]
+    pub region: Option<Region>,
 }
 
 #[derive(Debug, Serialize, JsonSchema, TS)]
@@ -220,13 +248,15 @@ pub struct RenderOutput {
     /// What was rendered: the input's settings clamped to Lightroom's
     /// ranges and rounded to its steps, as the XMP has them.
     pub params: Params,
-    /// Display-size JPEG, upright.
+    /// Display-size JPEG, upright; with `region`, that region at 1:1.
     pub preview: ArtifactRef,
     pub jpeg: Option<ArtifactRef>,
     pub tiff: Option<ArtifactRef>,
+    pub png: Option<ArtifactRef>,
     pub xmp: Option<ArtifactRef>,
     pub stem: String,
-    /// Upright size of `jpeg` (or of `preview` when there is no jpeg).
+    /// Upright size of the full-resolution files (or of `preview` when
+    /// there are none); with `region`, the region's size after clipping.
     pub width: u32,
     pub height: u32,
 }
@@ -299,8 +329,14 @@ impl Op for Render {
 
     async fn run(&self, cx: &RunCx, input: RenderInput) -> Result<RenderOutput> {
         let params = input.params.quantized();
+        if let Some(region) = input.region {
+            return render_region(cx, &input, params, region).await;
+        }
         let full = input.size == RenderSize::Full;
-        let files_wanted = full && (input.export.jpeg || input.export.tiff16 || input.export.xmp);
+        if full {
+            input.export.check()?;
+        }
+        let files_wanted = full && (input.export.full_res() || input.export.xmp);
         let timeline = Timeline::new(&[
             (Stage::Load, 4.0),
             (Stage::Render, 1.0),
@@ -337,7 +373,7 @@ impl Op for Render {
                 timeline.span(Stage::Export),
             )
             .await?;
-            if let (Some(_), Some((w, h))) = (&files.jpeg, files.size) {
+            if let Some((w, h)) = files.size {
                 (width, height) = (w, h);
             }
         }
@@ -347,10 +383,53 @@ impl Op for Render {
             preview,
             jpeg: files.jpeg,
             tiff: files.tiff,
+            png: files.png,
             xmp: files.xmp,
             stem,
             width,
             height,
         })
     }
+}
+
+/// [`Render`] of one region at 1:1 ([`region::render`]).
+async fn render_region(
+    cx: &RunCx,
+    input: &RenderInput,
+    params: Params,
+    region: Region,
+) -> Result<RenderOutput> {
+    let timeline = Timeline::new(&[(Stage::Load, 4.0), (Stage::Export, 4.0)]);
+    let gpu = open_gpu(cx).await?;
+    let loaded = unless_cancelled(
+        cx,
+        cache::developed(cx, &input.raw, &gpu, timeline.span(Stage::Load)),
+    )
+    .await?;
+    ensure_live(cx)?;
+    let tile = unless_cancelled(
+        cx,
+        region::render(
+            cx,
+            &gpu,
+            &loaded.photo,
+            &params,
+            region,
+            timeline.span(Stage::Export),
+        ),
+    )
+    .await?;
+    let preview = put_jpeg(cx, tile.jpeg).await?;
+    cx.progress(1.0, "Done");
+    Ok(RenderOutput {
+        params,
+        preview,
+        jpeg: None,
+        tiff: None,
+        png: None,
+        xmp: None,
+        stem: stem(input.filename.as_deref()),
+        width: tile.width,
+        height: tile.height,
+    })
 }

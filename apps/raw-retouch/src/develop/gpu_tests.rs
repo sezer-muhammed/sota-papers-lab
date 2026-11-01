@@ -460,6 +460,8 @@ fn synthetic(
             f_number: None,
             focal_length_mm: None,
             captured_at: None,
+            gps: None,
+            place: None,
             as_shot_temperature: 5000.0,
             as_shot_tint: 0.0,
             raw_clipped_fraction: 0.0,

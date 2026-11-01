@@ -3,6 +3,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use rawler::decoders::{FormatHint, RawDecodeParams, RawMetadata};
+use rawler::exif::{Exif, ExifGPS};
 use rawler::formats::tiff::Rational;
 use rawler::imgop::xyz::Illuminant;
 use rawler::rawimage::{BlackLevel, RawImage, RawImageData, RawPhotometricInterpretation};
@@ -10,7 +11,8 @@ use rawler::rawsource::RawSource;
 use spl_core::{Result, anyhow, bail};
 
 use crate::color::ColorModel;
-use crate::types::RawInfo;
+use crate::place;
+use crate::types::{Gps, RawInfo};
 
 /// A decoded RAW, cropped to the camera's default crop, still mosaiced (or
 /// three-channel for linear RAWs such as Sony's M/S lossless sizes).
@@ -158,6 +160,7 @@ fn build_frame(decoded: Decoded, bytes: &[u8]) -> Result<RawFrame> {
     let exif = metadata.as_ref().map(|m| &m.exif);
     let (as_shot_temperature, as_shot_tint) = color.temp_tint_for(wb_as_shot);
     let text = |s: Option<&String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let gps = exif.and_then(|e| e.gps.as_ref()).and_then(gps_position);
     let info = RawInfo {
         make: non_empty(&img.clean_make, &img.make),
         model: non_empty(&img.clean_model, &img.model),
@@ -184,8 +187,9 @@ fn build_frame(decoded: Decoded, bytes: &[u8]) -> Result<RawFrame> {
         exposure_time_s: exif.and_then(|e| ratio(e.exposure_time)),
         f_number: exif.and_then(|e| ratio(e.fnumber)),
         focal_length_mm: exif.and_then(|e| ratio(e.focal_length)),
-        captured_at: exif
-            .and_then(|e| text(e.date_time_original.as_ref()).or(text(e.create_date.as_ref()))),
+        captured_at: exif.and_then(captured_at),
+        gps,
+        place: gps.and_then(|g| place::place_name(g.lat, g.lon)),
         as_shot_temperature,
         as_shot_tint,
         raw_clipped_fraction: 0.0,
@@ -412,6 +416,91 @@ fn for_each_slot(data: &[u16], width: usize, channels: usize, mut f: impl FnMut(
             f(base, v);
         }
     }
+}
+
+/// EXIF DateTimeOriginal (else CreateDate), "YYYY:MM:DD HH:MM:SS", as ISO
+/// 8601, with OffsetTimeOriginal ("+03:00") when the file has one. `None`
+/// for a missing, blank or malformed date (cameras without a set clock
+/// write zeros or spaces).
+fn captured_at(exif: &Exif) -> Option<String> {
+    let date = [&exif.date_time_original, &exif.create_date]
+        .into_iter()
+        .find_map(|d| iso_date_time(d.as_deref()?))?;
+    let offset = [&exif.offset_time_original, &exif.offset_time]
+        .into_iter()
+        .find_map(|o| utc_offset(o.as_deref()?));
+    Some(date + offset.as_deref().unwrap_or_default())
+}
+
+fn iso_date_time(exif: &str) -> Option<String> {
+    let s = exif.trim().trim_end_matches('\0');
+    let b = s.as_bytes();
+    let digits = |r: std::ops::Range<usize>| {
+        b.get(r.clone())
+            .filter(|d| d.iter().all(u8::is_ascii_digit))
+            .map(|_| &s[r])
+    };
+    let (y, mo, d) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
+    let (h, mi, sec) = (digits(11..13)?, digits(14..16)?, digits(17..19)?);
+    // The digit checks above make `b` at least 19 bytes long.
+    let separated = matches!(b[4], b':' | b'-')
+        && matches!(b[7], b':' | b'-')
+        && matches!(b[10], b' ' | b'T')
+        && b[13] == b':'
+        && b[16] == b':';
+    let in_range =
+        |v: &str, lo: u32, hi: u32| v.parse::<u32>().is_ok_and(|v| (lo..=hi).contains(&v));
+    let valid = separated
+        && in_range(y, 1900, 9999)
+        && in_range(mo, 1, 12)
+        && in_range(d, 1, 31)
+        && in_range(h, 0, 23)
+        && in_range(mi, 0, 59)
+        && in_range(sec, 0, 60);
+    valid.then(|| format!("{y}-{mo}-{d}T{h}:{mi}:{sec}"))
+}
+
+/// "+03:00" or "-05:30" as EXIF OffsetTime* writes it; "Z" stays "Z".
+fn utc_offset(exif: &str) -> Option<String> {
+    let s = exif.trim().trim_end_matches('\0');
+    if s == "Z" {
+        return Some(s.into());
+    }
+    let b = s.as_bytes();
+    let valid = b.len() == 6
+        && matches!(b[0], b'+' | b'-')
+        && b[3] == b':'
+        && [1, 2, 4, 5].iter().all(|&i| b[i].is_ascii_digit())
+        && s[1..3].parse::<u32>().is_ok_and(|h| h <= 14)
+        && s[4..6].parse::<u32>().is_ok_and(|m| m < 60);
+    valid.then(|| s.into())
+}
+
+/// Latitude and longitude (degrees, minutes, seconds plus N/S and E/W) and
+/// altitude from EXIF GPS. `None` without both coordinates, for
+/// out-of-range values, and for 0, 0: what cameras write without a fix.
+fn gps_position(g: &ExifGPS) -> Option<Gps> {
+    let degrees = |dms: &Option<[Rational; 3]>, negative: Option<bool>| {
+        let [d, m, s] = dms.as_ref()?;
+        let part = |r: &Rational| (r.d != 0).then(|| f64::from(r.n) / f64::from(r.d));
+        let value = part(d)? + part(m).unwrap_or(0.0) / 60.0 + part(s).unwrap_or(0.0) / 3600.0;
+        Some(if negative? { -value } else { value })
+    };
+    let reference = |r: &Option<String>, positive: char, negative: char| {
+        let c = r.as_deref()?.trim().chars().next()?.to_ascii_uppercase();
+        (c == positive || c == negative).then_some(c == negative)
+    };
+    let lat = degrees(&g.gps_latitude, reference(&g.gps_latitude_ref, 'N', 'S'))?;
+    let lon = degrees(&g.gps_longitude, reference(&g.gps_longitude_ref, 'E', 'W'))?;
+    if !(lat.abs() <= 90.0 && lon.abs() <= 180.0) || (lat == 0.0 && lon == 0.0) {
+        return None;
+    }
+    let alt_m = g
+        .gps_altitude
+        .filter(|r| r.d != 0)
+        .map(|r| f64::from(r.n) / f64::from(r.d))
+        .map(|a| if g.gps_altitude_ref == Some(1) { -a } else { a });
+    Some(Gps { lat, lon, alt_m })
 }
 
 fn ratio(r: Option<Rational>) -> Option<f32> {
@@ -691,6 +780,146 @@ mod tests {
         assert!((wb[0] - 2425.0 / 1024.0).abs() < 1e-6 && wb[1] == 1.0);
         assert!((wb[2] - 1816.0 / 1024.0).abs() < 1e-6);
         assert!(sony_sr2_wb(&file[..200]).is_none());
+    }
+
+    #[test]
+    fn capture_dates_become_iso_8601() {
+        let exif = |date: Option<&str>, offset: Option<&str>| Exif {
+            date_time_original: date.map(String::from),
+            offset_time_original: offset.map(String::from),
+            ..Exif::default()
+        };
+        let cases = [
+            (
+                Some("2025:10:12 14:33:05"),
+                None,
+                Some("2025-10-12T14:33:05"),
+            ),
+            (
+                Some("2025:10:12 14:33:05\0"),
+                Some("+03:00"),
+                Some("2025-10-12T14:33:05+03:00"),
+            ),
+            (
+                Some(" 2024:01:31 23:59:59 "),
+                Some("-05:30"),
+                Some("2024-01-31T23:59:59-05:30"),
+            ),
+            (
+                Some("2024:01:31 23:59:59"),
+                Some("bogus"),
+                Some("2024-01-31T23:59:59"),
+            ),
+            (Some("0000:00:00 00:00:00"), None, None),
+            (Some("    :  :     :  :  "), None, None),
+            (Some("2024:13:01 10:00:00"), None, None),
+            (Some("2024:01:01"), None, None),
+            (None, Some("+03:00"), None),
+        ];
+        for (date, offset, want) in cases {
+            assert_eq!(
+                captured_at(&exif(date, offset)).as_deref(),
+                want,
+                "{date:?}"
+            );
+        }
+        // CreateDate and OffsetTime stand in for the originals.
+        let fallback = Exif {
+            create_date: Some("2023:06:01 08:00:00".into()),
+            offset_time: Some("+01:00".into()),
+            ..Exif::default()
+        };
+        assert_eq!(
+            captured_at(&fallback).as_deref(),
+            Some("2023-06-01T08:00:00+01:00")
+        );
+    }
+
+    #[test]
+    fn gps_positions_take_their_hemisphere() {
+        let r = |n, d| Rational { n, d };
+        let izmir = ExifGPS {
+            gps_latitude_ref: Some("N".into()),
+            gps_latitude: Some([r(38, 1), r(25, 1), r(838, 100)]),
+            gps_longitude_ref: Some("E".into()),
+            gps_longitude: Some([r(27, 1), r(8, 1), r(1932, 100)]),
+            gps_altitude_ref: Some(0),
+            gps_altitude: Some(r(255, 10)),
+            ..ExifGPS::default()
+        };
+        let g = gps_position(&izmir).expect("position");
+        assert!((g.lat - 38.418_994).abs() < 1e-5, "{g:?}");
+        assert!((g.lon - 27.138_7).abs() < 1e-5, "{g:?}");
+        assert_eq!(g.alt_m, Some(25.5));
+
+        let south_west = ExifGPS {
+            gps_latitude_ref: Some("S".into()),
+            gps_longitude_ref: Some("W".into()),
+            gps_altitude_ref: Some(1),
+            ..izmir.clone()
+        };
+        let g = gps_position(&south_west).expect("position");
+        assert!(g.lat < -38.0 && g.lon < -27.0 && g.alt_m == Some(-25.5));
+
+        // No fix, a missing reference or a zero denominator: no position.
+        let zero = ExifGPS {
+            gps_latitude: Some([r(0, 1), r(0, 1), r(0, 1)]),
+            gps_longitude: Some([r(0, 1), r(0, 1), r(0, 1)]),
+            ..izmir.clone()
+        };
+        assert_eq!(gps_position(&zero), None);
+        let no_ref = ExifGPS {
+            gps_latitude_ref: None,
+            ..izmir.clone()
+        };
+        assert_eq!(gps_position(&no_ref), None);
+        let bad = ExifGPS {
+            gps_latitude: Some([r(38, 0), r(0, 1), r(0, 1)]),
+            ..izmir.clone()
+        };
+        assert_eq!(gps_position(&bad), None);
+        let out_of_range = ExifGPS {
+            gps_latitude: Some([r(95, 1), r(0, 1), r(0, 1)]),
+            ..izmir
+        };
+        assert_eq!(gps_position(&out_of_range), None);
+        assert_eq!(gps_position(&ExifGPS::default()), None);
+    }
+
+    /// Which sample RAWs carry a capture date and a GPS position. Reads
+    /// only metadata: `gpu-test <dir> decode::tests::sample_metadata --ignored`
+    /// (or any machine with SPL_RAW_SAMPLES set).
+    #[test]
+    #[ignore = "needs the sample RAWs"]
+    fn sample_metadata() {
+        let dir = std::env::var_os("SPL_RAW_SAMPLES")
+            .map_or_else(|| std::path::PathBuf::from("/samples"), Into::into);
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("samples")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        files.sort();
+        for path in files {
+            let bytes = std::fs::read(&path).expect("read sample");
+            let src = RawSource::new_from_slice(&bytes);
+            let Ok(decoder) = rawler::get_decoder(&src) else {
+                continue;
+            };
+            let meta = decoder.raw_metadata(&src, &RawDecodeParams::default()).ok();
+            let exif = meta.as_ref().map(|m| &m.exif);
+            let date = exif.and_then(captured_at);
+            let gps = exif.and_then(|e| e.gps.as_ref()).and_then(gps_position);
+            let place = gps.and_then(|g| place::place_name(g.lat, g.lon));
+            println!(
+                "{}: date {} (raw {:?} offset {:?}), gps {:?}, place {:?}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                date.as_deref().unwrap_or("-"),
+                exif.and_then(|e| e.date_time_original.as_deref()),
+                exif.and_then(|e| e.offset_time_original.as_deref()),
+                gps,
+                place,
+            );
+        }
     }
 
     #[test]
