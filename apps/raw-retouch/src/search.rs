@@ -16,6 +16,8 @@ mod halton;
 mod space;
 #[cfg(test)]
 mod synthetic;
+#[cfg(test)]
+mod tune;
 
 use std::collections::HashSet;
 use std::ops::Range;

@@ -39,8 +39,8 @@ const CONTRAST_WIDTH: f64 = 2.5;
 // Whites: EV shift at +-100, full from WHITES_ABOVE below the bright end up,
 // fading out WHITES_BELOW below it.
 const WHITES_UP: f64 = 1.0;
-const WHITES_DOWN: f64 = 1.25;
-const WHITES_BELOW: f64 = 2.0;
+const WHITES_DOWN: f64 = 1.4;
+const WHITES_BELOW: f64 = 2.25;
 const WHITES_ABOVE: f64 = 0.5;
 // Blacks: EV shift at +-100, full at the dark end, gone BLACKS_ABOVE above it.
 const BLACKS_UP: f64 = 1.25;
