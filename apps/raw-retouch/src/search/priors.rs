@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn priors_follow_the_spec_table() {
-        assert_eq!(END, PARAM_SPECS.len() - 8, "Detail and Lens follow");
+        assert_eq!(PARAM_SPECS[END].key, "sharpening", "Detail follows");
         for (k, s) in PRIORS.iter().enumerate() {
             let spec = &PARAM_SPECS[FIRST + k];
             assert_eq!(s.key, spec.key);
@@ -197,13 +197,15 @@ mod tests {
             ("blue_primary_hue", "blue_primary_saturation")
         );
         // The search varies the Basic panel and every field with a prior
-        // but the hues: the Color Mixer's, Shadows Tint and the primaries'.
+        // but the hues: the Color Mixer's, Shadows Tint and the primaries'
+        // (and, in the black-and-white look only, the gray mixer).
         let hues = [SHADOW_TINT, RED_HUE, GREEN_HUE, BLUE_HUE];
         for (i, spec) in PARAM_SPECS.iter().enumerate() {
             let hue = (HUE..SAT).contains(&i) || hues.contains(&i);
+            let gray = spec.key.starts_with("gray_");
             assert_eq!(
                 spec.searched,
-                i < Params::BASIC || ((FIRST..END).contains(&i) && !hue),
+                i < Params::BASIC || ((FIRST..END).contains(&i) && !hue) || gray,
                 "{}",
                 spec.key
             );

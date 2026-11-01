@@ -2,7 +2,7 @@
 //! `#define` of the same name there; `layout_matches_cuda` checks them.
 
 /// Floats per packed parameter set.
-pub(crate) const CAND_STRIDE: usize = 1504;
+pub(crate) const CAND_STRIDE: usize = 1600;
 /// Camera -> Rec.2020 matrix with the white-balance delta folded in (3x3, row-major).
 pub(crate) const P_A1: usize = 0;
 /// The same matrix for fully clipped pixels, which stay neutral.
@@ -34,6 +34,9 @@ pub(crate) const CURVE_LEN: usize = 288;
 /// Color Mixer and Calibration: `MIXER_LEN` floats packed by `render/color_mixer.rs`.
 pub(crate) const MIXER_OFF: usize = 1216;
 pub(crate) const MIXER_LEN: usize = 288;
+/// Black & White and its gray mixer: `BW_LEN` floats packed by `render/bw.rs`.
+pub(crate) const BW_OFF: usize = 1504;
+pub(crate) const BW_LEN: usize = 96;
 
 /// Bilateral grid: padding nodes on every side, and the log2-luminance axis.
 pub(crate) const GRID_PAD: usize = 2;
@@ -115,6 +118,8 @@ mod tests {
             ("CURVE_LEN", CURVE_LEN),
             ("MIXER_OFF", MIXER_OFF),
             ("MIXER_LEN", MIXER_LEN),
+            ("BW_OFF", BW_OFF),
+            ("BW_LEN", BW_LEN),
             ("GRID_PAD", GRID_PAD),
             ("LUMA_BINS", LUMA_BINS),
             ("CHROMA_BINS", CHROMA_BINS),
@@ -165,7 +170,8 @@ mod tests {
                     && LOCAL_OFF + LOCAL_N <= ENDS_OFF
                     && ENDS_OFF + LOCAL_N <= CURVE_OFF
                     && CURVE_OFF + CURVE_LEN <= MIXER_OFF
-                    && MIXER_OFF + MIXER_LEN <= CAND_STRIDE
+                    && MIXER_OFF + MIXER_LEN <= BW_OFF
+                    && BW_OFF + BW_LEN <= CAND_STRIDE
             )
         };
         const { assert!(P_SAT < P_PRES && P_PRES + P_PRES_N <= TONE_OFF) };

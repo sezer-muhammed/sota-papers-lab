@@ -59,4 +59,13 @@ export const PARAM_SPECS: ParamSpec[] = [
   {"key":"color_nr","label":"Color","crs":"ColorNoiseReduction","group":"Detail","min":0.0,"max":100.0,"step":1.0,"neutral":25.0,"searched":false},
   {"key":"lens_profile","label":"Enable Profile Corrections","crs":"LensProfileEnable","group":"Lens","min":0.0,"max":1.0,"step":1.0,"neutral":0.0,"searched":false},
   {"key":"lens_ca","label":"Remove Chromatic Aberration","crs":"AutoLateralCA","group":"Lens","min":0.0,"max":1.0,"step":1.0,"neutral":0.0,"searched":false},
+  {"key":"bw","label":"Black & White","crs":"ConvertToGrayscale","group":"BlackWhite","min":0.0,"max":1.0,"step":1.0,"neutral":0.0,"searched":false},
+  {"key":"gray_red","label":"B&W Red","crs":"GrayMixerRed","group":"BlackWhite","min":-100.0,"max":100.0,"step":1.0,"neutral":0.0,"searched":true},
+  {"key":"gray_orange","label":"B&W Orange","crs":"GrayMixerOrange","group":"BlackWhite","min":-100.0,"max":100.0,"step":1.0,"neutral":0.0,"searched":true},
+  {"key":"gray_yellow","label":"B&W Yellow","crs":"GrayMixerYellow","group":"BlackWhite","min":-100.0,"max":100.0,"step":1.0,"neutral":0.0,"searched":true},
+  {"key":"gray_green","label":"B&W Green","crs":"GrayMixerGreen","group":"BlackWhite","min":-100.0,"max":100.0,"step":1.0,"neutral":0.0,"searched":true},
+  {"key":"gray_aqua","label":"B&W Aqua","crs":"GrayMixerAqua","group":"BlackWhite","min":-100.0,"max":100.0,"step":1.0,"neutral":0.0,"searched":true},
+  {"key":"gray_blue","label":"B&W Blue","crs":"GrayMixerBlue","group":"BlackWhite","min":-100.0,"max":100.0,"step":1.0,"neutral":0.0,"searched":true},
+  {"key":"gray_purple","label":"B&W Purple","crs":"GrayMixerPurple","group":"BlackWhite","min":-100.0,"max":100.0,"step":1.0,"neutral":0.0,"searched":true},
+  {"key":"gray_magenta","label":"B&W Magenta","crs":"GrayMixerMagenta","group":"BlackWhite","min":-100.0,"max":100.0,"step":1.0,"neutral":0.0,"searched":true},
 ];

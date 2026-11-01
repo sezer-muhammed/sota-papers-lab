@@ -11,18 +11,19 @@
 //
 // The settings beyond the Basic panel live in hook files, each with its own
 // owner: cuda/tone_curve.cu (parametric tone curve), cuda/color_mixer.cu
-// (Color Mixer, Calibration's shadows tint) and cuda/presence.cu (Texture,
-// Clarity, Dehaze). render.rs splices them in at the HOOKS line below, so
+// (Color Mixer, Calibration's shadows tint), cuda/presence.cu (Texture,
+// Clarity, Dehaze) and cuda/bw.cu (Black & White, its gray mixer).
+// render.rs splices them in at the HOOKS line below, so
 // they see everything above it. render_core calls each hook at a fixed point
 // only when its file defines the hook's switch (TONE_CURVE_HOOK,
-// COLOR_MIXER_HOOK, PRESENCE_HOOK): even an empty inlined call can change
+// COLOR_MIXER_HOOK, PRESENCE_HOOK, BW_HOOK): even an empty inlined call can change
 // how NVVM fuses multiply-adds around it, so a stub that is off keeps the
 // output bit for bit. Each hook reads its own region of the candidate,
 // packed by the Rust file of the same name under src/render/.
 // Every #define below mirrors a constant in src/render/layout.rs; a unit test
 // keeps the two in step.
 
-#define CAND_STRIDE 1504
+#define CAND_STRIDE 1600
 #define P_A1 0
 #define P_A2 9
 #define P_GAIN 18
@@ -44,6 +45,8 @@
 #define CURVE_LEN 288
 #define MIXER_OFF 1216
 #define MIXER_LEN 288
+#define BW_OFF 1504
+#define BW_LEN 96
 
 #define GRID_PAD 2
 #define GRID_Z0 (-14.0f)
@@ -219,7 +222,7 @@ __device__ float slice_base(const float* __restrict__ grid, int nx, int ny, int 
     return (s + GRID_PRIOR * l) / (w + GRID_PRIOR);
 }
 
-// HOOKS: render.rs inserts cuda/tone_curve.cu, cuda/color_mixer.cu and cuda/presence.cu here.
+// HOOKS: render.rs inserts cuda/tone_curve.cu, cuda/color_mixer.cu, cuda/presence.cu and cuda/bw.cu here.
 
 // One pixel from camera RGB (as-shot white balance, 1 = clip) to Oklab after
 // vibrance and saturation, before gamut mapping. `base` is the pixel's base
@@ -255,6 +258,11 @@ __device__ Lab render_core(const float* __restrict__ P, float r, float g, float 
             x = y = z = 0.0f;
         }
     }
+#ifdef BW_HOOK
+    // Black & White: the pixel becomes its gray-mixed luminance here, so
+    // every tone stage below works on it as on any grey.
+    bw_apply(P + BW_OFF, P[P_GAIN], x, y, z);
+#endif
     // Exposure, then highlights/shadows as a gain driven by the base layer:
     // detail (log luminance minus base) passes through untouched.
     float gain = P[P_GAIN] * exp2f(lut(P + LOCAL_OFF, LOCAL_N, LOCAL_B0, LOCAL_B1, base + P[P_BSHIFT]));
@@ -308,6 +316,10 @@ __device__ Lab render_core(const float* __restrict__ P, float r, float g, float 
 #ifdef COLOR_MIXER_HOOK
     color_mixer_apply(P + MIXER_OFF, o);
 #endif
+#ifdef BW_HOOK
+    // No colour leaks into black and white (rounding in Oklab, Shadows Tint).
+    bw_finish(P + BW_OFF, o);
+#endif
     return o;
 }
 
@@ -323,6 +335,13 @@ __device__ __forceinline__ float4 pres_at(const float4* __restrict__ pres, int p
 // colour was outside the gamut before mapping.
 __device__ void to_srgb_gamut(Lab c, float& r, float& g, float& b, bool& oog) {
     float L = clamp01(c.L);
+    if (c.a == 0.0f && c.b == 0.0f) {
+        // Exactly grey (black and white): equal channels, not three
+        // matrix rows that round apart.
+        r = g = b = L * L * L;
+        oog = false;
+        return;
+    }
     oklab_to_srgb_lin(L, c.a, c.b, r, g, b);
     oog = !in_gamut(r, g, b, OOG_EPS);
     float r2, g2, b2;
@@ -429,9 +448,11 @@ extern "C" __global__ void render8_kernel(const float4* __restrict__ px, const f
     bool oog;
     to_srgb_gamut(c, r, g, b, oog);
     unsigned x = (unsigned)(i % w), y = (unsigned)(i / w);
+    // A grey pixel gets one dither for all channels, so it stays grey.
+    bool grey = r == g && g == b;
     out[3 * i] = quant8(oetf(r), x, y, 0);
-    out[3 * i + 1] = quant8(oetf(g), x, y, 1);
-    out[3 * i + 2] = quant8(oetf(b), x, y, 2);
+    out[3 * i + 1] = quant8(oetf(g), x, y, grey ? 0u : 1u);
+    out[3 * i + 2] = quant8(oetf(b), x, y, grey ? 0u : 2u);
 }
 
 __device__ __forceinline__ float warp_sum(float v, unsigned mask_bits) {

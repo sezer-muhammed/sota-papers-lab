@@ -27,6 +27,14 @@
 //!    Tint and the primaries' hues stay at zero: no statistic sees a hue
 //!    move, so it would be a guess, and zero rules out hue flips.
 //!
+//! The black-and-white look ([`LookSpec::black_and_white`]) searches its own
+//! box ([`bw_space`]): the treatment on, the colour-only settings (Vibrance,
+//! Saturation, the Color Mixer, Calibration) at zero, and in stage 3 the
+//! gray mixer of the bands the photo holds instead of the colour fields,
+//! around its content-based priors (`objective::bw_mixer`). Its objective
+//! rejects colour renders and the colour looks' reject black and white, so
+//! the shared archive never crosses treatments.
+//!
 //! Stages 2 and 3 search only within 2.5 expert standard deviations of
 //! their start (`Space::around`), so CMA-ES's round steps suit every new
 //! setting. Splitting keeps every stage small enough to converge within the
@@ -57,12 +65,13 @@ use spl_core::{Context, Result, bail};
 
 use crate::cmaes::{self, SplitMix64};
 use crate::objective::{
-    LookSpec, Objective, PPR10K, SceneContext, Score, distance_sq, look_offset, offset_params,
+    BW_FIELD, GRAY, LookSpec, Objective, PPR10K, SATURATION_FIELD, SceneContext, Score,
+    VIBRANCE_FIELD, bw_mixer_box, distance_sq, look_offset, offset_params,
 };
 use crate::render::RenderEngine;
 use crate::types::{PARAM_SPECS, ParamGroup, ParamSpec, Params, Scene, Stats};
 pub use hues::Hues;
-use priors::{BLUE_SAT, GREEN_SAT, LUM, PRIORS, RED_SAT, SAT};
+use priors::{BLUE_SAT, GREEN_SAT, HUE, LUM, PRIORS, RED_SAT, SAT};
 use space::{LinearKey, Space};
 
 // The search box: PPR10K's union of the three experts' 1st to 99th
@@ -132,10 +141,6 @@ const COLOUR_RESTARTS: usize = 1;
 /// Each stage searches the settings with an expert prior within this many
 /// standard deviations of where it starts (`Space::around`).
 const TRUST_STDS: f32 = 2.5;
-/// Basic panel fields (indices into [`Params::to_array`]) the colour stage
-/// varies with the bands.
-const VIBRANCE_FIELD: usize = 8;
-const SATURATION_FIELD: usize = 9;
 
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
@@ -404,6 +409,15 @@ pub fn run_with<E: Evaluator + ?Sized>(
     let share = 0.95 / looks.len().max(1) as f32;
     progress(0.04, "Searching looks");
     for (k, (look, objective)) in looks.iter().zip(&objectives).enumerate() {
+        let space = if look.is_bw() {
+            let mut mixer = bw_mixer_box(&cx.hues, cx.iso);
+            if let Some(anchor) = &look.anchor {
+                widen_to(&mut mixer, anchor);
+            }
+            bw_space(&space, mixer)
+        } else {
+            space.clone()
+        };
         search_look(&mut book, &space, look, objective, &auto_params, cfg, k)?;
         let best = &book.entries[book.best(objective)];
         let (total, feasible) = objective.total(&best.stats, &best.params);
@@ -472,6 +486,12 @@ pub fn polish_with<E: Evaluator + ?Sized>(
     let space = Space::new(lo, hi);
     let mut book = Book::new(eval);
     let (_, cx) = book.neutral(scene, &space)?;
+    // Black and white keeps its treatment and its own gray mixer.
+    let space = if start.is_bw() {
+        bw_space(&space, [(-100.0, 100.0); hues::BANDS])
+    } else {
+        space
+    };
     let start = space.clamp(start);
     let look = LookSpec::proposal("refined", "Refined", start);
     let objective = Objective::new(&look, &cx);
@@ -522,7 +542,12 @@ pub fn evaluate_with<E: Evaluator + ?Sized>(
     let (_, cx) = book.neutral(scene, &space)?;
     let at = book.measure(&[*params])?.start;
     let stats = book.entries[at].stats.clone();
-    let score = Objective::new(&LookSpec::natural(), &cx).score(&stats, params);
+    let look = if params.is_bw() {
+        LookSpec::black_and_white()
+    } else {
+        LookSpec::natural()
+    };
+    let score = Objective::new(&look, &cx).score(&stats, params);
     Ok((stats, score))
 }
 
@@ -674,7 +699,8 @@ fn tone_dims() -> Vec<usize> {
 
 /// The colour stage's fields in this box: Vibrance and Saturation, every
 /// band's saturation and luminance the box lets vary (the bands the photo
-/// holds), and the three primaries' saturation.
+/// holds), and the three primaries' saturation; in black and white (whose
+/// box fixes all of those), the gray mixer's bands the box lets vary.
 fn colour_dims(space: &Space) -> Vec<usize> {
     let (lo, hi) = (space.lo.to_array(), space.hi.to_array());
     let bands = (0..hues::BANDS).flat_map(|b| [SAT + b, LUM + b]);
@@ -682,16 +708,55 @@ fn colour_dims(space: &Space) -> Vec<usize> {
         .into_iter()
         .chain(bands)
         .chain([RED_SAT, GREEN_SAT, BLUE_SAT])
+        .chain(GRAY..GRAY + hues::BANDS)
         .filter(|&i| lo[i] < hi[i])
         .collect()
 }
 
+/// The black-and-white look's box inside the photo's: the treatment on,
+/// Vibrance, Saturation, the Color Mixer and Calibration at zero (they act
+/// on colour, which black and white has none of), and the gray mixer in
+/// `mixer` (low, high per band, red to magenta).
+pub(crate) fn bw_space(space: &Space, mixer: [(f32, f32); hues::BANDS]) -> Space {
+    let (mut lo, mut hi) = (space.lo.to_array(), space.hi.to_array());
+    for i in [VIBRANCE_FIELD, SATURATION_FIELD]
+        .into_iter()
+        .chain(HUE..priors::END)
+    {
+        lo[i] = 0.0;
+        hi[i] = 0.0;
+    }
+    lo[BW_FIELD] = 1.0;
+    hi[BW_FIELD] = 1.0;
+    for (b, (l, h)) in mixer.into_iter().enumerate() {
+        lo[GRAY + b] = l;
+        hi[GRAY + b] = h;
+    }
+    Space::new(Params::from_array(lo), Params::from_array(hi))
+}
+
+/// `mixer` widened, band by band, to hold `p`'s gray mixer.
+fn widen_to(mixer: &mut [(f32, f32); hues::BANDS], p: &Params) {
+    let a = p.to_array();
+    for (b, (l, h)) in mixer.iter_mut().enumerate() {
+        let v = a[GRAY + b];
+        if v.is_finite() {
+            *l = l.min(v.clamp(-100.0, 100.0));
+            *h = h.max(v.clamp(-100.0, 100.0));
+        }
+    }
+}
+
 /// Where a look's settings sit before searching: the anchor, or auto moved
-/// by the look's typical offset, inside the box and on Lightroom's grid.
-fn typical(look: &LookSpec, auto: &Params, space: &Space) -> Params {
-    let p = look
-        .anchor
-        .unwrap_or_else(|| offset_params(auto, &look_offset(look), 1.0));
+/// by the look's typical offset (for black and white, with its gray mixer
+/// priors: the objective's baseline), inside the box and on Lightroom's
+/// grid.
+fn typical(look: &LookSpec, objective: &Objective, auto: &Params, space: &Space) -> Params {
+    let p = match look.anchor {
+        Some(anchor) => anchor,
+        None if objective.is_bw() => objective.baseline(),
+        None => offset_params(auto, &look_offset(look), 1.0),
+    };
     space.clamp(&p).quantized()
 }
 
@@ -750,7 +815,7 @@ fn search_look<E: Evaluator + ?Sized>(
     let (basic_evals, refine_evals, colour_evals) = stage_budget(cfg.evals_per_look, colour.len());
     let best = |book: &Book<E>| book.entries[book.best(objective)].params;
 
-    let typical = typical(look, auto, space);
+    let typical = typical(look, objective, auto, space);
     let basic = space.fixing(&ParamSpec::indices_of(&[ParamGroup::Basic]), &typical);
     let mut seeds = seeds(look, auto, &basic, seed);
     seeds.truncate(basic_evals);
@@ -900,9 +965,10 @@ fn finalists(auto: &Candidate, looks: &[Candidate], space: &Space, max: usize) -
     for c in pool {
         let is_auto = c.source == CandidateSource::Auto;
         let same_as_auto = !is_auto && c.params == auto.params;
-        let distinct = kept
-            .iter()
-            .all(|k| space.distance(&k.params, &c.params) >= DISTINCT);
+        // Black and white never looks like colour, however close the tones.
+        let distinct = kept.iter().all(|k| {
+            k.params.is_bw() != c.params.is_bw() || space.distance(&k.params, &c.params) >= DISTINCT
+        });
         if is_auto || (distinct && !same_as_auto) {
             kept.push(c);
         }
@@ -1427,6 +1493,61 @@ mod tests {
         assert!(moved.saturation_blue > 20.0);
         let back = stage.params_at(&stage.unit_of(&at));
         assert!((back.saturation_blue - 12.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn black_and_white_look_searches_its_own_box_fast() {
+        let mut syn = Synthetic::colourful();
+        let scene = syn.scene();
+        let hues = Hues::of(&scene);
+        let looks = [LookSpec::natural(), LookSpec::black_and_white()];
+        let start = Instant::now();
+        let r = run_synthetic(&mut syn, &looks, &SearchConfig::default());
+        let elapsed = start.elapsed();
+        eprintln!(
+            "natural + bw x 2000 evals: {} evaluations, {:.0} ms",
+            r.evaluations,
+            elapsed.as_secs_f64() * 1000.0
+        );
+        let limit = if cfg!(debug_assertions) { 2.0 } else { 0.5 };
+        assert!(elapsed.as_secs_f64() < limit, "{elapsed:?}");
+        let (natural, bw) = (look(&r, "natural"), look(&r, "bw"));
+        eprintln!("bw: {:.2} {:?}", bw.score.total, bw.params);
+        assert!(!natural.params.is_bw() && !r.auto.params.is_bw());
+        assert!(bw.params.is_bw() && bw.score.feasible, "{:?}", bw.score);
+        assert_eq!(bw.params.quantized(), bw.params);
+        let a = bw.params.to_array();
+        // Colour-only settings stay at zero; the mixer moved inside its box
+        // on the bands the photo holds and nowhere else.
+        assert_eq!((bw.params.vibrance, bw.params.saturation), (0.0, 0.0));
+        assert!(a[priors::HUE..priors::END].iter().all(|&v| v == 0.0));
+        let bx = bw_mixer_box(&hues, scene.info.iso);
+        for (b, (l, h)) in bx.iter().enumerate() {
+            let v = a[GRAY + b];
+            assert!(*l <= v && v <= *h, "band {b}: {v} not in {l}..{h}");
+            if !hues.searched(b) {
+                assert_eq!(v, 0.0);
+            }
+        }
+        // Every finalist set of one treatment; black and white is kept
+        // however close its tones are to a colour candidate.
+        assert!(r.finalists.iter().any(|c| c.params.is_bw()));
+        // Scoring a black-and-white edit scores it as black and white.
+        let (_, score) = evaluate_with(&mut syn, &scene, &bw.params).unwrap();
+        assert!(score.feasible && (score.total - bw.score.total).abs() < 1e-3);
+        // Polishing keeps the treatment and its mixer, even outside the box.
+        let mut start_bw = bw.params;
+        start_bw.gray_blue = -90.0;
+        let c = polish_with(&mut syn, &scene, &start_bw, &SearchConfig::default()).unwrap();
+        assert!(
+            c.params.is_bw() && c.params.gray_blue == -90.0,
+            "{:?}",
+            c.params
+        );
+        // A black-and-white anchor holds its own mixer too.
+        let anchored = LookSpec::proposal("claude", "Claude", start_bw);
+        let r = run_synthetic(&mut syn, &[anchored], &SearchConfig::default());
+        assert!(r.looks[0].params.is_bw() && r.looks[0].params.gray_blue <= -60.0);
     }
 
     #[test]

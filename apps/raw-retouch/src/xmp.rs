@@ -7,7 +7,9 @@
 //! its own `crs:` name from [`PARAM_SPECS`], with the parametric tone
 //! curve's fixed split points ([`TONE_CURVE_SPLITS`]) and, when lens profile
 //! corrections are on, `LensProfileSetup="LensDefaults"`, so Lightroom picks
-//! the lens's profile itself. White balance is always written as Custom with
+//! the lens's profile itself. The Black & White treatment is
+//! `ConvertToGrayscale="True"` or `"False"`, next to the gray mixer
+//! (`GrayMixerRed` and so on). White balance is always written as Custom with
 //! explicit Temperature and Tint, and HDR editing is switched off so a
 //! user's HDR default cannot change the look.
 
@@ -72,13 +74,14 @@ pub fn sidecar(params: &Params, info: &RawInfo) -> String {
 }
 
 /// One setting as Lightroom writes it: exposure in hundredths of a stop
-/// ("+0.35"), sharpening radius in tenths of a pixel ("+1.0"), sliders
-/// that can go negative with a sign ("+15", "-20", "0"), and the rest
-/// (temperature, Detail amounts, the Lens Corrections switches as 1 or 0)
-/// as plain integers.
+/// ("+0.35"), sharpening radius in tenths of a pixel ("+1.0"), the Black
+/// & White switch as "True" or "False", sliders that can go negative with
+/// a sign ("+15", "-20", "0"), and the rest (temperature, Detail amounts,
+/// the Lens Corrections switches as 1 or 0) as plain integers.
 fn value_of(spec: &ParamSpec, v: f32) -> String {
     match spec.key {
         "exposure" => exposure(v),
+        "bw" => if v >= 0.5 { "True" } else { "False" }.to_owned(),
         "sharpen_radius" => tenths(v),
         _ if spec.min < 0.0 => signed(v),
         _ => unsigned(v),
@@ -282,6 +285,15 @@ mod tests {
    crs:LensProfileEnable="1"
    crs:LensProfileSetup="LensDefaults"
    crs:AutoLateralCA="1"
+   crs:ConvertToGrayscale="False"
+   crs:GrayMixerRed="0"
+   crs:GrayMixerOrange="0"
+   crs:GrayMixerYellow="0"
+   crs:GrayMixerGreen="0"
+   crs:GrayMixerAqua="0"
+   crs:GrayMixerBlue="0"
+   crs:GrayMixerPurple="0"
+   crs:GrayMixerMagenta="0"
    crs:HasSettings="True"
    crs:HDREditMode="0"
    crs:AlreadyApplied="False"/>
@@ -298,9 +310,13 @@ mod tests {
         let mut a = [0.0; Params::COUNT];
         for (v, spec) in a.iter_mut().zip(&PARAM_SPECS) {
             let text = &attrs[&format!("crs:{}", spec.crs)];
-            *v = text
-                .parse()
-                .unwrap_or_else(|_| panic!("crs:{} = {text:?}", spec.crs));
+            *v = match text.as_str() {
+                "True" => 1.0,
+                "False" => 0.0,
+                _ => text
+                    .parse()
+                    .unwrap_or_else(|_| panic!("crs:{} = {text:?}", spec.crs)),
+            };
         }
         Params::from_array(a)
     }
@@ -319,10 +335,23 @@ mod tests {
             sharpen_radius: 3.0,
             ..every_panel()
         };
+        let black_and_white = Params {
+            bw: 1.0,
+            gray_red: 12.0,
+            gray_orange: 20.4,
+            gray_yellow: 8.0,
+            gray_green: -14.0,
+            gray_aqua: -20.0,
+            gray_blue: -35.0,
+            gray_purple: -100.0,
+            gray_magenta: 100.0,
+            ..every_panel()
+        };
         for p in [
             every_panel(),
             lens_off,
             extremes,
+            black_and_white,
             params(),
             Params::neutral(5200.0, 0.0),
         ] {
@@ -420,6 +449,26 @@ mod tests {
         };
         let attrs = check_well_formed(&sidecar(&low, &info("SONY", "X"))).unwrap();
         assert_eq!(attrs["crs:Temperature"], "2000");
+    }
+
+    #[test]
+    fn black_and_white_is_a_true_false_switch_with_its_mixer() {
+        let p = Params {
+            bw: 0.7,
+            gray_blue: -35.4,
+            gray_orange: 18.0,
+            gray_green: -140.0,
+            ..params()
+        };
+        let attrs = check_well_formed(&sidecar(&p, &info("SONY", "ILCE-7M3"))).unwrap();
+        assert_eq!(attrs["crs:ConvertToGrayscale"], "True");
+        assert_eq!(attrs["crs:GrayMixerBlue"], "-35");
+        assert_eq!(attrs["crs:GrayMixerOrange"], "+18");
+        assert_eq!(attrs["crs:GrayMixerGreen"], "-100");
+        assert_eq!(attrs["crs:GrayMixerRed"], "0");
+        let colour = Params { bw: 0.2, ..p };
+        let attrs = check_well_formed(&sidecar(&colour, &info("SONY", "X"))).unwrap();
+        assert_eq!(attrs["crs:ConvertToGrayscale"], "False");
     }
 
     #[test]

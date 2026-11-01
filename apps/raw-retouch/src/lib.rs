@@ -26,7 +26,8 @@
 //! The render owner shares `render` with per-effect owners: tone curve =
 //! render/tone_curve.rs, cuda/tone_curve.cu; colour mixer =
 //! render/color_mixer.rs, cuda/color_mixer.cu; presence =
-//! render/presence.rs, cuda/presence.cu.
+//! render/presence.rs, cuda/presence.cu; black and white = render/bw.rs,
+//! cuda/bw.cu.
 
 pub mod auto;
 pub mod cmaes;
