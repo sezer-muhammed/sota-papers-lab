@@ -21,6 +21,7 @@ fn hooks_are_spliced_in_ahead_of_render_core() {
         "void tone_curve_apply(",
         "void color_mixer_apply(",
         "void presence_apply(",
+        "void bw_apply(",
     ] {
         assert!(at(hook) > at(HOOKS) && at(hook) < core, "{hook}");
     }

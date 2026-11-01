@@ -10,7 +10,7 @@ use spl_core::{Result, anyhow};
 
 use super::layout::*;
 use super::{BASELINE_EV, CameraColor};
-use super::{color_mixer, presence, tone_curve};
+use super::{bw, color_mixer, presence, tone_curve};
 use crate::types::{PARAM_SPECS, Params};
 
 /// log2(0.18).
@@ -441,6 +441,7 @@ pub(crate) fn pack(
     presence::pack(&p, &mut out[P_PRES..P_PRES + P_PRES_N]);
     tone_curve::pack(&p, &mut out[CURVE_OFF..CURVE_OFF + CURVE_LEN]);
     color_mixer::pack(&p, &mut out[MIXER_OFF..MIXER_OFF + MIXER_LEN]);
+    bw::pack(&p, &mut out[BW_OFF..BW_OFF + BW_LEN]);
 }
 
 /// sRGB encoding of a display-linear value.

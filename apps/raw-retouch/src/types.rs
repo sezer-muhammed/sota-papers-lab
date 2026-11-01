@@ -18,7 +18,8 @@ pub const DISPLAY_EDGE: usize = 1536;
 
 /// Lightroom Classic's develop settings, in Lightroom's own units and
 /// ranges: the Basic panel, the parametric Tone Curve, Texture/Clarity/
-/// Dehaze, the Color Mixer, Calibration, Detail and Lens Corrections.
+/// Dehaze, the Color Mixer, Calibration, Detail, Lens Corrections and the
+/// Black & White treatment with its gray mixer.
 /// [`PARAM_SPECS`] describes every field, in this order (range, step,
 /// default, XMP name). Fields after the Basic panel take Lightroom's
 /// defaults when absent, so older clients and stored runs still parse.
@@ -166,6 +167,33 @@ pub struct Params {
     /// Remove Chromatic Aberration.
     #[serde(default)]
     pub lens_ca: f32,
+
+    // Black & White: Lightroom's Treatment switch and its B&W (gray) mixer.
+    /// Treatment: 0 (colour) or 1 (black and white), a switch like the
+    /// Lens Corrections ones. In black and white every pixel's grey is its
+    /// luminance, brightened or darkened by the gray mixer per hue band,
+    /// and the output has no colour (R = G = B).
+    #[serde(default)]
+    pub bw: f32,
+    /// Gray mixer, -100 to +100: how much darker (-) or brighter (+) the
+    /// red band's colours turn grey; the bands below likewise. Greys keep
+    /// their tone; the stronger a colour, the more it moves.
+    #[serde(default)]
+    pub gray_red: f32,
+    #[serde(default)]
+    pub gray_orange: f32,
+    #[serde(default)]
+    pub gray_yellow: f32,
+    #[serde(default)]
+    pub gray_green: f32,
+    #[serde(default)]
+    pub gray_aqua: f32,
+    #[serde(default)]
+    pub gray_blue: f32,
+    #[serde(default)]
+    pub gray_purple: f32,
+    #[serde(default)]
+    pub gray_magenta: f32,
 }
 
 fn default_sharpening() -> f32 {
@@ -203,6 +231,7 @@ pub enum ParamGroup {
     Calibration,
     Detail,
     Lens,
+    BlackWhite,
 }
 
 /// One field of [`Params`]: what the UI, the XMP sidecar and the search
@@ -290,7 +319,7 @@ impl ParamSpec {
     }
 }
 
-use ParamGroup::{Basic, Calibration, ColorMixer, Detail, Lens, Presence, ToneCurve};
+use ParamGroup::{Basic, BlackWhite, Calibration, ColorMixer, Detail, Lens, Presence, ToneCurve};
 
 /// Every field of [`Params`], in its order.
 pub const PARAM_SPECS: [ParamSpec; Params::COUNT] = [
@@ -530,6 +559,21 @@ pub const PARAM_SPECS: [ParamSpec; Params::COUNT] = [
         Lens,
     )
     .range(0.0, 1.0, 1.0),
+    ParamSpec::slider("bw", "Black & White", "ConvertToGrayscale", BlackWhite).range(0.0, 1.0, 1.0),
+    ParamSpec::slider("gray_red", "B&W Red", "GrayMixerRed", BlackWhite).searched(),
+    ParamSpec::slider("gray_orange", "B&W Orange", "GrayMixerOrange", BlackWhite).searched(),
+    ParamSpec::slider("gray_yellow", "B&W Yellow", "GrayMixerYellow", BlackWhite).searched(),
+    ParamSpec::slider("gray_green", "B&W Green", "GrayMixerGreen", BlackWhite).searched(),
+    ParamSpec::slider("gray_aqua", "B&W Aqua", "GrayMixerAqua", BlackWhite).searched(),
+    ParamSpec::slider("gray_blue", "B&W Blue", "GrayMixerBlue", BlackWhite).searched(),
+    ParamSpec::slider("gray_purple", "B&W Purple", "GrayMixerPurple", BlackWhite).searched(),
+    ParamSpec::slider(
+        "gray_magenta",
+        "B&W Magenta",
+        "GrayMixerMagenta",
+        BlackWhite,
+    )
+    .searched(),
 ];
 
 /// [`Params::to_array`] and [`Params::from_array`] from the field list, in
@@ -607,15 +651,25 @@ param_arrays!(
     color_nr,
     lens_profile,
     lens_ca,
+    bw,
+    gray_red,
+    gray_orange,
+    gray_yellow,
+    gray_green,
+    gray_aqua,
+    gray_blue,
+    gray_purple,
+    gray_magenta,
 );
 
 impl Params {
     /// Every field.
-    pub const COUNT: usize = 56;
+    pub const COUNT: usize = 65;
     /// The Basic panel: the first `BASIC` fields, the ones Claude plans and
     /// adjusts. The search varies these and every other field
     /// [`PARAM_SPECS`] marks `searched`: the Tone Curve, Presence, the Color
-    /// Mixer's saturation and luminance and the primaries' saturation.
+    /// Mixer's saturation and luminance and the primaries' saturation (and
+    /// the gray mixer, in the black-and-white look only).
     pub const BASIC: usize = 10;
     /// Field names in [`PARAM_SPECS`] order; the first [`Params::BASIC`]
     /// are the Basic panel.
@@ -658,6 +712,11 @@ impl Params {
             *v = v.clamp(s.min, s.max);
         }
         Self::from_array(a)
+    }
+
+    /// Whether the Black & White treatment is on.
+    pub fn is_bw(&self) -> bool {
+        self.bw >= 0.5
     }
 
     /// Clamped to Lightroom's legal ranges and rounded to its steps (whole

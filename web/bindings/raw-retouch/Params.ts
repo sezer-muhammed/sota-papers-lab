@@ -3,7 +3,8 @@
 /**
  * Lightroom Classic's develop settings, in Lightroom's own units and
  * ranges: the Basic panel, the parametric Tone Curve, Texture/Clarity/
- * Dehaze, the Color Mixer, Calibration, Detail and Lens Corrections.
+ * Dehaze, the Color Mixer, Calibration, Detail, Lens Corrections and the
+ * Black & White treatment with its gray mixer.
  * [`PARAM_SPECS`] describes every field, in this order (range, step,
  * default, XMP name). Fields after the Basic panel take Lightroom's
  * defaults when absent, so older clients and stored runs still parse.
@@ -104,4 +105,17 @@ lens_profile: number,
 /**
  * Remove Chromatic Aberration.
  */
-lens_ca: number, };
+lens_ca: number, 
+/**
+ * Treatment: 0 (colour) or 1 (black and white), a switch like the
+ * Lens Corrections ones. In black and white every pixel's grey is its
+ * luminance, brightened or darkened by the gray mixer per hue band,
+ * and the output has no colour (R = G = B).
+ */
+bw: number, 
+/**
+ * Gray mixer, -100 to +100: how much darker (-) or brighter (+) the
+ * red band's colours turn grey; the bands below likewise. Greys keep
+ * their tone; the stronger a colour, the more it moves.
+ */
+gray_red: number, gray_orange: number, gray_yellow: number, gray_green: number, gray_aqua: number, gray_blue: number, gray_purple: number, gray_magenta: number, };

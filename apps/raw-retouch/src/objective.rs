@@ -16,6 +16,16 @@
 //! keeps its hue, saturation and brightness, and no band's colour is pushed
 //! past what nature shows.
 //!
+//! Black and white ([`LookSpec::black_and_white`], not one of the default
+//! looks) scores a monochrome render: no colour, cast or saturation terms
+//! (there is no colour), deeper blacks, more global contrast, and tonal
+//! separation: local contrast against the colour neutral's, which a flat
+//! desaturation loses wherever neighbouring colours share a luminance. The
+//! gray mixer starts from content-based priors ([`bw_mixer`]: darker skies,
+//! brighter skin, lighter foliage) and stays near them; skin is never
+//! darkened. A look's treatment is fixed: a colour render never scores
+//! under a black-and-white look, nor the other way round.
+//!
 //! `Score::total` is the sum of `Score::terms`; penalties are negative.
 //! Weights are in units where 1.0 is a clearly visible flaw.
 
@@ -179,6 +189,28 @@ const KEY_KEEP_BRIGHT: f32 = 1.0;
 /// The black-point band runs from this share of its centre to this one.
 const P01_BAND: (f32, f32) = (0.8, 1.25);
 
+// Black and white.
+
+/// Rich blacks: this much more may crush than in colour.
+const BW_CLIP_LO_EXTRA: f32 = 0.01;
+/// Tonal separation: reward for local contrast above the colour neutral's,
+/// as a ratio, up to a cap (more reads as an over-processed, gritty look).
+const W_BW_SEPARATION: f32 = 1.0;
+const BW_SEPARATION_CAP: f32 = 0.3;
+/// The gray mixer's prior: distance from its content-based centre that
+/// costs one unit, and the half-width of its search box around it.
+pub(crate) const BW_MIXER_STD: f32 = 15.0;
+pub(crate) const BW_MIXER_REACH: f32 = 40.0;
+/// Over-editing scale of the gray mixer, per band.
+const BW_MIXER_SCALE: f32 = 80.0;
+/// Gray mixer settings of a classic black-and-white conversion, by band
+/// (red to magenta), used where the photo holds the band: darker blue and
+/// aqua skies (as a red-orange filter would), brighter skin (orange, red),
+/// slightly lighter foliage (yellow, green) so it separates from the sky.
+const BW_MIXER: [f32; BANDS] = [5.0, 15.0, 10.0, 5.0, -15.0, -25.0, -10.0, 0.0];
+/// Orange and red lift only this share without skin in the photo.
+const BW_NO_SKIN: f32 = 0.4;
+
 // Anchor looks (Claude's proposals).
 
 /// Squared normalized distance to the anchor: moving one slider by a tenth
@@ -254,6 +286,14 @@ const BUILTIN: [(&str, &str); 4] = [
     ("moody", "Moody"),
 ];
 
+/// The black-and-white look's id and label (not in [`BUILTIN`]).
+pub const BLACK_AND_WHITE: (&str, &str) = ("bw", "Black and white");
+
+/// Indices into [`Params::to_array`] of the Black & White switch and the
+/// first of the eight gray mixer bands (red to magenta).
+pub(crate) const BW_FIELD: usize = 56;
+pub(crate) const GRAY: usize = 57;
+
 /// A look the search optimizes for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LookSpec {
@@ -297,6 +337,27 @@ impl LookSpec {
             id: id.into(),
             label: label.into(),
             anchor: Some(params),
+        }
+    }
+
+    /// Black and white: the treatment on, the gray mixer searched around
+    /// this photo's content-based priors, rich blacks and separated tones.
+    /// Not one of [`LookSpec::builtin`]; asked for by id `"bw"`.
+    pub fn black_and_white() -> LookSpec {
+        let (id, label) = BLACK_AND_WHITE;
+        LookSpec {
+            id: id.into(),
+            label: label.into(),
+            anchor: None,
+        }
+    }
+
+    /// Whether this look renders black and white: the `"bw"` look, or an
+    /// anchor with the treatment on.
+    pub fn is_bw(&self) -> bool {
+        match &self.anchor {
+            Some(anchor) => anchor.is_bw(),
+            None => self.id == BLACK_AND_WHITE.0,
         }
     }
 }
@@ -475,6 +536,70 @@ const MOODY_EXTRA: [(usize, f32); 13] = [
     (LUM + PURPLE, -5.0),
 ];
 
+/// Black and white beyond the Basic panel: a gentle S-curve and more
+/// texture and clarity, for the crisp, separated tones monochrome needs.
+const BW_EXTRA: [(usize, f32); 6] = [
+    (CURVE_SHADOWS, -4.0),
+    (CURVE_DARKS, -4.0),
+    (CURVE_LIGHTS, 4.0),
+    (CURVE_HIGHLIGHTS, 2.0),
+    (TEXTURE, 6.0),
+    (CLARITY, 12.0),
+];
+
+/// The gray mixer a black-and-white conversion of this photo starts from
+/// and stays near: [`BW_MIXER`] on the bands the photo holds (zero on the
+/// others), orange and red lifted fully only where there is skin.
+pub(crate) fn bw_mixer(hues: &Hues) -> [f32; BANDS] {
+    let skin = hues.skin_presence();
+    std::array::from_fn(|b| {
+        if !hues.searched(b) {
+            return 0.0;
+        }
+        let v = BW_MIXER[b];
+        let v = if b == RED || b == ORANGE {
+            v * (BW_NO_SKIN + (1.0 - BW_NO_SKIN) * skin)
+        } else {
+            v
+        };
+        v.round()
+    })
+}
+
+/// The gray mixer's search box per band: [`BW_MIXER_REACH`] around
+/// [`bw_mixer`] (narrower on high-ISO photos, where a strong mix turns
+/// colour noise into grain), on Lightroom's whole-unit grid; bands the
+/// photo does not hold stay at zero.
+pub(crate) fn bw_mixer_box(hues: &Hues, iso: Option<u32>) -> [(f32, f32); BANDS] {
+    let centre = bw_mixer(hues);
+    let reach = (BW_MIXER_REACH * (1.0 - 0.5 * noise_factor(iso))).round();
+    std::array::from_fn(|b| {
+        if hues.searched(b) {
+            let c = centre[b];
+            ((c - reach).max(-100.0), (c + reach).min(100.0))
+        } else {
+            (0.0, 0.0)
+        }
+    })
+}
+
+/// `p` as the black-and-white look starts it: the treatment on, the
+/// colour-only settings (Vibrance, Saturation, the Color Mixer and
+/// Calibration) at zero, and the gray mixer at [`bw_mixer`].
+pub(crate) fn bw_params(p: &Params, hues: &Hues) -> Params {
+    let mut a = p.to_array();
+    a[VIBRANCE_FIELD] = 0.0;
+    a[SATURATION_FIELD] = 0.0;
+    a[HUE..priors::END].fill(0.0);
+    a[BW_FIELD] = 1.0;
+    a[GRAY..GRAY + BANDS].copy_from_slice(&bw_mixer(hues));
+    Params::from_array(a)
+}
+
+/// Vibrance and Saturation in [`Params::to_array`].
+pub(crate) const VIBRANCE_FIELD: usize = 8;
+pub(crate) const SATURATION_FIELD: usize = 9;
+
 /// A look's typical edit relative to auto, in [`Params`] order with
 /// temperature as a warm shift in mireds. Seeds the search and centres the
 /// over-editing penalty and the settings prior, so a moody look is not
@@ -498,6 +623,10 @@ pub(crate) fn look_offset(look: &LookSpec) -> [f32; Params::COUNT] {
                 0.0, 0.0, -0.45, 12.0, -25.0, -5.0, -10.0, -20.0, -8.0, -12.0,
             ],
             &MOODY_EXTRA,
+        ),
+        "bw" => (
+            [0.0, 0.0, 0.0, 15.0, -15.0, 5.0, 8.0, -12.0, 0.0, 0.0],
+            &BW_EXTRA,
         ),
         _ => return out,
     };
@@ -635,6 +764,21 @@ const MOODY: Targets = Targets {
     ..NATURAL
 };
 
+/// Black and white: a midtone like natural's, deeper blacks, clean
+/// whites, more global contrast and at least the colour neutral's local
+/// contrast. Colour targets do not apply.
+const BW: Targets = Targets {
+    p50: 0.45,
+    p99: Band::new(0.95, 0.985),
+    p99_stretch: 0.08,
+    p01_ratio: 0.4,
+    p01: Band::new(0.012, 0.06),
+    spread: Band::new(0.21, 0.30),
+    color: Band::new(0.0, f32::INFINITY),
+    local_min: 1.0,
+    ..NATURAL
+};
+
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     Look(Targets),
@@ -679,6 +823,10 @@ pub(crate) struct Objective {
     hues: Hues,
     skin: f32,
     presence: [f32; BANDS],
+    /// Black and white: renders must have the treatment on (else off).
+    bw: bool,
+    /// The gray mixer's prior centre (black and white).
+    bw_mixer: [f32; BANDS],
 }
 
 fn finite_or(x: f32, fallback: f32) -> f32 {
@@ -710,6 +858,7 @@ impl Objective {
                     "vivid" => VIVID,
                     "bright" => BRIGHT,
                     "moody" => MOODY,
+                    "bw" => BW,
                     _ => NATURAL,
                 };
                 let mut t = base;
@@ -730,12 +879,14 @@ impl Objective {
                 Mode::Look(t)
             }
         };
+        let bw = look.is_bw();
         let baseline = match mode {
             Mode::Anchor(anchor) => anchor,
             Mode::Look(_) => {
                 let mut a = offset_params(&auto, &look_offset(look), 1.0).to_array();
                 cx.hues.fix(&mut a);
-                Params::from_array(a)
+                let p = Params::from_array(a);
+                if bw { bw_params(&p, &cx.hues) } else { p }
             }
         };
 
@@ -758,7 +909,8 @@ impl Objective {
             clip_hi_limit: (CLIP_HI_LIMIT + CLIP_HI_RAW_ALLOWANCE * raw_clipped)
                 .min(CLIP_HI_LIMIT_MAX),
             clip_lo_limit: (CLIP_LO_LIMIT + CLIP_LO_DARK_EXTRA * dark)
-                .max(finite_or(n.clip_lo, 0.0).clamp(0.0, 1.0) + CLIP_LO_NEUTRAL_MARGIN),
+                .max(finite_or(n.clip_lo, 0.0).clamp(0.0, 1.0) + CLIP_LO_NEUTRAL_MARGIN)
+                + if bw { BW_CLIP_LO_EXTRA } else { 0.0 },
             gamut_limit: GAMUT_LIMIT
                 .max(finite_or(n.out_of_gamut, 0.0).clamp(0.0, 1.0) + GAMUT_NEUTRAL_MARGIN)
                 + gamut_extra,
@@ -775,7 +927,24 @@ impl Objective {
             hues: cx.hues,
             skin: cx.hues.skin_presence(),
             presence: std::array::from_fn(|b| cx.hues.presence(b)),
+            bw,
+            bw_mixer: if bw {
+                std::array::from_fn(|b| baseline.to_array()[GRAY + b])
+            } else {
+                [0.0; BANDS]
+            },
         }
+    }
+
+    /// Whether this objective scores black-and-white renders.
+    pub(crate) fn is_bw(&self) -> bool {
+        self.bw
+    }
+
+    /// Where over-editing is measured from: the anchor, or auto plus the
+    /// look's typical edit (and, in black and white, its gray mixer priors).
+    pub(crate) fn baseline(&self) -> Params {
+        self.baseline
     }
 
     pub(crate) fn score(&self, stats: &Stats, params: &Params) -> Score {
@@ -801,6 +970,10 @@ impl Objective {
             term("invalid", INVALID_TOTAL);
             return (INVALID_TOTAL, false);
         }
+        if p.is_bw() != self.bw {
+            term("treatment", INVALID_TOTAL);
+            return (INVALID_TOTAL, false);
+        }
         let mut total = 0.0;
         let mut add = |name: &'static str, value: f32| {
             total += value;
@@ -821,24 +994,36 @@ impl Objective {
         };
         let structure_gain = (s.structure - self.reference.structure).min(STRUCTURE_GAIN_CAP);
         add("fidelity.structure", share * W_STRUCTURE * structure_gain);
-        let excess = |x: f32, tol: f32| ((x - tol).max(0.0) / CAST_SCALE).powi(2);
-        let cast = excess(s.cast_a.abs(), self.cast_a)
-            + excess(s.cast_b, self.cast_warm)
-            + excess(-s.cast_b, self.cast_cool);
-        add("fidelity.cast", -share * W_CAST * cast);
-        let chroma = ((s.chroma_p95 - self.chroma_ceiling) / CHROMA_SCALE).max(0.0);
-        add("fidelity.chroma", -share * W_CHROMA * chroma * chroma);
         let saturation = saturation(s) / self.reference.saturation;
-        let colorful = ((saturation - self.saturation_ceiling) / COLORFUL_SCALE).max(0.0);
-        add(
-            "fidelity.colorfulness",
-            -share * W_COLORFUL * colorful * colorful,
-        );
+        if !self.bw {
+            let excess = |x: f32, tol: f32| ((x - tol).max(0.0) / CAST_SCALE).powi(2);
+            let cast = excess(s.cast_a.abs(), self.cast_a)
+                + excess(s.cast_b, self.cast_warm)
+                + excess(-s.cast_b, self.cast_cool);
+            add("fidelity.cast", -share * W_CAST * cast);
+            let chroma = ((s.chroma_p95 - self.chroma_ceiling) / CHROMA_SCALE).max(0.0);
+            add("fidelity.chroma", -share * W_CHROMA * chroma * chroma);
+            let colorful = ((saturation - self.saturation_ceiling) / COLORFUL_SCALE).max(0.0);
+            add(
+                "fidelity.colorfulness",
+                -share * W_COLORFUL * colorful * colorful,
+            );
+        }
         let lift = p.exposure.max(0.0) / 1.5 + p.shadows.max(0.0) / 60.0 + p.blacks.max(0.0) / 60.0;
         add("prior.noise", -share * W_NOISE * self.noise * lift * lift);
-        let (skin, bands) = self.colour(&a, saturation);
-        add("colour.skin", -W_SKIN * skin);
-        add("colour.bands", -W_BAND * bands);
+        if self.bw {
+            add("colour.skin", -W_SKIN * self.bw_skin(&a));
+            add("bw.mixer", -W_SETTINGS * self.bw_mixer_cost(&a));
+            if self.reference.local_contrast > 0.0 {
+                let ratio = s.local_contrast / self.reference.local_contrast;
+                let gain = (ratio - 1.0).clamp(-BW_SEPARATION_CAP, BW_SEPARATION_CAP);
+                add("bw.separation", share * W_BW_SEPARATION * gain);
+            }
+        } else {
+            let (skin, bands) = self.colour(&a, saturation);
+            add("colour.skin", -W_SKIN * skin);
+            add("colour.bands", -W_BAND * bands);
+        }
 
         match self.mode {
             Mode::Anchor(anchor) => add("anchor.distance", -W_ANCHOR * distance_sq(p, &anchor)),
@@ -853,7 +1038,12 @@ impl Objective {
                     "prior.settings",
                     -W_SETTINGS * priors::cost(&a, &self.centre),
                 );
-                let overedit = distance_sq(p, &self.baseline);
+                let mut overedit = distance_sq(p, &self.baseline);
+                if self.bw {
+                    overedit += (0..BANDS)
+                        .map(|b| ((a[GRAY + b] - self.bw_mixer[b]) / BW_MIXER_SCALE).powi(2))
+                        .sum::<f32>();
+                }
                 add("prior.overedit", -W_OVEREDIT * overedit);
                 let drift = (warm_shift(self.baseline.temperature, p.temperature) / WB_DRIFT_MIRED)
                     .powi(2)
@@ -869,10 +1059,12 @@ impl Objective {
                     "look.contrast",
                     -W_SPREAD * t.spread.cost(luma_std(s), SPREAD_SCALE),
                 );
-                add(
-                    "look.color",
-                    -W_COLOR * t.color.cost(saturation, COLOR_SCALE),
-                );
+                if !self.bw {
+                    add(
+                        "look.color",
+                        -W_COLOR * t.color.cost(saturation, COLOR_SCALE),
+                    );
+                }
                 let local = if t.local_min > 0.0 && self.reference.local_contrast > 0.0 {
                     let ratio = s.local_contrast / self.reference.local_contrast;
                     Band::new(t.local_min, f32::INFINITY).cost(ratio, LOCAL_SCALE)
@@ -892,6 +1084,29 @@ impl Objective {
 }
 
 impl Objective {
+    /// Black and white: skin darkened by the gray mixer (its bands weighted
+    /// by where the photo's skin sits), costing like a darkening in colour.
+    fn bw_skin(&self, a: &[f32; Params::COUNT]) -> f32 {
+        if self.skin <= 0.0 {
+            return 0.0;
+        }
+        let lum: f32 = (0..BANDS)
+            .map(|b| self.hues.skin_bands[b] * a[GRAY + b])
+            .sum();
+        self.skin * ((-SKIN_DARK_TOL - lum).max(0.0) / SKIN_DARK_SCALE).powi(2)
+    }
+
+    /// The gray mixer's distance from its prior centre, Huber like the
+    /// other settings' priors (`priors::cost`).
+    fn bw_mixer_cost(&self, a: &[f32; Params::COUNT]) -> f32 {
+        (0..BANDS)
+            .map(|b| {
+                let d = ((a[GRAY + b] - self.bw_mixer[b]) / BW_MIXER_STD).abs();
+                if d <= 2.0 { d * d } else { 4.0 * d - 4.0 }
+            })
+            .sum()
+    }
+
     /// The colour terms: how far skin moves (hue, saturation, darkening)
     /// weighted by how much skin the photo shows, and how far each band's
     /// colourfulness (its neutral colour times its saturation slider and
@@ -1634,5 +1849,162 @@ mod tests {
             ..base
         };
         assert_eq!(bands(&s, &muted), 0.0);
+    }
+
+    /// A black-and-white render's stats: the neutral's tones, no colour.
+    fn bw_stats() -> Stats {
+        Stats {
+            colorfulness: 0.0,
+            chroma_mean: 0.0,
+            chroma_p95: 0.0,
+            out_of_gamut: 0.0,
+            cast_a: 0.0,
+            cast_b: 0.0,
+            ..neutral_stats()
+        }
+    }
+
+    fn bw_look_params(cx: &SceneContext) -> Params {
+        Objective::new(&LookSpec::black_and_white(), cx).baseline()
+    }
+
+    #[test]
+    fn black_and_white_is_its_own_look_not_a_default_one() {
+        let bw = LookSpec::black_and_white();
+        assert_eq!((bw.id.as_str(), bw.label.as_str()), BLACK_AND_WHITE);
+        assert!(bw.is_bw() && bw.anchor.is_none());
+        assert!(LookSpec::builtin().iter().all(|l| !l.is_bw()));
+        assert!(!LookSpec::natural().is_bw());
+        let anchored = LookSpec::proposal("x", "X", bw_look_params(&cx()));
+        assert!(anchored.is_bw());
+        assert_eq!(
+            (
+                Params::NAMES[BW_FIELD],
+                Params::NAMES[GRAY],
+                Params::NAMES[GRAY + 7]
+            ),
+            ("bw", "gray_red", "gray_magenta")
+        );
+        assert_eq!(
+            (
+                Params::NAMES[VIBRANCE_FIELD],
+                Params::NAMES[SATURATION_FIELD]
+            ),
+            ("vibrance", "saturation")
+        );
+    }
+
+    #[test]
+    fn treatments_never_cross() {
+        let n = cx();
+        let colour = natural_params();
+        let bw = bw_look_params(&n);
+        assert!(bw.is_bw() && !colour.is_bw());
+        let natural = score(&neutral_stats(), &colour, &look("natural"), &n);
+        assert!(natural.feasible && natural.total > -5.0);
+        // A black-and-white render under a colour look and the other way
+        // round: infeasible and far below anything real.
+        for (stats, p, l) in [
+            (bw_stats(), bw, look("natural")),
+            (neutral_stats(), colour, LookSpec::black_and_white()),
+        ] {
+            let sc = score(&stats, &p, &l, &n);
+            assert!(!sc.feasible && sc.total <= INVALID_TOTAL, "{}", l.id);
+        }
+        let sc = score(&bw_stats(), &bw, &LookSpec::black_and_white(), &n);
+        assert!(sc.feasible, "{:?}", sc.terms);
+        let sum: f32 = sc.terms.iter().map(|(_, v)| v).sum();
+        assert!((sum - sc.total).abs() < 1e-4);
+    }
+
+    #[test]
+    fn black_and_white_has_no_colour_terms_but_wants_separation_and_depth() {
+        let n = cx();
+        let l = LookSpec::black_and_white();
+        let p = bw_look_params(&n);
+        let sc = score(&bw_stats(), &p, &l, &n);
+        for name in [
+            "fidelity.cast",
+            "fidelity.chroma",
+            "fidelity.colorfulness",
+            "colour.bands",
+            "look.color",
+        ] {
+            assert!(sc.terms.iter().all(|(t, _)| t != name), "{name}");
+        }
+        // No colour at all is not a flaw in black and white.
+        assert!(term(&sc, "bw.separation").abs() < 1e-6);
+        // More local contrast (tones that separate) scores better, up to a cap.
+        let crisp = Stats {
+            local_contrast: 0.06,
+            ..bw_stats()
+        };
+        let gritty = Stats {
+            local_contrast: 0.2,
+            ..bw_stats()
+        };
+        let sep = |s: &Stats| term(&score(s, &p, &l, &n), "bw.separation");
+        assert!(sep(&crisp) > 0.1);
+        assert!((sep(&gritty) - BW_SEPARATION_CAP * W_BW_SEPARATION).abs() < 1e-6);
+        // Rich blacks: a deeper black point scores better than a hazy one.
+        let hazy = Stats {
+            luma_p01: 0.09,
+            ..bw_stats()
+        };
+        let deep = Stats {
+            luma_p01: 0.02,
+            ..bw_stats()
+        };
+        let p01 = |s: &Stats| term(&score(s, &p, &l, &n), "look.p01");
+        assert!(p01(&deep) > p01(&hazy));
+    }
+
+    #[test]
+    fn gray_mixer_priors_follow_the_content() {
+        let n = colourful_cx();
+        let mix = bw_mixer(&n.hues);
+        // Sky darker, skin brighter, foliage a little lighter; absent
+        // bands (purple, magenta) untouched.
+        assert!(mix[BLUE] < -10.0 && mix[AQUA] < 0.0);
+        assert!(mix[ORANGE] > 5.0);
+        assert!(mix[GREEN] >= 0.0 && mix[YELLOW] > 0.0);
+        assert_eq!((mix[PURPLE], mix[MAGENTA]), (0.0, 0.0));
+        // Without skin, orange gets less of a lift.
+        let no_skin = Hues {
+            skin: 0.0,
+            ..n.hues
+        };
+        assert!(bw_mixer(&no_skin)[ORANGE] < mix[ORANGE]);
+        // The box holds the prior, absent bands are fixed, high ISO is narrower.
+        let bx = bw_mixer_box(&n.hues, Some(100));
+        for b in 0..BANDS {
+            assert!(bx[b].0 <= mix[b] && mix[b] <= bx[b].1);
+        }
+        assert_eq!(bx[PURPLE], (0.0, 0.0));
+        let noisy = bw_mixer_box(&n.hues, Some(12800));
+        assert!(noisy[BLUE].1 - noisy[BLUE].0 < bx[BLUE].1 - bx[BLUE].0);
+        // The look's baseline: treatment on, colour-only settings at zero,
+        // the mixer at its prior.
+        let base = bw_look_params(&n);
+        let a = base.to_array();
+        assert!(base.is_bw());
+        assert_eq!((base.vibrance, base.saturation), (0.0, 0.0));
+        assert!(a[HUE..priors::END].iter().all(|&v| v == 0.0));
+        assert_eq!(&a[GRAY..GRAY + BANDS], &mix);
+        // Moving the mixer off its prior costs; darkening skin costs more.
+        let l = LookSpec::black_and_white();
+        let total = |p: &Params| score(&bw_stats(), p, &l, &n).total;
+        let off = Params {
+            gray_blue: base.gray_blue + 30.0,
+            ..base
+        };
+        let dark_skin = Params {
+            gray_orange: -40.0,
+            ..base
+        };
+        assert!(total(&off) < total(&base));
+        let skin = |p: &Params| term(&score(&bw_stats(), p, &l, &n), "colour.skin");
+        assert_eq!(skin(&base), 0.0);
+        assert!(skin(&dark_skin) < -0.5, "{}", skin(&dark_skin));
     }
 }

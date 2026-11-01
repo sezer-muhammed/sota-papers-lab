@@ -20,10 +20,12 @@
 //! their own: the parametric tone curve (`render/tone_curve.rs`,
 //! `cuda/tone_curve.cu`), the Color Mixer and Calibration
 //! (`render/color_mixer.rs`, `cuda/color_mixer.cu`), Texture, Clarity and
-//! Dehaze (`render/presence.rs`, `cuda/presence.cu`), and Detail and Lens
+//! Dehaze (`render/presence.rs`, `cuda/presence.cu`), Black & White and
+//! its gray mixer (`render/bw.rs`, `cuda/bw.cu`), and Detail and Lens
 //! Corrections after rendering ([`crate::finish`]). The `.cu` hook files are
 //! spliced into `cuda/render.cu` to make one NVRTC source, [`SOURCE`].
 
+mod bw;
 mod color_mixer;
 mod curves;
 #[cfg(test)]
@@ -69,6 +71,8 @@ pub(crate) static SOURCE: LazyLock<String> = LazyLock::new(|| {
         include_str!("../cuda/color_mixer.cu"),
         "\n",
         include_str!("../cuda/presence.cu"),
+        "\n",
+        include_str!("../cuda/bw.cu"),
         "\n",
         &render[at..],
     ]
@@ -464,6 +468,9 @@ impl RenderEngine {
             &LensCorrection::new(params, &self.info),
             scale,
         )?;
+        if params.is_bw() {
+            bw::grey8(&mut img);
+        }
         Ok(img)
     }
 
@@ -491,5 +498,8 @@ pub fn render_full(
         &Detail::of(params),
         &LensCorrection::new(params, &scene.info),
     )?;
+    if params.is_bw() {
+        bw::grey16(&mut img);
+    }
     Ok(img)
 }
