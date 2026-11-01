@@ -38,6 +38,7 @@ export function DownloadButton({ file }: { file: FileRef }) {
 
 const KINDS = [
   { key: "jpeg", label: "JPEG" },
+  { key: "png", label: "PNG" },
   { key: "xmp", label: "XMP" },
   { key: "tiff", label: "16-bit TIFF" },
 ] as const;

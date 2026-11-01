@@ -83,18 +83,26 @@ export type Photo = {
   /** The newest successful auto run, kept while a re-run is queued or going. */
   result?: AutoResult;
   manual?: ManualState;
+  /** The edit asked for in the photo's own box; empty uses the default box. */
+  instruction?: string;
 };
+
+export type DownloadKind = "jpeg" | "png" | "xmp";
 
 export type SessionState = {
   photos: Photo[];
   options: RetouchOptions;
+  /** The default box: the edit asked for photos whose own box is empty. */
+  instruction: string;
+  /** Another tab of this browser drives the retouch queue (see session.ts). */
+  follower: boolean;
   /** A request answered 401: the page asks for the token. */
   locked: boolean;
   /** The last error while polling the host, cleared when it answers again. */
   trouble?: string;
   /** For the polite live region; `id` changes with every message. */
   announcement?: { id: number; text: string };
-  downloading?: { kind: "jpeg" | "xmp"; done: number; total: number };
+  downloading?: { kind: DownloadKind; done: number; total: number };
 };
 
 /** What a photo's status chip says. */
@@ -177,6 +185,7 @@ export type FinalFiles = {
   jpeg?: FileRef;
   xmp?: FileRef;
   tiff?: FileRef;
+  png?: FileRef;
 };
 
 /** The files "Download all" takes for a photo: a full-size manual export when
@@ -188,12 +197,19 @@ export function finalFiles(photo: Photo): FinalFiles {
   return {};
 }
 
-/** Download names for an export: `<stem>.jpg`, `<stem>.xmp`, `<stem>.tif`. */
+/** Download names for an export: `<stem>.jpg`, `<stem>.xmp`, `<stem>.tif`, `<stem>.png`. */
 export function filesOf(output: AutoOutput | RenderOutput, photo: Photo, source: "manual" | "auto"): FinalFiles {
   const stem = safeFileName(output.stem || stemOf(photo.filename));
   const ref = (artifact: { id: string; size_bytes: number } | null, ext: string): FileRef | undefined =>
     artifact ? { id: artifact.id, name: `${stem}.${ext}`, size: artifact.size_bytes } : undefined;
-  return { source, jpeg: ref(output.jpeg, "jpg"), xmp: ref(output.xmp, "xmp"), tiff: ref(output.tiff, "tif") };
+  return {
+    source,
+    jpeg: ref(output.jpeg, "jpg"),
+    xmp: ref(output.xmp, "xmp"),
+    tiff: ref(output.tiff, "tif"),
+    // Hosts from before PNG export leave the field out.
+    png: ref(output.png ?? null, "png"),
+  };
 }
 
 /** Candidates with Claude's ranking first (1 = favourite), then by score. */
@@ -272,6 +288,12 @@ export function asAutoOutput(value: unknown): AutoOutput | undefined {
 
 export function asRenderOutput(value: unknown): RenderOutput | undefined {
   return isObject(value) && isRef(value.preview) ? (value as RenderOutput) : undefined;
+}
+
+/** The instruction a run followed, as the host recorded it. */
+export function usedInstruction(result: AutoResult | undefined): string | undefined {
+  const value = result?.input?.instruction;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 export function asAutoInput(value: unknown): Partial<AutoInput> | undefined {

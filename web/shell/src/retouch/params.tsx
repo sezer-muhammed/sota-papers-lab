@@ -15,7 +15,7 @@ import {
 } from "./develop/layout";
 import type { CurveRegion } from "./develop/tone-curve";
 import { CURVE_KEY, ToneCurvePreview } from "./develop/tone-curve-preview";
-import { formatParam, formatSigned, isDefault, paramValue, snapParam, type ParamKey, type ParamSpec } from "./format";
+import { formatParam, formatSigned, isDefault, isSwitch, paramValue, snapParam, type ParamKey, type ParamSpec } from "./format";
 
 const REGION_OF = new Map<ParamKey, CurveRegion>(
   (Object.entries(CURVE_KEY) as [CurveRegion, ParamKey][]).map(([region, key]) => [key, region]),
@@ -121,7 +121,7 @@ function ValuesTable({
    has no centre, is a mark on its scale; switches have no bar. The colour
    sliders' bars run over their tinted scale. */
 function ValueBar({ spec, value }: { spec: ParamSpec; value: number }) {
-  if (spec.group === "Lens") return null;
+  if (isSwitch(spec)) return null;
   // Temperature on its slider's scale, where photos live.
   const range = spec.key === "temperature" ? TEMPERATURE_SLIDER : spec;
   const share = (value - range.min) / (range.max - range.min || 1);
@@ -264,7 +264,7 @@ function BlockSliders({
       {block.title ? <BlockTitle id={titleId}>{block.title}</BlockTitle> : null}
       {block.rows.map((row) => {
         const { key } = row.spec;
-        if (row.spec.group === "Lens") {
+        if (isSwitch(row.spec)) {
           return (
             <SwitchRow
               key={key}

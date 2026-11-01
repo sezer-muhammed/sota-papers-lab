@@ -2,6 +2,7 @@ import { SplError, type RunDetail, type RunRecord, type SplClient } from "@spl/s
 import type { InspectInput } from "@spl/bindings/raw-retouch/InspectInput";
 import type { InspectOutput } from "@spl/bindings/raw-retouch/InspectOutput";
 import type { Params } from "@spl/bindings/raw-retouch/Params";
+import type { Region } from "@spl/bindings/raw-retouch/Region";
 import type { RenderInput } from "@spl/bindings/raw-retouch/RenderInput";
 import { describeError, isUnauthorized } from "../api";
 import { isRawFileName } from "./files";
@@ -19,6 +20,7 @@ import {
   needsRetouch,
   queueOrder,
   type AutoState,
+  type DownloadKind,
   type ExportState,
   type FileRef,
   type ManualState,
@@ -27,9 +29,13 @@ import {
 } from "./model";
 import {
   DEFAULT_OPTIONS,
+  HOST_SLOTS,
+  INSTRUCTION_MAX,
   autoInput,
+  exportOptions,
   loadOptions,
   normalizeOptions,
+  resolveInstruction,
   saveOptions,
   type OptionsStorage,
   type RetouchOptions,
@@ -50,9 +56,16 @@ const DOWNLOAD_GAP_MS = 600;
     run it just started should not fail the photo. */
 const MISSING_LIMIT = 5;
 const SESSION_KEY = "spl-retouch-session";
+/** The Web Lock whose holder drives the retouch queue: one tab per browser. */
+const QUEUE_LOCK = "spl-retouch-queue";
 
 /** No export files: what a preview render asks for. */
-const NO_EXPORT = { jpeg: false, jpeg_quality: 95, tiff16: false, png: false, png_bits: 8, xmp: false };
+const NO_EXPORT = { jpeg: false, jpeg_quality: 95, tiff16: false, xmp: false, png: false, png_bits: 8 };
+
+const DOWNLOAD_LABEL: Record<DownloadKind, string> = { jpeg: "JPEG", png: "PNG", xmp: "XMP" };
+
+/** A 1:1 crop rendered for the zoomed viewer. */
+export type RegionRender = { id: string; width: number; height: number };
 
 export type RetouchClient = Pick<SplClient, "uploadArtifact" | "startRun" | "runDetail" | "cancelRun">;
 
@@ -62,7 +75,8 @@ export type SessionDeps = {
   storage?: OptionsStorage;
   /** Saves one artifact under a file name (see artifact.ts). */
   download: (id: string, filename: string) => Promise<void>;
-  /** Wake polls when the tab returns; warn before closing during an upload. */
+  /** Wake polls when the tab returns; warn before closing during an upload;
+      share the queue with other tabs (one drives it). */
   browser?: boolean;
 };
 
@@ -82,6 +96,7 @@ type SavedPhoto = {
   /** The last successful auto run, when a later run is the current one. */
   resultRunId?: string;
   queued?: number;
+  instruction?: string;
   manual?: {
     base: Params;
     params: Params;
@@ -118,19 +133,30 @@ export class RetouchSession {
   private pumpScheduled = false;
   private savedText = "";
   private announcements = 0;
+  /** This tab drives the retouch queue. Two tabs restoring one session would
+      otherwise each start the queued photos, retouching them twice. */
+  private leader = true;
+  /** Auto runs this tab has followed, so a follower never mistakes an old
+      run in the leader's saved session for one it started from this queue. */
+  private readonly seenRuns = new Set<string>();
 
   constructor(deps: SessionDeps) {
     this.deps = deps;
-    const saved = loadSaved(deps.storage);
+    const saved = parseSaved(readSaved(deps.storage));
     this.state = {
-      photos: saved.map(restorePhoto),
+      photos: saved.photos.map(restorePhoto),
       options: loadOptions(deps.storage),
+      instruction: saved.instruction,
+      follower: false,
       locked: false,
     };
-    this.nextOrder = 1 + Math.max(0, ...saved.map((s) => s.queued ?? 0));
-    this.savedText = serialize(this.state.photos);
-    if (deps.browser) this.watchBrowser();
-    this.resume(saved);
+    this.nextOrder = 1 + Math.max(0, ...saved.photos.map((s) => s.queued ?? 0));
+    this.savedText = serialize(this.state);
+    if (deps.browser) {
+      this.watchBrowser();
+      this.claimQueue();
+    }
+    this.resume(saved.photos);
   }
 
   subscribe = (listener: () => void) => {
@@ -258,6 +284,26 @@ export class RetouchSession {
     for (const photo of this.state.photos) if (isActive(photo)) this.cancel(photo.key);
   }
 
+  /* ---- Instructions ---- */
+
+  /** The photo's own box. Read when its retouch starts, so a queued photo
+      follows what the box says by then. */
+  setInstruction(key: string, text: string) {
+    const instruction = text.slice(0, INSTRUCTION_MAX);
+    this.patch(key, (p) => ((p.instruction ?? "") === instruction ? p : { ...p, instruction: instruction || undefined }));
+  }
+
+  /** The default box, for photos whose own box is empty. */
+  setDefaultInstruction(text: string) {
+    const instruction = text.slice(0, INSTRUCTION_MAX);
+    if (instruction !== this.state.instruction) this.commit({ ...this.state, instruction });
+  }
+
+  /** What a retouch of this photo would follow now. */
+  instructionFor(photo: Photo): string | undefined {
+    return resolveInstruction(photo.instruction, this.state.instruction);
+  }
+
   /* ---- Options ---- */
 
   setOptions(patch: Partial<RetouchOptions>) {
@@ -314,14 +360,13 @@ export class RetouchSession {
     const manual = photo?.manual;
     if (!photo?.artifactId || !manual || manual.export?.status === "running") return;
     const params = manual.params;
-    const o = this.state.options;
     const input: RenderInput = {
       raw: photo.artifactId,
       params,
       size: "full",
       filename: photo.filename,
       // A full-size export is for the JPEG, whatever the auto options say.
-      export: { jpeg: true, jpeg_quality: o.jpegQuality, tiff16: o.tiff16, png: true, png_bits: 8, xmp: o.xmp },
+      export: exportOptions(this.state.options, true),
     };
     const life = this.lifetime(key);
     this.setExport(key, () => ({ status: "running", params, progress: null, cancelling: false }));
@@ -361,10 +406,65 @@ export class RetouchSession {
       .finally(() => this.wake(key));
   }
 
+  /* ---- Zoom ---- */
+
+  /**
+   * Renders a crop of the photo at full resolution (1:1) with `params`, for
+   * the zoomed viewer. Resolves with the crop's JPEG; rejects when `signal`
+   * aborts (which also cancels the run on the host) or the render fails.
+   */
+  async renderRegion(key: string, params: Params, region: Region, signal: AbortSignal): Promise<RegionRender> {
+    const photo = this.photo(key);
+    if (!photo?.artifactId) throw new Error("The photo is not uploaded yet.");
+    const input: RenderInput = {
+      raw: photo.artifactId,
+      params,
+      size: "preview",
+      filename: photo.filename,
+      export: NO_EXPORT,
+      region,
+    };
+    const client = this.deps.client();
+    let run: RunRecord;
+    try {
+      run = await client.startRun(OPS.render, input);
+    } catch (error) {
+      this.noteAuth(error);
+      throw error;
+    }
+    const id = run.id;
+    const cancel = () => this.cancelQuietly(id);
+    if (signal.aborted) {
+      cancel();
+      throw abortError();
+    }
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      let failures = 0;
+      while (!isFinished(run.status)) {
+        await pause(failures ? Math.min(POLL_MS.preview * 2 ** failures, 5000) : POLL_MS.preview, signal);
+        try {
+          run = (await client.runDetail(id)).run;
+          failures = 0;
+        } catch (error) {
+          if (signal.aborted) throw abortError();
+          this.noteAuth(error);
+          failures += 1;
+          if (failures > 6) throw error;
+        }
+      }
+      const output = run.status === "succeeded" ? asRenderOutput(run.output) : undefined;
+      if (!output) throw new Error(runFailure(run, "The 1:1 render"));
+      return { id: output.preview.id, width: output.width, height: output.height };
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
+  }
+
   /* ---- Downloads ---- */
 
-  /** Every photo's final JPEG (or XMP), one browser download each. */
-  async downloadAll(kind: "jpeg" | "xmp") {
+  /** Every photo's final JPEG (or PNG, or XMP), one browser download each. */
+  async downloadAll(kind: DownloadKind) {
     if (this.state.downloading) return;
     const items = this.state.photos
       .map((p) => finalFiles(p)[kind])
@@ -381,7 +481,7 @@ export class RetouchSession {
       await new Promise((resolve) => setTimeout(resolve, DOWNLOAD_GAP_MS));
     }
     this.commit({ ...this.state, downloading: undefined });
-    const label = kind === "jpeg" ? "JPEG" : "XMP";
+    const label = DOWNLOAD_LABEL[kind];
     this.announce(
       failed
         ? `${failed} of ${items.length} ${label} downloads failed.`
@@ -422,11 +522,11 @@ export class RetouchSession {
   }
 
   private persist() {
-    const text = serialize(this.state.photos);
+    const text = serialize(this.state);
     if (text === this.savedText) return;
     this.savedText = text;
     try {
-      if (this.state.photos.length > 0) this.deps.storage?.setItem(SESSION_KEY, text);
+      if (this.state.photos.length > 0 || this.state.instruction) this.deps.storage?.setItem(SESSION_KEY, text);
       else this.deps.storage?.removeItem(SESSION_KEY);
     } catch {
       /* quota or private mode: this visit still works, a reload forgets it */
@@ -458,7 +558,9 @@ export class RetouchSession {
   }
 
   /** Starts what the slots allow: uploads two at a time, retouches at the
-      chosen parallelism in queue order, each after its photo has been read. */
+      chosen parallelism in queue order, each after its photo has been read.
+      Retouches leave one of the host's run slots free for previews, zoom
+      tiles and exports, and only the tab that holds the queue starts them. */
   private pump() {
     const { photos, options } = this.state;
     let uploading = photos.filter((p) => p.upload.status === "uploading").length;
@@ -469,6 +571,8 @@ export class RetouchSession {
       void this.upload(photo.key);
     }
 
+    if (!this.leader) return;
+    const limit = Math.max(1, Math.min(options.parallel, HOST_SLOTS - 1));
     let active = photos.filter((p) => p.auto.status === "running" || p.auto.status === "restoring").length;
     const ready = photos
       .filter(
@@ -479,7 +583,7 @@ export class RetouchSession {
       )
       .sort((a, b) => queueOrder(a) - queueOrder(b));
     for (const photo of ready) {
-      if (active >= options.parallel) break;
+      if (active >= limit) break;
       active += 1;
       void this.runAuto(photo.key);
     }
@@ -554,6 +658,51 @@ export class RetouchSession {
       event.preventDefault();
       event.returnValue = "";
     });
+    // While another tab drives the queue, follow the runs it starts.
+    window.addEventListener("storage", (event) => {
+      if (event.key === SESSION_KEY && !this.leader) this.adoptRuns(event.newValue);
+    });
+  }
+
+  /** Takes the queue lock: at once when no other tab of this session holds
+      it, else when that tab closes. Without Web Locks every tab drives its
+      own queue, as before. */
+  private claimQueue() {
+    const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+    if (!locks?.request) return;
+    this.leader = false;
+    const lead = () => {
+      this.leader = true;
+      if (this.state.follower) this.commit({ ...this.state, follower: false });
+      else this.schedulePump();
+      // Held for the tab's life.
+      return new Promise<void>(() => undefined);
+    };
+    locks
+      .request(QUEUE_LOCK, { ifAvailable: true }, (lock) => {
+        if (lock) return lead();
+        this.commit({ ...this.state, follower: true });
+        void locks.request(QUEUE_LOCK, lead).catch(() => undefined);
+        return undefined;
+      })
+      .catch(() => {
+        // Locks refused (e.g. an opaque origin): drive the queue here.
+        this.leader = true;
+        this.schedulePump();
+      });
+  }
+
+  /** The leading tab saved the session: photos queued here that it has
+      started are followed instead of started a second time. */
+  private adoptRuns(text: string | null) {
+    for (const saved of parseSaved(text).photos) {
+      const runId = str(saved.autoRunId);
+      const photo = this.photo(saved.key);
+      if (!runId || this.seenRuns.has(runId) || !photo || photo.auto.status !== "queued") continue;
+      if (photo.result?.runId === runId) continue;
+      this.patch(photo.key, (p) => (p.auto.status === "queued" ? { ...p, auto: { status: "restoring", runId } } : p));
+      void this.followAuto(photo.key, runId, true);
+    }
   }
 
   /** Picks up what a reload interrupted: reads, retouches and exports that
@@ -714,7 +863,7 @@ export class RetouchSession {
     const photo = this.photo(key);
     if (!photo?.artifactId) return;
     const life = this.lifetime(key);
-    const input = autoInput(this.state.options, photo.artifactId, photo.filename);
+    const input = autoInput(this.state.options, photo.artifactId, photo.filename, this.instructionFor(photo));
     this.patch(key, (p) => ({
       ...p,
       auto: { status: "running", serverQueued: false, progress: null, logs: [], startedAtMs: null, cancelling: false },
@@ -757,6 +906,7 @@ export class RetouchSession {
     // A run started or seen running in this visit is announced and replaces
     // manual edits; one that had ended before a reload just restores.
     let live = typeof first !== "string";
+    this.seenRuns.add(typeof first === "string" ? first : first.id);
     const run = await this.follow(key, first, POLL_MS.auto, immediate, (detail) => {
       if (isFinished(detail.run.status)) return;
       live = true;
@@ -821,6 +971,7 @@ export class RetouchSession {
   }
 
   private async restoreResult(key: string, runId: string) {
+    this.seenRuns.add(runId);
     const run = await this.follow(key, runId, POLL_MS.auto, true);
     const output = run?.status === "succeeded" ? asAutoOutput(run.output) : undefined;
     if (!run || !output) return;
@@ -998,8 +1149,35 @@ function newKey(photos: Photo[]): string {
   }
 }
 
-function serialize(photos: Photo[]): string {
-  return JSON.stringify({ v: 1, photos: photos.map(toSaved) });
+function abortError(): Error {
+  return new DOMException("The request was aborted.", "AbortError");
+}
+
+/** Waits `ms`; rejects at once when `signal` aborts. */
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError());
+      return;
+    }
+    const stop = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", stop);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", stop, { once: true });
+  });
+}
+
+function serialize(state: Pick<SessionState, "photos" | "instruction">): string {
+  return JSON.stringify({
+    v: 1,
+    photos: state.photos.map(toSaved),
+    ...(state.instruction ? { instruction: state.instruction } : {}),
+  });
 }
 
 function toSaved(photo: Photo): SavedPhoto {
@@ -1016,6 +1194,7 @@ function toSaved(photo: Photo): SavedPhoto {
     autoRunId,
     resultRunId: photo.result && photo.result.runId !== autoRunId ? photo.result.runId : undefined,
     queued: auto.status === "queued" ? auto.order : undefined,
+    instruction: photo.instruction || undefined,
     manual: manual && {
       base: manual.base,
       params: manual.params,
@@ -1027,25 +1206,38 @@ function toSaved(photo: Photo): SavedPhoto {
   };
 }
 
-function loadSaved(storage: OptionsStorage | undefined): SavedPhoto[] {
+function readSaved(storage: OptionsStorage | undefined): string | null {
   try {
-    const text = storage?.getItem(SESSION_KEY);
-    if (!text) return [];
-    const data: unknown = JSON.parse(text);
-    if (typeof data !== "object" || data === null) return [];
-    const { v, photos } = data as { v?: unknown; photos?: unknown };
-    if (v !== 1 || !Array.isArray(photos)) return [];
-    const seen = new Set<string>();
-    return photos.filter((s: unknown): s is SavedPhoto => {
-      if (typeof s !== "object" || s === null) return false;
-      const { key, filename, size } = s as Partial<SavedPhoto>;
-      if (typeof key !== "string" || !key || seen.has(key)) return false;
-      if (typeof filename !== "string" || typeof size !== "number") return false;
-      seen.add(key);
-      return true;
-    });
+    return storage?.getItem(SESSION_KEY) ?? null;
   } catch {
-    return [];
+    return null;
+  }
+}
+
+type Saved = { photos: SavedPhoto[]; instruction: string };
+
+function parseSaved(text: string | null | undefined): Saved {
+  const none: Saved = { photos: [], instruction: "" };
+  try {
+    if (!text) return none;
+    const data: unknown = JSON.parse(text);
+    if (typeof data !== "object" || data === null) return none;
+    const { v, photos, instruction } = data as { v?: unknown; photos?: unknown; instruction?: unknown };
+    if (v !== 1 || !Array.isArray(photos)) return none;
+    const seen = new Set<string>();
+    return {
+      instruction: typeof instruction === "string" ? instruction.slice(0, INSTRUCTION_MAX) : "",
+      photos: photos.filter((s: unknown): s is SavedPhoto => {
+        if (typeof s !== "object" || s === null) return false;
+        const { key, filename, size } = s as Partial<SavedPhoto>;
+        if (typeof key !== "string" || !key || seen.has(key)) return false;
+        if (typeof filename !== "string" || typeof size !== "number") return false;
+        seen.add(key);
+        return true;
+      }),
+    };
+  } catch {
+    return none;
   }
 }
 
@@ -1099,5 +1291,6 @@ function restorePhoto(saved: SavedPhoto): Photo {
         ? { status: "queued", order: saved.queued }
         : { status: "idle" },
     manual,
+    instruction: str(saved.instruction)?.slice(0, INSTRUCTION_MAX),
   };
 }

@@ -18,7 +18,7 @@ export type DevelopPrefs = {
 const PREFS_KEY = "spl-retouch-develop";
 
 const DEFAULTS: DevelopPrefs = {
-  open: { basic: true, toneCurve: true, colorMixer: false, detail: false, lens: false, calibration: false },
+  open: { basic: true, toneCurve: true, colorMixer: false, blackWhite: true, detail: false, lens: false, calibration: false },
   mixer: "hsl",
   property: "hue",
   band: "red",

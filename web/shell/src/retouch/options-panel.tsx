@@ -2,7 +2,12 @@ import { useId, type ReactNode } from "react";
 import { RotateCcw } from "lucide-react";
 import { Button, SegmentedControl, Surface, Switch, cn, text } from "@spl/ui";
 import { NumberField } from "./number-field";
-import { LIMITS, type RetouchOptions } from "./options";
+import { HOST_SLOTS, LIMITS, type RetouchOptions } from "./options";
+
+const pngDepths = [
+  { value: "8" as const, label: "8-bit" },
+  { value: "16" as const, label: "16-bit" },
+];
 
 const models = [
   { value: "opus" as const, label: "Opus" },
@@ -106,6 +111,21 @@ export function OptionsPanel({
             />
           </Row>
           <Switch
+            checked={options.png}
+            onCheckedChange={(png) => onChange({ png })}
+            label="Full-resolution PNG"
+            description="Lossless. 16-bit keeps the full tonal range for further editing (larger)."
+          />
+          <Row label="PNG depth" disabled={!options.png}>
+            <SegmentedControl
+              label="PNG bit depth"
+              value={String(options.pngBits) as "8" | "16"}
+              options={pngDepths}
+              disabled={!options.png}
+              onChange={(value) => onChange({ pngBits: value === "16" ? 16 : 8 })}
+            />
+          </Row>
+          <Switch
             checked={options.xmp}
             onCheckedChange={(xmp) => onChange({ xmp })}
             label="XMP sidecar"
@@ -128,6 +148,10 @@ export function OptionsPanel({
               onChange={(value) => onChange({ parallel: Number(value) })}
             />
           </Row>
+          <p className={text.caption}>
+            The host runs {HOST_SLOTS} jobs at once; one stays free, so previews, zoom and exports don't wait
+            behind retouches.
+          </p>
         </Group>
 
         <details className="group px-4 py-3">

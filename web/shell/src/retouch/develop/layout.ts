@@ -9,7 +9,7 @@ import { HUE_BANDS, type HueBand } from "../scopes/compute";
    shorter labels under a heading, the Color Mixer's bands). A setting the
    table gains later shows up at the end of its panel without a change here. */
 
-export type SectionId = "basic" | "toneCurve" | "colorMixer" | "detail" | "lens" | "calibration";
+export type SectionId = "basic" | "toneCurve" | "colorMixer" | "blackWhite" | "detail" | "lens" | "calibration";
 
 /** A slider (or switch) as a panel shows it. `label` is shorter than the
     spec's when a heading carries the rest ("Hue" under "Red Primary");
@@ -44,6 +44,7 @@ const SECTION_LAYOUT: Omit<Section, "blocks">[] = [
   { id: "basic", title: "Basic", groups: ["Basic", "Presence"] },
   { id: "toneCurve", title: "Tone Curve", groups: ["ToneCurve"] },
   { id: "colorMixer", title: "Color Mixer", groups: ["ColorMixer"] },
+  { id: "blackWhite", title: "Black & White", groups: ["BlackWhite"] },
   { id: "detail", title: "Detail", groups: ["Detail"] },
   { id: "lens", title: "Lens Corrections", groups: ["Lens"] },
   { id: "calibration", title: "Calibration", groups: ["Calibration"] },
@@ -81,6 +82,9 @@ const BLOCKS: Record<Exclude<SectionId, "colorMixer">, Block[]> = {
     },
     { title: "Noise Reduction", rows: [row("luminance_nr"), row("color_nr")] },
   ],
+  // Built from the table in buildSections, so a host without B&W shows no
+  // empty panel.
+  blackWhite: [],
   lens: [{ rows: [row("lens_profile"), row("lens_ca")] }],
   calibration: [
     { title: "Shadows", rows: [row("shadow_tint", "Tint")] },
@@ -128,6 +132,17 @@ function buildSections(): Section[] {
     for (const block of blocks) for (const r of block.rows) placed.add(r.spec.key);
     return { ...layout, blocks };
   });
+  // Black & White: the switch, then Lightroom's B&W mixer by band.
+  const bw = sections.find((s) => s.id === "blackWhite")!;
+  const bySpecKey = new Map<string, ParamSpec>(SPECS.map((spec) => [spec.key, spec]));
+  const bwSpec = bySpecKey.get("bw");
+  const grayRows = BANDS.flatMap((band): Row[] => {
+    const spec = bySpecKey.get(`gray_${band.name}`);
+    return spec ? [{ spec, label: band.label, name: `B&W Mixer ${band.label}` }] : [];
+  });
+  if (bwSpec) bw.blocks.push({ rows: [rowOf(bwSpec, "Black & White")] });
+  if (grayRows.length) bw.blocks.push({ title: "B&W Mixer", rows: grayRows });
+  for (const block of bw.blocks) for (const r of block.rows) placed.add(r.spec.key);
   // Settings the table has and the arrangement above does not: last in their panel.
   for (const spec of SPECS) {
     if (placed.has(spec.key)) continue;
@@ -136,7 +151,7 @@ function buildSections(): Section[] {
     if (last && !last.title) last.rows.push(rowOf(spec));
     else section.blocks.push({ rows: [rowOf(spec)] });
   }
-  return sections;
+  return sections.filter((s) => s.blocks.some((block) => block.rows.length > 0));
 }
 
 export const SECTIONS: Section[] = buildSections();
