@@ -1,0 +1,15 @@
+This is the current best edit of a RAW photograph. It was rendered with these Lightroom Basic panel values (temperature in kelvin, exposure in stops, the others from -100 to +100): {params}.
+
+Camera: {camera}. Shot at {shot}.
+
+{images}
+
+Allowed range of each slider for this photo:
+{bounds}
+
+Look at it as a finished print. Is there one small, targeted change that would clearly improve it? For example: recover a slightly hot sky or face, open up shadows that hide the subject, remove a slight colour cast, calm colour that is a little loud, or add a touch of contrast to a flat image. Change only the one or two sliders this needs, by a modest amount, and keep every other slider exactly as it is. If the image is already right, return the same values unchanged.
+
+Answer with:
+- assessment: one sentence on what, if anything, still holds the image back.
+- change: the change you made and why, or "none".
+- settings: all ten slider values, absolute and within the allowed ranges.
