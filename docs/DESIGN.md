@@ -46,6 +46,8 @@ Controls:
 Pages with app-specific views (the Retouch page, `#/retouch`) compose these; photos and other user content may carry their own colours, and labels laid over a photo use a translucent black chip with white text so they read on any image. Its scopes are data, drawn with tokens: histogram channels in the red, green and blue 700 steps, their overlaps in amber, teal and pink 700, all three in gray-700; only the vectorscope's dots take the photo's own hues.
 Its Develop panels (Basic, Tone Curve, Color Mixer, Detail, Lens Corrections, Calibration) are built from the app's `PARAM_SPECS` table and open and close per browser. A setting the auto edit moved off Lightroom's default carries a neutral gray-1000 dot before its name (not a status colour). White balance and tint tracks use tokens; the Color Mixer chips and tracks and the Calibration primaries show the real hues they act on, like the vectorscope's dots.
 
+The Home page (`web/shell/src/home`) shows the app it hosts rather than an abstract landing: real before/after pairs from bundled CC0 sample RAWs (`web/shell/public/examples`, described in `home/examples.ts`), BEFORE on the left and AFTER on the right of a draggable split that is also a keyboard slider. Photos are the visual centre; sections are unboxed (mono eyebrow, h2, hairline rules) and keep to neutral greys plus the action blue.
+
 ## Motion
 
 Reveal and stagger on scroll, ping for live status, skeleton shimmer, indeterminate bar, check draw. All disabled under `prefers-reduced-motion`.
