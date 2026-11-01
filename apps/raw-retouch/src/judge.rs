@@ -8,6 +8,12 @@
 //! shows images under neutral labels only, never slider values or how a
 //! candidate was made, and asks twice with the order reversed so position
 //! bias cancels out. Verdicts are cached on disk, so a re-run costs nothing.
+//!
+//! Planning and refining set the Basic panel and every Tone Curve,
+//! Presence, Color Mixer and Calibration setting the photo's search box lets
+//! move (`search::bounds`): the Basic, curve and presence sliders by value,
+//! Color Mixer bands and Calibration settings only when Claude changes
+//! them. Detail and Lens Corrections are never Claude's.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -29,7 +35,7 @@ use tokio::sync::Semaphore;
 use ts_rs::TS;
 
 use crate::encode;
-use crate::types::{Params, RawInfo, Rgb8Image, Stats};
+use crate::types::{PARAM_SPECS, ParamGroup, Params, RawInfo, Rgb8Image, Stats};
 use crate::xmp;
 
 #[derive(Debug, Clone)]
@@ -110,7 +116,8 @@ impl PhotoBrief {
 pub struct PlannedLook {
     pub name: String,
     pub rationale: String,
-    /// Absolute Lightroom values, clamped to the bounds given to `plan`.
+    /// Absolute Lightroom values, clamped to the bounds given to `plan`;
+    /// settings Claude did not set come from auto.
     pub params: Params,
 }
 
@@ -166,6 +173,9 @@ const PLAN_PROMPT: &str = include_str!("../prompts/plan.txt");
 const RANK_PROMPT: &str = include_str!("../prompts/rank.txt");
 const REFINE_PROMPT: &str = include_str!("../prompts/refine.txt");
 const COMPARE_PROMPT: &str = include_str!("../prompts/compare.txt");
+/// What each setting does, by panel (`[basic]`, `[tone_curve]`, ...): the
+/// plan and refine prompts show the panels and settings Claude may set.
+const SLIDERS: &str = include_str!("../prompts/sliders.txt");
 
 /// CLI processes running at once across the whole process: enough for both
 /// orders of a comparison to overlap, few enough for the subscription's
@@ -173,7 +183,7 @@ const COMPARE_PROMPT: &str = include_str!("../prompts/compare.txt");
 static CLI_SLOTS: Semaphore = Semaphore::const_new(3);
 
 /// Changes whenever a cached verdict would no longer answer the same request.
-const CACHE_VERSION: &str = "spl-judge-1";
+const CACHE_VERSION: &str = "spl-judge-2";
 
 const DEFAULT_TIMEOUT_S: u64 = 300;
 
@@ -208,7 +218,9 @@ impl Claude {
     }
 
     /// Reads the neutral and auto renders plus stats; proposes up to three
-    /// visibly different looks inside `lo`..`hi`.
+    /// visibly different looks inside `lo`..`hi`. Settings a look leaves
+    /// alone (Color Mixer bands and Calibration settings it does not list,
+    /// and everything Claude may not set) come from `auto_params`.
     pub async fn plan(
         &self,
         photo: &PhotoBrief,
@@ -224,9 +236,10 @@ impl Claude {
         let text = fill(
             PLAN_PROMPT,
             &[
+                ("sliders", &ranges.glossary()),
                 ("camera", &photo.camera),
                 ("shot", &photo.exposure),
-                ("auto", &describe(auto_params)),
+                ("auto", &ranges.describe_params(auto_params)),
                 ("stats", &stats),
                 ("bounds", &ranges.describe()),
             ],
@@ -241,6 +254,9 @@ impl Claude {
                 if r.looks.is_empty() {
                     bail!("no looks proposed");
                 }
+                for look in &r.looks {
+                    ranges.values(&look.settings)?;
+                }
                 Ok(())
             })
             .await?;
@@ -249,12 +265,14 @@ impl Claude {
             .into_iter()
             .take(3)
             .enumerate()
-            .map(|(i, look)| PlannedLook {
-                name: non_empty(look.name, || format!("Look {}", i + 1)),
-                rationale: look.rationale.trim().to_owned(),
-                params: ranges.fit(look.settings.values()),
+            .map(|(i, look)| {
+                Ok(PlannedLook {
+                    name: non_empty(look.name, || format!("Look {}", i + 1)),
+                    rationale: look.rationale.trim().to_owned(),
+                    params: ranges.fit(auto_params, &ranges.values(&look.settings)?),
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         Ok(PlanVerdict {
             scene: reply.analysis.trim().to_owned(),
             looks,
@@ -351,7 +369,8 @@ impl Claude {
         let text = fill(
             REFINE_PROMPT,
             &[
-                ("params", &describe(params)),
+                ("params", &ranges.describe_params(params)),
+                ("sliders", &ranges.glossary()),
                 ("camera", &photo.camera),
                 ("shot", &photo.exposure),
                 ("bounds", &ranges.describe()),
@@ -366,7 +385,7 @@ impl Claude {
                 "refine",
                 &refine_schema(&ranges),
                 &blocks,
-                |_: &RefineReply| Ok(()),
+                |r: &RefineReply| ranges.values(&r.settings).map(|_| ()),
             )
             .await?;
         let rationale = [reply.assessment.trim(), reply.change.trim()]
@@ -375,7 +394,7 @@ impl Claude {
             .collect::<Vec<_>>()
             .join(" ");
         Ok(RefineVerdict {
-            params: ranges.adjust(params, reply.settings.values()),
+            params: ranges.adjust(params, &ranges.values(&reply.settings)?),
             rationale,
         })
     }
@@ -1080,7 +1099,8 @@ struct LookReply {
     name: String,
     #[serde(default)]
     rationale: String,
-    settings: Settings,
+    /// Read by [`Ranges::values`].
+    settings: Value,
 }
 
 #[derive(Deserialize)]
@@ -1089,92 +1109,144 @@ struct RefineReply {
     assessment: String,
     #[serde(default)]
     change: String,
-    settings: Settings,
-}
-
-/// Slider values as Claude writes them, in Lightroom units.
-#[derive(Deserialize)]
-struct Settings {
-    temperature: f64,
-    tint: f64,
-    exposure: f64,
-    contrast: f64,
-    highlights: f64,
-    shadows: f64,
-    whites: f64,
-    blacks: f64,
-    vibrance: f64,
-    saturation: f64,
-}
-
-impl Settings {
-    /// In [`Params::NAMES`] order (the Basic panel).
-    fn values(&self) -> [f64; Params::BASIC] {
-        [
-            self.temperature,
-            self.tint,
-            self.exposure,
-            self.contrast,
-            self.highlights,
-            self.shadows,
-            self.whites,
-            self.blacks,
-            self.vibrance,
-            self.saturation,
-        ]
-    }
+    /// Read by [`Ranges::values`].
+    settings: Value,
 }
 
 const EXPOSURE: usize = 2;
 
-/// Lightroom's legal range per slider, in [`Params::NAMES`] order.
-const LEGAL: [(f64, f64); Params::BASIC] = [
-    (2000.0, 50000.0),
-    (-150.0, 150.0),
-    (-5.0, 5.0),
-    (-100.0, 100.0),
-    (-100.0, 100.0),
-    (-100.0, 100.0),
-    (-100.0, 100.0),
-    (-100.0, 100.0),
-    (-100.0, 100.0),
-    (-100.0, 100.0),
+/// The panels Claude may set besides the Basic panel, where the search box
+/// lets a setting move.
+const CLAUDE_GROUPS: [ParamGroup; 4] = [
+    ParamGroup::ToneCurve,
+    ParamGroup::Presence,
+    ParamGroup::ColorMixer,
+    ParamGroup::Calibration,
 ];
 
-/// Lightroom's steps per unit: whole kelvin and slider units, 0.01 EV.
-const STEPS_PER_UNIT: [f64; Params::BASIC] = [1.0, 1.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+/// A Color Mixer band's settings, as their field names start (`hue_blue`,
+/// `saturation_blue`, `luminance_blue`).
+const MIXER_KINDS: [&str; 3] = ["hue", "saturation", "luminance"];
 
-/// The box Claude may move in: per Basic slider, inclusive bounds on
+/// Panels whose every offered slider Claude gives by value; Color Mixer
+/// bands and Calibration settings come as lists of the ones it changes.
+fn by_value(i: usize) -> bool {
+    matches!(
+        PARAM_SPECS[i].group,
+        ParamGroup::Basic | ParamGroup::ToneCurve | ParamGroup::Presence
+    )
+}
+
+/// Index of the field named `key` in [`Params::NAMES`].
+fn field(key: &str) -> Option<usize> {
+    Params::NAMES.iter().position(|n| *n == key)
+}
+
+/// A Color Mixer field as (kind, band): `saturation_blue` is
+/// ("saturation", "blue").
+fn kind_band(i: usize) -> Option<(&'static str, &'static str)> {
+    let spec = &PARAM_SPECS[i];
+    (spec.group == ParamGroup::ColorMixer)
+        .then(|| spec.key.split_once('_'))
+        .flatten()
+}
+
+/// Lightroom's steps per unit of field `i`: whole kelvin and slider
+/// units, 0.01 EV, 0.1 px of sharpening radius.
+fn steps_per_unit(i: usize) -> f64 {
+    (1.0 / f64::from(PARAM_SPECS[i].step)).round()
+}
+
+/// The box Claude may move in: per setting, inclusive bounds on
 /// Lightroom's grid, rounded inward so every value on the grid inside them
-/// is legal. Claude sets only the Basic panel; every other setting comes
-/// from the search box (`base`, its low corner, where the box fixes them).
+/// is legal. Claude sets the Basic panel, and each Tone Curve, Presence,
+/// Color Mixer and Calibration setting the box lets move
+/// ([`Ranges::offered`]); every other setting stays where the box holds it.
 struct Ranges {
-    lo: [f64; Params::BASIC],
-    hi: [f64; Params::BASIC],
-    base: Params,
+    lo: [f64; Params::COUNT],
+    hi: [f64; Params::COUNT],
+    /// The box as given: where the settings Claude leaves alone are held.
+    box_lo: [f32; Params::COUNT],
+    box_hi: [f32; Params::COUNT],
 }
 
 impl Ranges {
     fn new(lo: &Params, hi: &Params) -> Self {
-        let base = *lo;
-        let (lo, hi) = (lo.basic(), hi.basic());
-        let bounds: [(f64, f64); Params::BASIC] =
-            std::array::from_fn(|i| grid_bounds(i, lo[i], hi[i]));
+        let (box_lo, box_hi) = (lo.to_array(), hi.to_array());
+        let bounds: [(f64, f64); Params::COUNT] =
+            std::array::from_fn(|i| grid_bounds(i, box_lo[i], box_hi[i]));
         Self {
             lo: bounds.map(|b| b.0),
             hi: bounds.map(|b| b.1),
-            base,
+            box_lo,
+            box_hi,
         }
     }
 
-    /// Claude's values on Lightroom's grid, clamped into the box.
-    fn fit(&self, values: [f64; Params::BASIC]) -> Params {
-        self.base
-            .with_basic(std::array::from_fn(|i| self.fit_one(i, values[i])))
+    /// Whether Claude sets field `i`: the Basic panel always, the other
+    /// panels it may set where the box is wider than one step.
+    fn offered(&self, i: usize) -> bool {
+        let group = PARAM_SPECS[i].group;
+        group == ParamGroup::Basic || (CLAUDE_GROUPS.contains(&group) && self.lo[i] < self.hi[i])
+    }
+
+    /// The offered fields of `group`, in field order.
+    fn offered_in(&self, group: ParamGroup) -> impl Iterator<Item = usize> + '_ {
+        (0..Params::COUNT).filter(move |&i| PARAM_SPECS[i].group == group && self.offered(i))
+    }
+
+    /// The offered sliders Claude gives by value, in field order.
+    fn offered_by_value(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..Params::COUNT).filter(move |&i| by_value(i) && self.offered(i))
+    }
+
+    /// The Color Mixer bands with an offered setting, in Lightroom's order.
+    fn mixer_bands(&self) -> Vec<&'static str> {
+        let mut bands: Vec<&'static str> = Vec::new();
+        for i in self.offered_in(ParamGroup::ColorMixer) {
+            if let Some((_, band)) = kind_band(i)
+                && !bands.contains(&band)
+            {
+                bands.push(band);
+            }
+        }
+        let order: Vec<&str> = (0..Params::COUNT)
+            .filter_map(kind_band)
+            .filter(|(kind, _)| *kind == MIXER_KINDS[0])
+            .map(|(_, band)| band)
+            .collect();
+        bands.sort_by_key(|band| order.iter().position(|b| b == band));
+        bands
+    }
+
+    /// The offered fields of one Color Mixer kind ("hue", ...).
+    fn mixer_fields(&self, kind: &str) -> Vec<usize> {
+        self.offered_in(ParamGroup::ColorMixer)
+            .filter(|&i| kind_band(i).is_some_and(|(k, _)| k == kind))
+            .collect()
+    }
+
+    /// Claude's `values` (field, value) on Lightroom's grid and clamped
+    /// into the box, over `start` held in the box: every setting Claude
+    /// did not set keeps `start`'s value.
+    fn fit(&self, start: &Params, values: &[(usize, f64)]) -> Params {
+        let s = start.to_array();
+        let mut a: [f32; Params::COUNT] = std::array::from_fn(|i| {
+            let (lo, hi) = (
+                self.box_lo[i].min(self.box_hi[i]),
+                self.box_lo[i].max(self.box_hi[i]),
+            );
+            // NaN-proof: max and min ignore a NaN start, and a NaN bound.
+            s[i].max(lo).min(hi)
+        });
+        for &(i, v) in values {
+            a[i] = self.fit_one(i, v);
+        }
+        Params::from_array(a)
     }
 
     fn fit_one(&self, i: usize, value: f64) -> f32 {
-        let per = STEPS_PER_UNIT[i];
+        let per = steps_per_unit(i);
         let v = if value.is_finite() {
             (value * per).round() / per
         } else {
@@ -1183,59 +1255,288 @@ impl Ranges {
         v.clamp(self.lo[i], self.hi[i]) as f32
     }
 
-    /// Like [`Ranges::fit`], except that sliders Claude kept (equal to the
-    /// current value on Lightroom's grid) keep their exact current value.
-    fn adjust(&self, current: &Params, values: [f64; Params::BASIC]) -> Params {
-        let now = current.basic();
-        current.with_basic(std::array::from_fn(|i| {
-            let per = STEPS_PER_UNIT[i];
-            let kept = (f64::from(now[i]) * per).round() == (values[i] * per).round();
-            if kept {
-                (f64::from(now[i]).clamp(self.lo[i], self.hi[i])) as f32
+    /// `current` with Claude's `values`: like [`Ranges::fit`], except that
+    /// settings Claude kept (equal to the current value on Lightroom's
+    /// grid) keep their exact current value, and settings it did not
+    /// mention stay exactly as they are.
+    fn adjust(&self, current: &Params, values: &[(usize, f64)]) -> Params {
+        let now = current.to_array();
+        let mut a = now;
+        for &(i, v) in values {
+            let per = steps_per_unit(i);
+            let kept = (f64::from(now[i]) * per).round() == (v * per).round();
+            a[i] = if kept {
+                f64::from(now[i]).clamp(self.lo[i], self.hi[i]) as f32
             } else {
-                self.fit_one(i, values[i])
-            }
-        }))
+                self.fit_one(i, v)
+            };
+        }
+        Params::from_array(a)
     }
 
+    /// The (field, value) pairs a reply's `settings` set: every offered
+    /// Basic, Tone Curve and Presence slider it gives (the Basic panel must
+    /// all be there), and the Color Mixer bands and Calibration settings it
+    /// lists. Settings Claude may not set are ignored.
+    fn values(&self, settings: &Value) -> Result<Vec<(usize, f64)>> {
+        let obj = settings
+            .as_object()
+            .context("the settings are not an object")?;
+        let mut out = Vec::new();
+        for i in self.offered_by_value() {
+            let key = PARAM_SPECS[i].key;
+            match obj.get(key).and_then(Value::as_f64) {
+                Some(v) => out.push((i, v)),
+                None if i < Params::BASIC => bail!("the settings have no {key}"),
+                None => {}
+            }
+        }
+        let list = |name: &str| {
+            obj.get(name)
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        };
+        for item in list("color_mixer") {
+            let Some(band) = item.get("band").and_then(Value::as_str) else {
+                continue;
+            };
+            let band = band.trim().to_ascii_lowercase();
+            for kind in MIXER_KINDS {
+                if let Some(v) = item.get(kind).and_then(Value::as_f64)
+                    && let Some(i) = field(&format!("{kind}_{band}"))
+                    && kind_band(i).is_some()
+                    && self.offered(i)
+                {
+                    out.push((i, v));
+                }
+            }
+        }
+        for item in list("calibration") {
+            if let Some(setting) = item.get("setting").and_then(Value::as_str)
+                && let Some(v) = item.get("value").and_then(Value::as_f64)
+                && let Some(i) = field(setting.trim())
+                && PARAM_SPECS[i].group == ParamGroup::Calibration
+                && self.offered(i)
+            {
+                out.push((i, v));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `settings` object Claude fills in: every offered Basic, Tone
+    /// Curve and Presence slider, then `color_mixer` and `calibration`
+    /// lists (possibly empty) when any of theirs is offered.
     fn settings_schema(&self) -> Value {
         let mut properties = Map::new();
-        for (i, name) in Params::NAMES[..Params::BASIC].iter().enumerate() {
-            let property = if i == EXPOSURE {
-                json!({"type": "number", "minimum": self.lo[i], "maximum": self.hi[i]})
-            } else {
-                json!({"type": "integer", "minimum": self.lo[i] as i64, "maximum": self.hi[i] as i64})
-            };
-            properties.insert((*name).to_owned(), property);
+        let mut required: Vec<&str> = Vec::new();
+        for i in self.offered_by_value() {
+            let key = PARAM_SPECS[i].key;
+            properties.insert(key.to_owned(), self.number_schema(&[i]));
+            required.push(key);
+        }
+        let bands = self.mixer_bands();
+        if !bands.is_empty() {
+            let mut item = Map::new();
+            item.insert("band".into(), json!({"type": "string", "enum": bands}));
+            let mut item_required = vec!["band"];
+            for kind in MIXER_KINDS {
+                let fields = self.mixer_fields(kind);
+                if !fields.is_empty() {
+                    item.insert(kind.into(), self.number_schema(&fields));
+                    item_required.push(kind);
+                }
+            }
+            properties.insert(
+                "color_mixer".into(),
+                json!({
+                    "type": "array",
+                    "maxItems": bands.len(),
+                    "items": {
+                        "type": "object",
+                        "properties": item,
+                        "required": item_required,
+                        "additionalProperties": false,
+                    },
+                }),
+            );
+            required.push("color_mixer");
+        }
+        let calibration: Vec<usize> = self.offered_in(ParamGroup::Calibration).collect();
+        if !calibration.is_empty() {
+            let names: Vec<&str> = calibration.iter().map(|&i| PARAM_SPECS[i].key).collect();
+            properties.insert(
+                "calibration".into(),
+                json!({
+                    "type": "array",
+                    "maxItems": names.len(),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "setting": {"type": "string", "enum": names},
+                            "value": self.number_schema(&calibration),
+                        },
+                        "required": ["setting", "value"],
+                        "additionalProperties": false,
+                    },
+                }),
+            );
+            required.push("calibration");
         }
         json!({
             "type": "object",
             "properties": properties,
-            "required": &Params::NAMES[..Params::BASIC],
+            "required": required,
             "additionalProperties": false,
         })
     }
 
-    fn describe(&self) -> String {
-        Params::NAMES[..Params::BASIC]
+    /// A number within every one of `fields`' bounds put together: whole
+    /// units unless a field has finer steps (exposure).
+    fn number_schema(&self, fields: &[usize]) -> Value {
+        let lo = fields
             .iter()
-            .enumerate()
-            .map(|(i, name)| {
+            .map(|&i| self.lo[i])
+            .fold(f64::INFINITY, f64::min);
+        let hi = fields
+            .iter()
+            .map(|&i| self.hi[i])
+            .fold(f64::NEG_INFINITY, f64::max);
+        if fields.iter().any(|&i| PARAM_SPECS[i].step < 1.0) {
+            json!({"type": "number", "minimum": lo, "maximum": hi})
+        } else {
+            json!({"type": "integer", "minimum": lo as i64, "maximum": hi as i64})
+        }
+    }
+
+    /// The allowed range of every setting Claude may set, one per line.
+    fn describe(&self) -> String {
+        let range = |i: usize| {
+            format!(
+                "{} to {}",
+                slider_value(i, self.lo[i]),
+                slider_value(i, self.hi[i])
+            )
+        };
+        let mut lines: Vec<String> = self
+            .offered_by_value()
+            .map(|i| format!("- {}: {}", PARAM_SPECS[i].key, range(i)))
+            .collect();
+        for band in self.mixer_bands() {
+            let parts: Vec<String> = MIXER_KINDS
+                .iter()
+                .filter_map(|kind| {
+                    let i = field(&format!("{kind}_{band}"))?;
+                    self.offered(i).then(|| format!("{kind} {}", range(i)))
+                })
+                .collect();
+            lines.push(format!("- {band} band: {}", parts.join(", ")));
+        }
+        lines.extend(
+            self.offered_in(ParamGroup::Calibration)
+                .map(|i| format!("- {}: {}", PARAM_SPECS[i].key, range(i))),
+        );
+        lines.join("\n")
+    }
+
+    /// `params` as Claude reads them: every offered Basic, Tone Curve and
+    /// Presence slider ("temperature 5400 K, tint +5, exposure +0.35 EV,
+    /// ..."), then the offered Color Mixer and Calibration settings away
+    /// from zero ("blue band luminance -15", "blue_primary_saturation +8").
+    fn describe_params(&self, params: &Params) -> String {
+        let q = params.quantized().to_array();
+        let mut parts: Vec<String> = self
+            .offered_by_value()
+            .map(|i| {
                 format!(
-                    "- {name}: {} to {}",
-                    slider_value(i, self.lo[i]),
-                    slider_value(i, self.hi[i])
+                    "{} {}",
+                    PARAM_SPECS[i].key,
+                    slider_value(i, f64::from(q[i]))
                 )
             })
+            .collect();
+        for i in self.offered_in(ParamGroup::ColorMixer) {
+            if let Some((kind, band)) = kind_band(i)
+                && q[i] != 0.0
+            {
+                parts.push(format!("{band} band {kind} {}", xmp::signed(q[i])));
+            }
+        }
+        for i in self.offered_in(ParamGroup::Calibration) {
+            if q[i] != 0.0 {
+                parts.push(format!("{} {}", PARAM_SPECS[i].key, xmp::signed(q[i])));
+            }
+        }
+        parts.join(", ")
+    }
+
+    /// What each setting Claude may set does: the sections of
+    /// `prompts/sliders.txt` for the panels it may set, without the lines
+    /// on settings it may not.
+    fn glossary(&self) -> String {
+        sections(SLIDERS)
+            .into_iter()
+            .filter_map(|(name, lines)| {
+                let group = group_of(name)?;
+                self.offered_in(group).next()?;
+                let kept: Vec<&str> = lines
+                    .into_iter()
+                    .filter(|line| self.explains(group, line))
+                    .collect();
+                Some(kept.join("\n"))
+            })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n\n")
+    }
+
+    /// Whether a glossary line belongs in the prompt: a "- name: ..." line
+    /// only when Claude may set that setting (in the Color Mixer section, a
+    /// band setting such as "saturation" of any band).
+    fn explains(&self, group: ParamGroup, line: &str) -> bool {
+        let Some((name, _)) = line.strip_prefix("- ").and_then(|l| l.split_once(':')) else {
+            return true;
+        };
+        let name = name.trim();
+        if group == ParamGroup::ColorMixer && MIXER_KINDS.contains(&name) {
+            return !self.mixer_fields(name).is_empty();
+        }
+        field(name).is_none_or(|i| self.offered(i))
     }
 }
 
-/// Slider `i`'s bounds within Lightroom's legal range, rounded inward to
+/// `[name]` sections of a prompt file and their lines.
+fn sections(text: &str) -> Vec<(&str, Vec<&str>)> {
+    let mut out: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            out.push((name, Vec::new()));
+        } else if let Some((_, lines)) = out.last_mut()
+            && !trimmed.is_empty()
+        {
+            lines.push(line.trim_end());
+        }
+    }
+    out
+}
+
+/// The panel a `prompts/sliders.txt` section describes.
+fn group_of(section: &str) -> Option<ParamGroup> {
+    Some(match section {
+        "basic" => ParamGroup::Basic,
+        "tone_curve" => ParamGroup::ToneCurve,
+        "presence" => ParamGroup::Presence,
+        "color_mixer" => ParamGroup::ColorMixer,
+        "calibration" => ParamGroup::Calibration,
+        _ => return None,
+    })
+}
+
+/// Field `i`'s bounds within Lightroom's legal range, rounded inward to
 /// its grid. A box narrower than one step collapses to its rounded middle.
 fn grid_bounds(i: usize, lo: f32, hi: f32) -> (f64, f64) {
-    let (legal_lo, legal_hi) = LEGAL[i];
+    let (legal_lo, legal_hi) = (f64::from(PARAM_SPECS[i].min), f64::from(PARAM_SPECS[i].max));
     let bound = |v: f32, fallback: f64| {
         if v.is_finite() {
             f64::from(v).clamp(legal_lo, legal_hi)
@@ -1245,7 +1546,7 @@ fn grid_bounds(i: usize, lo: f32, hi: f32) -> (f64, f64) {
     };
     let (a, b) = (bound(lo, legal_lo), bound(hi, legal_hi));
     let (a, b) = if a <= b { (a, b) } else { (b, a) };
-    let per = STEPS_PER_UNIT[i];
+    let per = steps_per_unit(i);
     // Snap away f32 noise (0.35 is 0.34999999) before rounding inward.
     let snap = |v: f64| (v * per * 1e4).round() / 1e4;
     let (grid_lo, grid_hi) = (snap(a).ceil() / per, snap(b).floor() / per);
@@ -1264,17 +1565,6 @@ fn slider_value(i: usize, v: f64) -> String {
         EXPOSURE => format!("{} EV", xmp::exposure(v as f32)),
         _ => xmp::signed(v as f32),
     }
-}
-
-/// "temperature 5400 K, tint +5, exposure +0.35 EV, contrast +10, ..."
-fn describe(params: &Params) -> String {
-    let values = params.quantized().basic();
-    Params::NAMES[..Params::BASIC]
-        .iter()
-        .enumerate()
-        .map(|(i, name)| format!("{name} {}", slider_value(i, f64::from(values[i]))))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn rank_schema(labels: &[&str]) -> Value {

@@ -22,13 +22,14 @@ use super::work::{
 };
 use super::{AutoInput, AutoOutput, CandidateSummary, JudgeSummary, Timings};
 use crate::auto::auto_params;
+use crate::finish;
 use crate::judge::{
     Claude, CompareVerdict, JudgeImage, JudgeOptions, PhotoBrief, PlannedLook, RankVerdict,
 };
 use crate::objective::LookSpec;
 use crate::render::RenderEngine;
 use crate::search::{self, Candidate, SearchConfig};
-use crate::types::{Gpu, PARAM_SPECS, Params, Stats};
+use crate::types::{Gpu, PARAM_SPECS, Params, Scene, Stats};
 
 /// Images Claude ranks at once: the finalists and the neutral render.
 const MAX_SHOWN: usize = 7;
@@ -48,6 +49,9 @@ struct Bench {
     gpu: Gpu,
     engine: RenderEngine,
     photo: Arc<Photo>,
+    /// The photo's images with the run's lens corrections (every candidate
+    /// has the automatic ones).
+    scene: Arc<Scene>,
 }
 
 /// The neutral render and what follows from it, before the search.
@@ -98,15 +102,22 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
     ensure_live(cx)?;
     let info = loaded.photo.scene.info.clone();
     let orientation = info.orientation;
-    let neutral = Params::neutral(info.as_shot_temperature, info.as_shot_tint).quantized();
+    // As shot, with this photo's automatic Detail and Lens Corrections like
+    // every candidate, so before and after differ only in the edit.
+    let neutral = finish::with_auto(
+        &Params::neutral(info.as_shot_temperature, info.as_shot_tint),
+        &info,
+    )
+    .quantized();
 
     let measuring = Instant::now();
     let photo = loaded.photo.clone();
     let (mut bench, first) = blocking(cx, load.part(0.8, 1.0), move |r| {
         r.progress(0.0, "Measuring the neutral render");
-        let mut engine = RenderEngine::new(&gpu, &photo.scene)?;
-        let (stats, _) = search::evaluate(&mut engine, &photo.scene, &neutral)?;
-        let auto = auto_params(&stats, &photo.scene).quantized();
+        let scene = photo.scene_for(&gpu, &neutral)?;
+        let mut engine = RenderEngine::new(&gpu, &scene)?;
+        let (stats, _) = search::evaluate(&mut engine, &scene, &neutral)?;
+        let auto = auto_params(&stats, &scene).quantized();
         let before = display(&mut engine, &neutral, orientation)?;
         let planner = if plan {
             let auto_shown = display(&mut engine, &auto, orientation)?;
@@ -123,13 +134,19 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
             before: before.jpeg,
             planner,
         };
-        Ok((Bench { gpu, engine, photo }, first))
+        let bench = Bench {
+            gpu,
+            engine,
+            photo,
+            scene,
+        };
+        Ok((bench, first))
     })
     .await?;
     let mut search_ms = ms(measuring);
     let before = put_jpeg(cx, first.before).await?;
     let brief = PhotoBrief::new(&info, &first.stats);
-    let (lo, hi) = search::bounds(&bench.photo.scene);
+    let (lo, hi) = search::bounds(&bench.scene);
     cx.log(format!("Auto: {}", describe(&first.auto)));
 
     // Claude, when asked for and installed.
@@ -215,14 +232,14 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
     let search_cfg = cfg.clone();
     let (b, result) = blocking(cx, timeline.span(Stage::Search), move |r| {
         let mut bench = bench;
-        let Bench { engine, photo, .. } = &mut bench;
+        let Bench { engine, scene, .. } = &mut bench;
         let mut eval = Cancellable {
             engine,
             cancel: r.cancel(),
         };
         let mut report =
             |fraction: f32, message: &str| search_progress(r, &labels, fraction, message);
-        let result = search::run_with(&mut eval, &photo.scene, &looks, &search_cfg, &mut report)?;
+        let result = search::run_with(&mut eval, scene, &looks, &search_cfg, &mut report)?;
         Ok((bench, result))
     })
     .await?;
@@ -358,13 +375,12 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
                 let polish_cfg = cfg.clone();
                 let (b, (polished, jpeg, image)) = blocking(cx, span.part(0.3, 0.4), move |r| {
                     let mut bench = bench;
-                    let Bench { engine, photo, .. } = &mut bench;
+                    let Bench { engine, scene, .. } = &mut bench;
                     let mut eval = Cancellable {
                         engine,
                         cancel: r.cancel(),
                     };
-                    let polished =
-                        search::polish_with(&mut eval, &photo.scene, &target, &polish_cfg)?;
+                    let polished = search::polish_with(&mut eval, scene, &target, &polish_cfg)?;
                     let rendered = display(engine, &polished.params, orientation)?;
                     let image = JudgeImage::from_rgb("refined", &rendered.upright)?;
                     Ok((bench, (polished, rendered.jpeg, image)))
@@ -436,7 +452,9 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
         describe(&chosen.params),
         chosen.score.total
     ));
-    let Bench { gpu, engine, photo } = bench;
+    let Bench {
+        gpu, engine, photo, ..
+    } = bench;
     // The export needs the engine's GPU memory more than the engine does.
     blocking(cx, Span::NONE, move |_| {
         drop(engine);

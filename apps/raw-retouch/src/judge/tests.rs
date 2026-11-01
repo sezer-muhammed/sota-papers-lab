@@ -68,6 +68,89 @@ fn bounds() -> (Params, Params) {
     (lo, hi)
 }
 
+/// The Basic panel's values as (field, value) pairs.
+fn basic(values: [f64; Params::BASIC]) -> Vec<(usize, f64)> {
+    values.into_iter().enumerate().collect()
+}
+
+/// [`bounds`] with a box for part of every panel Claude may set, as the
+/// search gives one: the tone curve, presence, three Color Mixer bands
+/// (saturation and luminance, hues held) and two Calibration primaries.
+/// Detail and Lens Corrections are fixed at a photo's automatic values.
+fn bounds_open() -> (Params, Params) {
+    let (lo, hi) = bounds();
+    let fixed = fixed_open();
+    let lo = Params {
+        curve_highlights: -20.0,
+        curve_lights: -15.0,
+        curve_darks: -15.0,
+        curve_shadows: -10.0,
+        texture: -10.0,
+        clarity: -10.0,
+        dehaze: 0.0,
+        saturation_orange: -15.0,
+        saturation_green: -20.0,
+        saturation_blue: -20.0,
+        luminance_orange: -5.0,
+        luminance_green: -10.0,
+        luminance_blue: -30.0,
+        red_primary_saturation: -10.0,
+        blue_primary_saturation: -5.0,
+        ..fixed.with_basic(lo.basic())
+    };
+    let hi = Params {
+        curve_highlights: 20.0,
+        curve_lights: 15.0,
+        curve_darks: 15.0,
+        curve_shadows: 10.0,
+        texture: 15.0,
+        clarity: 25.0,
+        dehaze: 15.0,
+        saturation_orange: 5.0,
+        saturation_green: 5.0,
+        saturation_blue: 15.0,
+        luminance_orange: 15.0,
+        luminance_green: 5.0,
+        luminance_blue: 5.0,
+        red_primary_saturation: 10.0,
+        blue_primary_saturation: 20.0,
+        ..fixed.with_basic(hi.basic())
+    };
+    (lo, hi)
+}
+
+/// Lightroom's defaults with a photo's automatic Detail and Lens values.
+fn fixed_open() -> Params {
+    Params {
+        sharpening: 34.0,
+        luminance_nr: 24.0,
+        color_nr: 45.0,
+        lens_profile: 1.0,
+        lens_ca: 1.0,
+        ..Params::neutral(5200.0, 0.0)
+    }
+}
+
+/// What the search's auto would give inside [`bounds_open`].
+fn auto_open() -> Params {
+    Params {
+        temperature: 5600.0,
+        tint: 4.0,
+        exposure: 0.45,
+        contrast: 12.0,
+        highlights: -30.0,
+        shadows: 25.0,
+        whites: 8.0,
+        blacks: -6.0,
+        vibrance: 15.0,
+        texture: 4.0,
+        clarity: 5.0,
+        saturation_orange: -5.0,
+        luminance_orange: 8.0,
+        ..fixed_open()
+    }
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -180,18 +263,21 @@ fn ranges_round_inward_and_clamp() {
     // Swapped bounds are put right.
     assert_eq!((ranges.lo[9], ranges.hi[9]), (-40.0, 30.0));
 
-    let p = ranges.fit([
-        9000.0,
-        0.4,
-        0.351,
-        12.6,
-        -120.0,
-        f64::NAN,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-    ]);
+    let p = ranges.fit(
+        &lo,
+        &basic([
+            9000.0,
+            0.4,
+            0.351,
+            12.6,
+            -120.0,
+            f64::NAN,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ]),
+    );
     assert_eq!(p.temperature, 8000.0);
     assert_eq!(p.tint, 0.0);
     assert_eq!(p.exposure, 0.35);
@@ -241,7 +327,7 @@ fn refine_keeps_untouched_sliders_exactly() {
         ..Params::neutral(5200.0, 0.0)
     };
     let reply = [5600.0, 4.0, 0.46, 35.0, -10.0, 10.0, 20.0, 0.0, 45.0, 25.0];
-    let p = Ranges::new(&lo, &hi).adjust(&current, reply);
+    let p = Ranges::new(&lo, &hi).adjust(&current, &basic(reply));
     assert_eq!(
         p,
         Params {
@@ -348,37 +434,302 @@ fn rank_requests_show_only_pixels_under_neutral_labels() {
 
 #[test]
 fn plan_and_refine_prompts_are_filled() {
-    let (lo, hi) = bounds();
-    let ranges = Ranges::new(&lo, &hi);
-    let auto = Params::neutral(5600.0, 4.0);
-    for (template, extra) in [
-        (PLAN_PROMPT, ("auto", describe(&auto))),
-        (REFINE_PROMPT, ("params", describe(&auto))),
-    ] {
-        let text = fill(
-            template,
-            &[
-                ("camera", "SONY ILCE-7M3"),
-                ("shot", "1/250 s"),
-                ("stats", "{}"),
-                ("bounds", &ranges.describe()),
-                (extra.0, &extra.1),
-            ],
-        );
-        assert!(text.contains("{images}"));
-        for key in [
-            "camera", "shot", "auto", "params", "stats", "bounds", "n", "labels",
+    for (lo, hi) in [bounds(), bounds_open()] {
+        let ranges = Ranges::new(&lo, &hi);
+        let auto = Params {
+            luminance_blue: -12.0,
+            ..Params::neutral(5600.0, 4.0)
+        };
+        for (template, extra) in [
+            (PLAN_PROMPT, ("auto", ranges.describe_params(&auto))),
+            (REFINE_PROMPT, ("params", ranges.describe_params(&auto))),
         ] {
-            assert!(
-                !text.contains(&format!("{{{key}}}")),
-                "{{{key}}} unfilled:\n{text}"
+            let text = fill(
+                template,
+                &[
+                    ("sliders", &ranges.glossary()),
+                    ("camera", "SONY ILCE-7M3"),
+                    ("shot", "1/250 s"),
+                    ("stats", "{}"),
+                    ("bounds", &ranges.describe()),
+                    (extra.0, &extra.1),
+                ],
             );
+            assert!(text.contains("{images}"));
+            for key in [
+                "sliders", "camera", "shot", "auto", "params", "stats", "bounds", "n", "labels",
+            ] {
+                assert!(
+                    !text.contains(&format!("{{{key}}}")),
+                    "{{{key}}} unfilled:\n{text}"
+                );
+            }
+            assert!(text.contains("temperature 5600 K, tint +4, exposure 0.00 EV, contrast 0"));
+            assert!(text.contains("- temperature: 3800 K to 8000 K"));
+            assert!(text.contains("- exposure: -1.50 EV to +2.00 EV"));
+            assert!(text.contains("- highlights: -100 to +30"));
+            assert!(text.contains("- tint: -150 to +150. Positive adds magenta"));
+            // The other panels only where the box lets them move.
+            let open = lo != bounds().0;
+            for line in [
+                "- curve_lights: the upper midtones",
+                "- clarity: -100 to +100.",
+                "- luminance: how bright the band is.",
+                "- blue_primary_saturation: richer",
+                "- curve_highlights: -20 to +20",
+                "- blue band: saturation -20 to +15, luminance -30 to +5",
+                "- red_primary_saturation: -10 to +10",
+                "blue band luminance -12",
+            ] {
+                assert_eq!(text.contains(line), open, "{line:?} in:\n{text}");
+            }
+            // Never what the box holds still: band hues, shadow tint.
+            for line in ["- hue: shifts", "- shadow_tint:", "red_primary_hue"] {
+                assert!(!text.contains(line), "{line:?} in:\n{text}");
+            }
         }
-        assert!(text.contains("temperature 5600 K, tint +4, exposure 0.00 EV, contrast 0"));
-        assert!(text.contains("- temperature: 3800 K to 8000 K"));
-        assert!(text.contains("- exposure: -1.50 EV to +2.00 EV"));
-        assert!(text.contains("- highlights: -100 to +30"));
     }
+}
+
+#[test]
+fn sliders_glossary_names_real_settings() {
+    let sections = sections(SLIDERS);
+    let names: Vec<&str> = sections.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        names,
+        [
+            "basic",
+            "tone_curve",
+            "presence",
+            "color_mixer",
+            "calibration"
+        ]
+    );
+    for (name, lines) in &sections {
+        let group = group_of(name).unwrap();
+        for line in lines {
+            let Some((setting, _)) = line.strip_prefix("- ").and_then(|l| l.split_once(':')) else {
+                continue;
+            };
+            let known = if group == ParamGroup::ColorMixer {
+                MIXER_KINDS.contains(&setting)
+            } else {
+                field(setting).is_some_and(|i| PARAM_SPECS[i].group == group)
+            };
+            assert!(known, "[{name}] explains an unknown setting {setting:?}");
+        }
+    }
+    // Every Basic, Tone Curve, Presence and Calibration setting is explained.
+    let (lo, hi) = bounds_open();
+    let everything = Ranges::new(
+        &Params::from_array(PARAM_SPECS.map(|s| s.min)),
+        &Params::from_array(PARAM_SPECS.map(|s| s.max)),
+    );
+    let glossary = everything.glossary();
+    for spec in PARAM_SPECS
+        .iter()
+        .filter(|s| s.group != ParamGroup::ColorMixer && CLAUDE_GROUPS.contains(&s.group))
+    {
+        assert!(
+            glossary.contains(&format!("- {}:", spec.key)),
+            "{}",
+            spec.key
+        );
+    }
+    assert!(glossary.contains("- hue: shifts the band"));
+    assert!(Ranges::new(&lo, &hi).glossary().len() < glossary.len());
+}
+
+#[test]
+fn schemas_offer_what_the_box_lets_move() {
+    let (lo, hi) = bounds();
+    let basic_only = Ranges::new(&lo, &hi).settings_schema();
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    let mut names = Params::NAMES[..Params::BASIC].to_vec();
+    names.sort_unstable();
+    assert_eq!(keys(&basic_only["properties"]), names);
+
+    let (lo, hi) = bounds_open();
+    let settings = Ranges::new(&lo, &hi).settings_schema();
+    let props = &settings["properties"];
+    assert_eq!(
+        props["curve_highlights"],
+        json!({"type": "integer", "minimum": -20, "maximum": 20})
+    );
+    assert_eq!(
+        props["dehaze"],
+        json!({"type": "integer", "minimum": 0, "maximum": 15})
+    );
+    let mixer = &props["color_mixer"];
+    assert_eq!(mixer["type"], "array");
+    assert_eq!(mixer["maxItems"], 3);
+    let item = &mixer["items"];
+    assert_eq!(
+        item["properties"]["band"]["enum"],
+        json!(["orange", "green", "blue"])
+    );
+    // Every band's box put together; each band is clamped to its own.
+    assert_eq!(
+        item["properties"]["saturation"],
+        json!({"type": "integer", "minimum": -20, "maximum": 15})
+    );
+    assert_eq!(
+        item["properties"]["luminance"],
+        json!({"type": "integer", "minimum": -30, "maximum": 15})
+    );
+    assert!(item["properties"].get("hue").is_none(), "hues are held");
+    assert_eq!(item["required"], json!(["band", "saturation", "luminance"]));
+    let calibration = &props["calibration"]["items"]["properties"];
+    assert_eq!(
+        calibration["setting"]["enum"],
+        json!(["red_primary_saturation", "blue_primary_saturation"])
+    );
+    assert_eq!(
+        calibration["value"],
+        json!({"type": "integer", "minimum": -10, "maximum": 20})
+    );
+    let required: Vec<&str> = settings["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for name in [
+        "temperature",
+        "curve_shadows",
+        "texture",
+        "clarity",
+        "dehaze",
+        "color_mixer",
+        "calibration",
+    ] {
+        assert!(required.contains(&name), "{name}");
+    }
+    for name in ["sharpening", "lens_profile", "hue_blue", "shadow_tint"] {
+        assert!(props.get(name).is_none(), "{name} is not Claude's");
+    }
+}
+
+#[test]
+fn settings_set_every_offered_panel_and_keep_the_rest() {
+    let (lo, hi) = bounds_open();
+    let ranges = Ranges::new(&lo, &hi);
+    let auto = auto_open();
+    let settings = json!({
+        "temperature": 6100, "tint": 6, "exposure": 0.6, "contrast": 18,
+        "highlights": -45, "shadows": 30, "whites": 10, "blacks": -10,
+        "vibrance": 20, "saturation": 0,
+        "curve_highlights": -8, "curve_lights": 9.6, "curve_darks": -40, "curve_shadows": 0,
+        "texture": 4, "clarity": 12, "dehaze": 5,
+        "color_mixer": [
+            {"band": "Blue", "saturation": 30, "luminance": -18},
+            {"band": "red", "saturation": 10, "luminance": 10},
+            {"band": "green", "saturation": -8, "luminance": 0},
+        ],
+        "calibration": [
+            {"setting": "blue_primary_saturation", "value": 12},
+            {"setting": "shadow_tint", "value": 20},
+        ],
+    });
+    let values = ranges.values(&settings).unwrap();
+    let p = ranges.fit(&auto, &values);
+    assert_eq!(
+        p,
+        Params {
+            temperature: 6100.0,
+            tint: 6.0,
+            exposure: 0.6,
+            contrast: 18.0,
+            highlights: -45.0,
+            shadows: 30.0,
+            whites: 10.0,
+            blacks: -10.0,
+            vibrance: 20.0,
+            saturation: 0.0,
+            curve_highlights: -8.0,
+            curve_lights: 10.0,
+            curve_darks: -15.0,
+            curve_shadows: 0.0,
+            texture: 4.0,
+            clarity: 12.0,
+            dehaze: 5.0,
+            saturation_blue: 15.0,
+            luminance_blue: -18.0,
+            saturation_green: -8.0,
+            luminance_green: 0.0,
+            blue_primary_saturation: 12.0,
+            // Not listed: orange keeps auto's skin move. Not offered: red
+            // and shadow tint keep auto's (zero), Detail and Lens the box's.
+            ..auto
+        }
+    );
+    assert_eq!(p.quantized(), p);
+
+    // Basic sliders are required; the other panels' are not.
+    let mut partial = settings.clone();
+    partial.as_object_mut().unwrap().remove("clarity");
+    partial.as_object_mut().unwrap().remove("color_mixer");
+    assert_eq!(
+        ranges.fit(&auto, &ranges.values(&partial).unwrap()).clarity,
+        5.0
+    );
+    partial.as_object_mut().unwrap().remove("tint");
+    let err = ranges.values(&partial).unwrap_err().to_string();
+    assert!(err.contains("tint"), "{err}");
+    assert!(ranges.values(&json!([1, 2])).is_err());
+
+    // A box that holds the other panels still ignores them.
+    let (lo, hi) = bounds();
+    let basic_only = Ranges::new(&lo, &hi);
+    let values = basic_only.values(&settings).unwrap();
+    assert_eq!(values.len(), Params::BASIC);
+    assert_eq!(
+        basic_only.fit(&auto, &values).clarity,
+        0.0,
+        "held by the box"
+    );
+}
+
+#[test]
+fn refine_changes_only_what_claude_changes() {
+    let (lo, hi) = bounds_open();
+    let ranges = Ranges::new(&lo, &hi);
+    let current = Params {
+        curve_lights: 6.4,
+        clarity: 8.0,
+        luminance_blue: -10.0,
+        saturation_green: -12.0,
+        ..auto_open()
+    };
+    let mut settings =
+        json!({"color_mixer": [{"band": "blue", "saturation": 0, "luminance": -20}]});
+    let obj = settings.as_object_mut().unwrap();
+    for i in ranges.offered_by_value() {
+        let v = current.to_array()[i];
+        obj.insert(PARAM_SPECS[i].key.into(), json!(v.round()));
+    }
+    obj.insert("exposure".into(), json!(current.exposure));
+    let p = ranges.adjust(&current, &ranges.values(&settings).unwrap());
+    assert_eq!(
+        p,
+        Params {
+            luminance_blue: -20.0,
+            ..current
+        },
+        "the curve keeps 6.4 exactly, unlisted bands their values"
+    );
+    let text = ranges.describe_params(&current);
+    assert!(
+        text.contains("curve_lights +6, ")
+            && text.contains("blue band luminance -10")
+            && text.contains("green band saturation -12")
+            && text.contains("orange band saturation -5"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("sharpening") && !text.contains("lens"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -774,6 +1125,125 @@ mod fake_cli {
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
     }
 
+    /// Plan and refine through the CLI with every panel open: the schema
+    /// and prompt carry the curve, presence, Color Mixer and Calibration,
+    /// and the answers come back clamped, with auto (or the current edit)
+    /// wherever Claude says nothing.
+    #[tokio::test]
+    async fn plans_and_refines_every_offered_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let basic = json!({
+            "temperature": 6100, "tint": 6, "exposure": 0.6, "contrast": 18,
+            "highlights": -45, "shadows": 30, "whites": 10, "blacks": -10,
+            "vibrance": 20, "saturation": 0,
+            "curve_highlights": -8, "curve_lights": 6, "curve_darks": -6, "curve_shadows": 0,
+            "texture": 0, "clarity": 30, "dehaze": 5,
+        });
+        let with = |mixer: Value, calibration: Value| {
+            let mut s = basic.clone();
+            s["color_mixer"] = mixer;
+            s["calibration"] = calibration;
+            s
+        };
+        let plan = json!({
+            "analysis": "A hazy coast under a pale sky.",
+            "looks": [
+                {
+                    "name": "Deep sky",
+                    "rationale": "Darker blues and a little clarity.",
+                    "settings": with(
+                        json!([{"band": "blue", "saturation": 10, "luminance": -45}]),
+                        json!([{"setting": "blue_primary_saturation", "value": 8}]),
+                    ),
+                },
+                {
+                    "name": "Natural",
+                    "rationale": "As auto, warmer.",
+                    "settings": with(json!([]), json!([])),
+                },
+            ],
+        });
+        let refine = json!({
+            "assessment": "The foliage is a little loud.",
+            "change": "Green saturation -10.",
+            "settings": with(json!([{"band": "green", "saturation": -10, "luminance": 0}]), json!([])),
+        });
+        let behaviour = [
+            r#"if [ "$n" -eq 0 ]; then"#.to_owned(),
+            "cat <<'EOF'".to_owned(),
+            result_line(&plan, 0.2),
+            "EOF".to_owned(),
+            "else".to_owned(),
+            "cat <<'EOF'".to_owned(),
+            result_line(&refine, 0.1),
+            "EOF".to_owned(),
+            "fi".to_owned(),
+        ]
+        .join("\n");
+        let claude = Claude::with_bin(fake(dir.path(), &behaviour), options(None, 30));
+        let (lo, hi) = bounds_open();
+        let auto = auto_open();
+        let img = flat_image(80);
+        let verdict = claude
+            .plan(&brief(), &img, &img, &auto, &lo, &hi)
+            .await
+            .unwrap();
+        assert_eq!(verdict.scene, "A hazy coast under a pale sky.");
+        let [deep, natural] = &verdict.looks[..] else {
+            panic!("{:?}", verdict.looks)
+        };
+        assert_eq!(deep.name, "Deep sky");
+        let p = deep.params;
+        assert_eq!(
+            (p.curve_highlights, p.curve_lights, p.curve_darks, p.clarity),
+            (-8.0, 6.0, -6.0, 25.0),
+            "clarity clamped to its box"
+        );
+        assert_eq!((p.saturation_blue, p.luminance_blue), (10.0, -30.0));
+        assert_eq!(p.blue_primary_saturation, 8.0);
+        // Bands the look does not list keep auto's skin move; Detail and
+        // Lens Corrections are the box's.
+        assert_eq!((p.saturation_orange, p.luminance_orange), (-5.0, 8.0));
+        assert_eq!(
+            (p.sharpening, p.color_nr, p.lens_profile),
+            (34.0, 45.0, 1.0)
+        );
+        assert_eq!(natural.params.luminance_blue, auto.luminance_blue);
+        assert_eq!(natural.params.texture, 0.0, "a slider by value is Claude's");
+
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        let args: Vec<String> = read("args.0").lines().map(str::to_owned).collect();
+        let schema = args.iter().position(|a| a == "--json-schema").unwrap();
+        let schema: Value = serde_json::from_str(&args[schema + 1]).unwrap();
+        let settings = &schema["properties"]["looks"]["items"]["properties"]["settings"];
+        assert_eq!(settings, &Ranges::new(&lo, &hi).settings_schema());
+        let stdin = read("stdin.0");
+        for text in [
+            "curve_lights: the upper midtones",
+            "- blue band: saturation -20 to +15, luminance -30 to +5",
+            "texture +4, clarity +5",
+            "orange band luminance +8",
+        ] {
+            assert!(stdin.contains(text), "{text:?} not in the plan request");
+        }
+
+        let current = deep.params;
+        let refined = claude
+            .refine(&brief(), &img, &current, &lo, &hi)
+            .await
+            .unwrap();
+        assert_eq!(
+            refined.params,
+            Params {
+                saturation_green: -10.0,
+                ..current
+            }
+        );
+        let stdin = read("stdin.1");
+        assert!(stdin.contains("blue band luminance -30"), "{stdin}");
+        assert!(stdin.contains("What the settings do"), "{stdin}");
+    }
+
     /// A stand-in that answers `output` only once `calls` CLI processes are
     /// running at the same time (each marks its start with a file of its
     /// own), and fails after 5 s otherwise.
@@ -1148,20 +1618,9 @@ mod live {
     #[ignore = "calls the real claude CLI on the subscription; run natively on the GPU host"]
     async fn live_plan() {
         let live = Live::new();
-        let (lo, hi) = bounds();
-        let auto = Params {
-            temperature: 5600.0,
-            tint: 4.0,
-            exposure: 0.45,
-            contrast: 12.0,
-            highlights: -30.0,
-            shadows: 25.0,
-            whites: 8.0,
-            blacks: -6.0,
-            vibrance: 15.0,
-            saturation: 0.0,
-            ..Params::neutral(5200.0, 0.0)
-        };
+        // Every panel open, as the search's box has them.
+        let (lo, hi) = bounds_open();
+        let auto = auto_open();
         let (neutral, auto_image) = (judged(Look::Flat), judged(Look::Good));
         let (t, u) = (Instant::now(), live.claude.usage());
         let plan = live
@@ -1198,7 +1657,7 @@ mod live {
     #[ignore = "calls the real claude CLI on the subscription; run natively on the GPU host"]
     async fn live_refine() {
         let live = Live::new();
-        let (lo, hi) = bounds();
+        let (lo, hi) = bounds_open();
         let current = Params {
             temperature: 5600.0,
             tint: 4.0,
@@ -1210,7 +1669,7 @@ mod live {
             blacks: 0.0,
             vibrance: 45.0,
             saturation: 40.0,
-            ..Params::neutral(5200.0, 0.0)
+            ..auto_open()
         };
         let image = judged(Look::Oversaturated);
         let (t, u) = (Instant::now(), live.claude.usage());
@@ -1219,10 +1678,11 @@ mod live {
             .refine(&live.brief, &image, &current, &lo, &hi)
             .await
             .unwrap();
+        let ranges = Ranges::new(&lo, &hi);
         let verdict = format!(
             "from {}\nto   {}\n{}",
-            describe(&current),
-            describe(&refine.params),
+            ranges.describe_params(&current),
+            ranges.describe_params(&refine.params),
             refine.rationale
         );
         live.report("refine of the oversaturated render", t, &u, &verdict);

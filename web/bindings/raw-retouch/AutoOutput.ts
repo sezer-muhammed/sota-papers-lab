@@ -8,7 +8,7 @@ import type { Timings } from "./Timings";
 
 export type AutoOutput = { info: RawInfo, 
 /**
- * The chosen edit, in Lightroom units.
+ * The chosen edit, in Lightroom units: every develop setting.
  */
 params: Params, 
 /**
