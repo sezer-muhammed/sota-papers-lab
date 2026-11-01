@@ -27,7 +27,7 @@ use spl_core::{Context, Result, bail};
 
 use crate::cmaes::{self, SplitMix64};
 use crate::objective::{
-    LookSpec, Objective, PPR10K, SceneContext, Score, look_offset, offset_params,
+    LookSpec, Objective, PPR10K, SceneContext, Score, distance_sq, look_offset, offset_params,
 };
 use crate::render::RenderEngine;
 use crate::types::{Params, Scene, Stats};
@@ -306,6 +306,7 @@ pub fn run_with<E: Evaluator + ?Sized>(
         .clamp(&crate::auto::auto_params(&cx.neutral, scene))
         .quantized();
     let auto_at = book.measure(&[auto_params])?.start;
+    let auto_at = repair_auto(&mut book, &space, &natural, auto_at)?;
     let neutral = book.candidate(
         neutral_at,
         "neutral",
@@ -527,6 +528,53 @@ impl<'a, E: Evaluator + ?Sized> Book<'a, E> {
 
 fn derived_seed(seed: u64, stream: u64) -> u64 {
     SplitMix64(seed ^ stream.wrapping_mul(0xD1B5_4A32_D192_ED03)).next_u64()
+}
+
+/// Auto softened until it meets the hard constraints, for when the
+/// closed-form rules clip a sky or push a saturated subject out of gamut:
+/// one batch of gentler variants (less Whites, Saturation and Vibrance,
+/// shallower Blacks, more Highlights recovery, a little less exposure), of
+/// which the feasible one closest to auto wins. Auto stays as it is when it
+/// is already feasible or no variant is.
+fn repair_auto<E: Evaluator + ?Sized>(
+    book: &mut Book<E>,
+    space: &Space,
+    natural: &Objective,
+    at: usize,
+) -> Result<usize> {
+    let auto = book.entries[at].params;
+    if natural.total(&book.entries[at].stats, &auto).1 {
+        return Ok(at);
+    }
+    let soften = |v: f32, keep: f32| v.min(0.0) + v.max(0.0) * keep;
+    let mut variants = Vec::new();
+    for keep in [0.75f32, 0.5, 0.25, 0.0] {
+        for ev in [0.0f32, -0.15, -0.3] {
+            for recover in [0.0f32, 30.0] {
+                let p = Params {
+                    exposure: auto.exposure + ev,
+                    highlights: auto.highlights - recover,
+                    whites: soften(auto.whites, keep),
+                    blacks: -soften(-auto.blacks, 0.5 + 0.5 * keep),
+                    vibrance: soften(auto.vibrance, 0.5 + 0.5 * keep),
+                    saturation: soften(auto.saturation, keep),
+                    ..auto
+                };
+                variants.push(space.clamp(&p).quantized());
+            }
+        }
+    }
+    let range = book.measure(&variants)?;
+    let closest = range
+        .filter(|&i| {
+            let e = &book.entries[i];
+            natural.total(&e.stats, &e.params).1
+        })
+        .min_by(|&a, &b| {
+            let d = |i: usize| distance_sq(&book.entries[i].params, &auto);
+            d(a).total_cmp(&d(b))
+        });
+    Ok(closest.unwrap_or(at))
 }
 
 /// One look: seeds in one batch, then CMA-ES from the best archived point.
@@ -828,9 +876,10 @@ mod tests {
             r.auto.score.total
         );
         assert!(natural.score.total > r.neutral.score.total);
-        // It looks like a natural edit, not a stunt.
+        // It looks like a natural edit, not a stunt, and keeps part of the
+        // neutral's key.
         assert!(
-            (0.40..=0.52).contains(&natural.stats.luma_p50),
+            (0.36..=0.52).contains(&natural.stats.luma_p50),
             "{:?}",
             natural.stats
         );

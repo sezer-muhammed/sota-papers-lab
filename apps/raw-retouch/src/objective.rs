@@ -71,6 +71,8 @@ const COLORFUL_CEILING_RATIO: f32 = 1.45;
 /// Extra headroom in colourfulness units, for nearly grey scenes.
 const COLORFUL_CEILING_MARGIN: f32 = 4.0;
 const COLORFUL_SCALE: f32 = 0.1;
+/// A look's own colour band stays this far below the ceiling.
+const COLORFUL_CEILING_ABOVE_LOOK: f32 = 0.1;
 /// Mean luma below which saturation stops dividing by it.
 const SATURATION_LUMA_FLOOR: f32 = 0.05;
 
@@ -90,9 +92,12 @@ const W_OVEREDIT: f32 = 1.0;
 /// White balance away from the baseline's. Render stats barely see a
 /// white-balance shift that stays inside the cast tolerance, yet people
 /// do, so without this term it drifts at random.
-const W_WB_DRIFT: f32 = 0.25;
-const WB_DRIFT_MIRED: f32 = 30.0;
-const WB_DRIFT_TINT: f32 = 10.0;
+/// Strong enough that no look buys colourfulness or a target percentile by
+/// tinting a grey backdrop (vivid warmed a ColorChecker's grey card 12
+/// mired at 15): auto already corrects strong casts.
+const W_WB_DRIFT: f32 = 1.0;
+const WB_DRIFT_MIRED: f32 = 6.0;
+const WB_DRIFT_TINT: f32 = 3.0;
 /// Lifting a high-ISO photo's shadows lifts its noise.
 const W_NOISE: f32 = 0.2;
 const NOISE_ISO_FROM: f32 = 800.0;
@@ -123,10 +128,17 @@ const LOCAL_SCALE: f32 = 0.08;
 const STYLE_COST: f32 = 0.3;
 /// Raw-clipped share above which p99 is white whatever the sliders do.
 const RAW_CLIPPED_P99: f32 = 0.004;
-/// How much of a very dark or very bright scene's key the looks keep
-/// (0 = pull every photo to the look's midtone, 1 = keep the neutral's).
+/// How much of the neutral render's key the looks keep (0 = pull every
+/// photo to the look's midtone, 1 = keep the neutral's). The neutral is
+/// calibrated to the camera's JPEG, whose metering is usually right, so
+/// every photo keeps some of it...
+const KEY_KEEP: f32 = 0.35;
+/// ...and very dark or very bright scenes this much of the rest: night
+/// stays night, a white backdrop or snow stays bright instead of grey.
 const KEY_KEEP_DARK: f32 = 0.5;
-const KEY_KEEP_BRIGHT: f32 = 0.5;
+const KEY_KEEP_BRIGHT: f32 = 1.0;
+/// The black-point band runs from this share of its centre to this one.
+const P01_BAND: (f32, f32) = (0.8, 1.25);
 
 // Anchor looks (Claude's proposals).
 
@@ -314,7 +326,8 @@ fn brightness(neutral_p50: f32) -> f32 {
 /// partial exposure correction.
 pub(crate) fn adapted_p50(look_p50: f32, neutral_p50: f32) -> f32 {
     let neutral_p50 = neutral_p50.clamp(0.01, 0.99);
-    let keep = KEY_KEEP_DARK * darkness(neutral_p50) + KEY_KEEP_BRIGHT * brightness(neutral_p50);
+    let extreme = KEY_KEEP_DARK * darkness(neutral_p50) + KEY_KEEP_BRIGHT * brightness(neutral_p50);
+    let keep = KEY_KEEP + (1.0 - KEY_KEEP) * extreme.min(1.0);
     let target =
         srgb_to_linear(look_p50).ln() * (1.0 - keep) + srgb_to_linear(neutral_p50).ln() * keep;
     linear_to_srgb(target.exp())
@@ -328,7 +341,7 @@ pub(crate) fn noise_factor(iso: Option<u32>) -> f32 {
 }
 
 /// Squared distance between two parameter sets in [`SLIDER_SCALE`] units.
-fn distance_sq(a: &Params, b: &Params) -> f32 {
+pub(crate) fn distance_sq(a: &Params, b: &Params) -> f32 {
     let (a, b) = (a.to_array(), b.to_array());
     let mired = |k: f32| 1.0e6 / k.max(1.0);
     let dt = (mired(a[0]) - mired(b[0])) / SLIDER_SCALE[0];
@@ -346,7 +359,7 @@ pub(crate) fn look_offset(look: &LookSpec) -> [f32; Params::COUNT] {
         return [0.0; Params::COUNT];
     }
     match look.id.as_str() {
-        "vivid" => [0.0, 0.0, 0.0, 15.0, -5.0, 0.0, 0.0, -8.0, 20.0, 6.0],
+        "vivid" => [0.0, 0.0, 0.0, 18.0, -5.0, 0.0, 0.0, -10.0, 25.0, 8.0],
         "bright" => [0.0, 0.0, 0.45, -12.0, -15.0, 25.0, 5.0, 15.0, -5.0, -3.0],
         "moody" => [
             0.0, 0.0, -0.45, 12.0, -25.0, -5.0, -10.0, -20.0, -8.0, -12.0,
@@ -398,6 +411,14 @@ struct Targets {
     p50: f32,
     p50_half: f32,
     p99: Band,
+    /// The white end is pulled up at most this far above the neutral's p99:
+    /// a sky or a grey backdrop that tops the histogram stays about where
+    /// the camera puts it instead of being stretched to white.
+    p99_stretch: f32,
+    /// Black point as a share of the neutral's p01 (camera JPEGs land near
+    /// half of it: their toe is deeper), kept inside `p01`; the band is
+    /// [`P01_BAND`] around it. A hazy scene keeps some of its haze.
+    p01_ratio: f32,
     p01: Band,
     /// Lower limit for p05 (lifted shadows); 0 = none.
     p05_min: f32,
@@ -405,6 +426,10 @@ struct Targets {
     spread: Band,
     /// Saturation relative to the neutral render.
     color: Band,
+    /// Extra share of pixels that may start outside sRGB: the renderer's
+    /// chroma roll-off maps them inside smoothly, and a vivid edit of
+    /// foliage or a red subject needs some.
+    gamut_extra: f32,
     /// Local contrast relative to the neutral render; 0 = none.
     local_min: f32,
     style_cost: f32,
@@ -414,22 +439,31 @@ const NATURAL: Targets = Targets {
     p50: 0.46,
     p50_half: 0.04,
     p99: Band::new(0.94, 0.98),
-    p01: Band::new(0.02, 0.04),
+    p99_stretch: 0.06,
+    p01_ratio: 0.55,
+    p01: Band::new(0.025, 0.14),
     p05_min: 0.0,
     spread: Band::new(0.17, 0.26),
-    color: Band::new(1.0, 1.12),
+    color: Band::new(1.0, 1.15),
+    gamut_extra: 0.0,
     local_min: 0.0,
     style_cost: 0.0,
 };
 
-/// Natural's colourfulness plus 15 to 25 %, more contrast, deeper blacks.
+/// Natural's midtone with more colour, more contrast, deeper blacks.
 const VIVID: Targets = Targets {
-    p50: 0.44,
+    p50: 0.46,
+    // Narrower than natural's: the gamut limit otherwise buys colour by
+    // darkening (vivid sat 0.05 below natural on sunny shots).
+    p50_half: 0.025,
     p99: Band::new(0.95, 0.985),
-    p01: Band::new(0.012, 0.03),
+    p99_stretch: 0.08,
+    p01_ratio: 0.42,
+    p01: Band::new(0.015, 0.075),
     spread: Band::new(0.21, 0.30),
-    color: Band::new(1.28, 1.45),
-    local_min: 1.08,
+    color: Band::new(1.35, 1.55),
+    gamut_extra: 0.03,
+    local_min: 1.10,
     style_cost: STYLE_COST,
     ..NATURAL
 };
@@ -438,7 +472,9 @@ const BRIGHT: Targets = Targets {
     p50: 0.55,
     p50_half: 0.03,
     p99: Band::new(0.95, 0.985),
-    p01: Band::new(0.04, 0.08),
+    p99_stretch: 0.10,
+    p01_ratio: 0.8,
+    p01: Band::new(0.04, 0.13),
     p05_min: 0.14,
     spread: Band::new(0.13, 0.22),
     color: Band::new(0.95, 1.12),
@@ -450,9 +486,11 @@ const BRIGHT: Targets = Targets {
 const MOODY: Targets = Targets {
     p50: 0.36,
     p99: Band::new(0.86, 0.95),
-    p01: Band::new(0.008, 0.025),
+    p99_stretch: 0.03,
+    p01_ratio: 0.35,
+    p01: Band::new(0.01, 0.06),
     spread: Band::new(0.18, 0.28),
-    color: Band::new(0.82, 0.98),
+    color: Band::new(0.85, 1.0),
     style_cost: STYLE_COST,
     ..NATURAL
 };
@@ -479,6 +517,10 @@ pub(crate) struct Objective {
     mode: Mode,
     /// Where over-editing is measured from: auto plus the look's offset.
     baseline: Params,
+    /// The look's typical edit, taken off before the expert prior: the
+    /// experts retouched for a natural look, and a vivid edit is not an
+    /// unusual natural one.
+    prior_offset: [f32; Params::COUNT],
     reference: Reference,
     clip_hi_limit: f32,
     clip_lo_limit: f32,
@@ -526,11 +568,17 @@ impl Objective {
                     _ => NATURAL,
                 };
                 let mut t = base;
-                t.p50 = adapted_p50(base.p50, p50);
+                // Natural's midtone for this photo, and the other looks a
+                // fixed step brighter or darker from it, so bright stays
+                // brighter than natural even where natural keeps the key.
+                t.p50 = (adapted_p50(NATURAL.p50, p50) + base.p50 - NATURAL.p50).clamp(0.05, 0.9);
+                let n01 = finite_or(n.luma_p01, 0.03).clamp(0.0, 1.0);
+                let n99 = finite_or(n.luma_p99, 0.95).clamp(0.0, 1.0);
                 // Night scenes may keep true blacks and dim highlights.
-                t.p01.lo *= 1.0 - dark;
+                let p01 = (base.p01_ratio * n01).clamp(base.p01.lo * (1.0 - dark), base.p01.hi);
+                t.p01 = Band::new(P01_BAND.0 * p01, P01_BAND.1 * p01);
                 t.p05_min *= 1.0 - dark;
-                t.p99.lo -= 0.15 * dark;
+                t.p99.lo = t.p99.lo.min(n99 + base.p99_stretch) - 0.15 * dark;
                 if raw_clipped > RAW_CLIPPED_P99 {
                     t.p99.hi = 1.0;
                 }
@@ -542,19 +590,32 @@ impl Objective {
             Mode::Look(_) => offset_params(&auto, &look_offset(look), 1.0),
         };
 
+        let prior_offset = match mode {
+            Mode::Anchor(_) => [0.0; Params::COUNT],
+            Mode::Look(_) => look_offset(look),
+        };
+        // A look that asks for more colour gets room above its own band.
+        let (gamut_extra, color_hi) = match mode {
+            Mode::Look(t) => (t.gamut_extra, t.color.hi),
+            Mode::Anchor(_) => (0.0, 0.0),
+        };
+
         Self {
             mode,
             baseline,
+            prior_offset,
             reference,
             clip_hi_limit: (CLIP_HI_LIMIT + CLIP_HI_RAW_ALLOWANCE * raw_clipped)
                 .min(CLIP_HI_LIMIT_MAX),
             clip_lo_limit: (CLIP_LO_LIMIT + CLIP_LO_DARK_EXTRA * dark)
                 .max(finite_or(n.clip_lo, 0.0).clamp(0.0, 1.0) + CLIP_LO_NEUTRAL_MARGIN),
             gamut_limit: GAMUT_LIMIT
-                .max(finite_or(n.out_of_gamut, 0.0).clamp(0.0, 1.0) + GAMUT_NEUTRAL_MARGIN),
+                .max(finite_or(n.out_of_gamut, 0.0).clamp(0.0, 1.0) + GAMUT_NEUTRAL_MARGIN)
+                + gamut_extra,
             chroma_ceiling: CHROMA_P95_CEILING
                 .max(finite_or(n.chroma_p95, 0.0) + CHROMA_NEUTRAL_MARGIN),
-            saturation_ceiling: COLORFUL_CEILING_RATIO + COLORFUL_CEILING_MARGIN / colorfulness,
+            saturation_ceiling: COLORFUL_CEILING_RATIO.max(color_hi + COLORFUL_CEILING_ABOVE_LOOK)
+                + COLORFUL_CEILING_MARGIN / colorfulness,
             cast_a: cast(n.cast_a.abs(), CAST_TOL_A),
             cast_warm: cast(n.cast_b, CAST_TOL_WARM),
             cast_cool: cast(-n.cast_b, CAST_TOL_COOL),
@@ -625,7 +686,11 @@ impl Objective {
         match self.mode {
             Mode::Anchor(anchor) => add("anchor.distance", -W_ANCHOR * distance_sq(p, &anchor)),
             Mode::Look(t) => {
-                let prior = expert_prior(p, self.as_shot_temperature, self.as_shot_tint);
+                let prior = expert_prior(
+                    &offset_params(p, &self.prior_offset, -1.0),
+                    self.as_shot_temperature,
+                    self.as_shot_tint,
+                );
                 add("prior.experts", -W_PRIOR * prior);
                 let overedit = distance_sq(p, &self.baseline);
                 add("prior.overedit", -W_OVEREDIT * overedit);
@@ -1002,12 +1067,15 @@ mod tests {
 
     #[test]
     fn dark_scenes_keep_part_of_their_key() {
+        // An ordinary exposure moves most of the way to the look's midtone...
         let normal = adapted_p50(0.46, 0.40);
+        assert!(normal > 0.43 && normal < 0.46, "{normal}");
+        assert!((adapted_p50(0.46, 0.46) - 0.46).abs() < 1e-3);
+        // ...night stays darker, and snow or a white backdrop stays bright.
         let night = adapted_p50(0.46, 0.08);
         let snow = adapted_p50(0.46, 0.72);
-        assert!((normal - 0.46).abs() < 1e-3, "{normal}");
         assert!(night > 0.15 && night < 0.30, "{night}");
-        assert!(snow > 0.50 && snow < 0.62, "{snow}");
+        assert!(snow > 0.66 && snow < 0.72, "{snow}");
     }
 
     #[test]
@@ -1183,9 +1251,11 @@ mod tests {
             s.luma_p01 = p01;
             term(&score(&s, &p, &look("natural"), &cx()), "look.p01")
         };
-        assert_eq!(at(0.03), 0.0);
-        assert!((at(0.04 + P01_SCALE) + W_P01).abs() < 1e-4);
-        let (far, farther) = (at(0.04 + 5.0 * P01_SCALE), at(0.04 + 10.0 * P01_SCALE));
+        // The band's top for this neutral (p01 0.03).
+        let hi = P01_BAND.1 * (NATURAL.p01_ratio * 0.03).max(NATURAL.p01.lo);
+        assert_eq!(at(0.025), 0.0);
+        assert!((at(hi + P01_SCALE) + W_P01).abs() < 1e-4);
+        let (far, farther) = (at(hi + 5.0 * P01_SCALE), at(hi + 10.0 * P01_SCALE));
         assert!((far - 5.0 * farther / 10.0).abs() < 0.5, "{far} {farther}");
         assert!((farther - far + 10.0 * W_P01).abs() < 1e-3);
     }

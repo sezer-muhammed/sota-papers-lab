@@ -42,6 +42,11 @@ const SHADOWS_RANGE: f32 = 45.0;
 /// Shadow lift kept on a high-ISO file (noise lifts with it).
 const SHADOWS_NOISY: f32 = 0.5;
 const WHITE_POINT: f32 = 0.97;
+/// Whites lift the white end at most this far above where exposure puts
+/// it (beyond what Highlights takes off): a
+/// blue sky or a grey backdrop that tops the histogram clips a channel
+/// long before its luma reaches white.
+const WHITES_STRETCH: f32 = 0.06;
 const WHITES_GAIN: f32 = 250.0;
 const BLACK_POINT: f32 = 0.03;
 /// Night scenes may keep true blacks.
@@ -118,7 +123,8 @@ pub fn auto_from_stats(
     let shadows = (SHADOWS_MIN + SHADOWS_RANGE * lift) * (1.0 - (1.0 - SHADOWS_NOISY) * noise);
 
     let p99h = p99e + HIGHLIGHTS_EFFECT * highlights;
-    let mut whites = (WHITES_GAIN * (WHITE_POINT - p99h)).clamp(-30.0, 40.0);
+    let white_point = WHITE_POINT.min(p99e + WHITES_STRETCH);
+    let mut whites = (WHITES_GAIN * (white_point - p99h)).clamp(-30.0, 40.0);
     if raw_share >= RAW_CLIPPED_TOP {
         whites = whites.max(0.0);
     }
@@ -209,11 +215,16 @@ mod tests {
         assert!(normal.exposure.abs() < 0.15, "{normal:?}");
         let dark = auto(&stats(0.01, 0.03, 0.22, 0.6, 0.75));
         assert!(dark.exposure > 0.8 && dark.exposure < 2.0, "{dark:?}");
+        // A high-key scene keeps its key (the camera meters it bright on
+        // purpose); highlights recovery handles the top.
         let bright = auto(&stats(0.2, 0.35, 0.72, 0.97, 0.995));
         assert!(
-            bright.exposure < -0.3 && bright.exposure > -1.5,
+            bright.exposure < 0.05 && bright.exposure > -0.3,
             "{bright:?}"
         );
+        assert!(bright.highlights < -50.0, "{bright:?}");
+        let overexposed = auto(&stats(0.15, 0.3, 0.62, 0.95, 0.99));
+        assert!(overexposed.exposure < -0.2, "{overexposed:?}");
         // A night scene is lifted, but not to a daylight midtone.
         let night = auto(&stats(0.0, 0.01, 0.07, 0.4, 0.9));
         assert!(night.exposure > 1.0 && night.exposure < 3.0, "{night:?}");
