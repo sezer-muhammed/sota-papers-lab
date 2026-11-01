@@ -1,4 +1,5 @@
 import type { AutoInput } from "@spl/bindings/raw-retouch/AutoInput";
+import type { ExportOptions } from "@spl/bindings/raw-retouch/ExportOptions";
 
 /** The Retouch page's settings, saved per browser. They shape the next
     raw_retouch.auto runs; a run that has started keeps its own. */
@@ -15,6 +16,9 @@ export type RetouchOptions = {
   jpeg: boolean;
   xmp: boolean;
   tiff16: boolean;
+  png: boolean;
+  /** Bits per channel of the PNG. */
+  pngBits: 8 | 16;
   jpegQuality: number;
   evalsPerLook: number;
   parallel: number;
@@ -29,16 +33,26 @@ export const DEFAULT_OPTIONS: RetouchOptions = {
   jpeg: true,
   xmp: true,
   tiff16: false,
+  png: true,
+  pngBits: 8,
   jpegQuality: 95,
   evalsPerLook: 1500,
   parallel: 2,
 };
 
+/** spl's default SPL_MAX_CONCURRENT_RUNS (the host does not report its own).
+    Retouches leave one of these slots free, so previews, zoom tiles and
+    exports never wait behind a retouch. */
+export const HOST_SLOTS = 3;
+
 export const LIMITS = {
   jpegQuality: { min: 50, max: 100, step: 1 },
   evalsPerLook: { min: 100, max: 20000, step: 100 },
-  parallel: { min: 1, max: 4 },
+  parallel: { min: 1, max: HOST_SLOTS - 1 },
 } as const;
+
+/** The longest edit instruction the host takes. */
+export const INSTRUCTION_MAX = 500;
 
 const OPTIONS_KEY = "spl-retouch-options";
 
@@ -60,6 +74,8 @@ export function normalizeOptions(value: unknown): RetouchOptions {
     jpeg: bool(v.jpeg, d.jpeg),
     xmp: bool(v.xmp, d.xmp),
     tiff16: bool(v.tiff16, d.tiff16),
+    png: bool(v.png, d.png),
+    pngBits: v.pngBits === 16 ? 16 : v.pngBits === 8 ? 8 : d.pngBits,
     jpegQuality: clampInt(v.jpegQuality, LIMITS.jpegQuality.min, LIMITS.jpegQuality.max, d.jpegQuality),
     evalsPerLook: clampInt(v.evalsPerLook, LIMITS.evalsPerLook.min, LIMITS.evalsPerLook.max, d.evalsPerLook),
     parallel: clampInt(v.parallel, LIMITS.parallel.min, LIMITS.parallel.max, d.parallel),
@@ -85,8 +101,33 @@ export function saveOptions(storage: OptionsStorage | undefined, options: Retouc
   }
 }
 
+/** An instruction as sent: trimmed, at most 500 characters, undefined when empty. */
+export function cleanInstruction(value: string | null | undefined): string | undefined {
+  const trimmed = (value ?? "").trim().slice(0, INSTRUCTION_MAX).trim();
+  return trimmed || undefined;
+}
+
+/** What a photo's retouch follows: its own box, else the default box. */
+export function resolveInstruction(own: string | undefined, fallback: string | undefined): string | undefined {
+  return cleanInstruction(own) ?? cleanInstruction(fallback);
+}
+
+/** The export files these options ask for. A manual full-size export always
+    takes the JPEG (`jpeg`), whatever the auto options say. */
+export function exportOptions(options: RetouchOptions, jpeg = options.jpeg): ExportOptions {
+  return {
+    jpeg,
+    jpeg_quality: options.jpegQuality,
+    tiff16: options.tiff16,
+    xmp: options.xmp,
+    png: options.png,
+    png_bits: options.pngBits,
+  };
+}
+
 /** The raw_retouch.auto input for one photo under these options. */
-export function autoInput(options: RetouchOptions, raw: string, filename: string): AutoInput {
+export function autoInput(options: RetouchOptions, raw: string, filename: string, instruction?: string): AutoInput {
+  const asked = cleanInstruction(instruction);
   return {
     raw,
     filename,
@@ -96,11 +137,7 @@ export function autoInput(options: RetouchOptions, raw: string, filename: string
     plan: options.useClaude && options.plan,
     refine: options.useClaude && options.refine,
     evals_per_look: options.evalsPerLook,
-    export: {
-      jpeg: options.jpeg,
-      jpeg_quality: options.jpegQuality,
-      tiff16: options.tiff16,
-      xmp: options.xmp,
-    },
+    export: exportOptions(options),
+    ...(asked ? { instruction: asked } : {}),
   };
 }

@@ -56,6 +56,15 @@ export function useArtifactSrc(id: string | undefined): { src?: string; failed: 
   return { src: loaded.src, failed: loaded.src === undefined };
 }
 
+/** An artifact decoded as an image, for drawing on a canvas. */
+export async function loadArtifactImage(id: string): Promise<HTMLImageElement> {
+  const image = new Image();
+  image.decoding = "async";
+  image.src = hasToken() ? await blobUrl(id) : client.artifactUrl(id);
+  await image.decode();
+  return image;
+}
+
 /** Saves an artifact as `filename`. The host sends it as an attachment under
     that name; the anchor's download attribute covers a host that does not. */
 export async function downloadArtifact(id: string, filename: string): Promise<void> {

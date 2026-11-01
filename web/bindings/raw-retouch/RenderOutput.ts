@@ -11,7 +11,7 @@ params: Params,
 /**
  * Display-size JPEG, upright.
  */
-preview: ArtifactRef, jpeg: ArtifactRef | null, tiff: ArtifactRef | null, xmp: ArtifactRef | null, stem: string, 
+preview: ArtifactRef, jpeg: ArtifactRef | null, tiff: ArtifactRef | null, png: ArtifactRef | null, xmp: ArtifactRef | null, stem: string, 
 /**
  * Upright size of `jpeg` (or of `preview` when there is no jpeg).
  */

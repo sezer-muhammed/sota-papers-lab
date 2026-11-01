@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowLeft, ChevronLeft, ChevronRight, CircleStop, FileDown, Undo2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { ArrowLeft, ChevronLeft, ChevronRight, CircleStop, FileDown, MapPin, Undo2 } from "lucide-react";
 import type { AutoOutput } from "@spl/bindings/raw-retouch/AutoOutput";
 import type { CandidateSummary } from "@spl/bindings/raw-retouch/CandidateSummary";
+import type { Params } from "@spl/bindings/raw-retouch/Params";
+import type { Region } from "@spl/bindings/raw-retouch/Region";
 import {
   ActionBar,
   Badge,
@@ -26,10 +28,12 @@ import {
   formatMs,
   formatPercent,
   formatScore,
+  placeLine,
   sameParams,
   uprightSize,
 } from "./format";
 import { ArtifactImage } from "./images";
+import { INSTRUCTION_EXAMPLES, InstructionField, UsedInstruction } from "./instruction";
 import {
   filesOf,
   isActive,
@@ -38,10 +42,12 @@ import {
   photoPhase,
   rankedCandidates,
   thumbnailId,
+  usedInstruction,
   type AutoResult,
   type ExportState,
   type Photo,
 } from "./model";
+import { cleanInstruction } from "./options";
 import { AdjustSliders, ParamsTable } from "./params";
 import { ScopesPanel, useTwoColumns } from "./scopes/scopes-panel";
 import type { RetouchSession } from "./session";
@@ -49,16 +55,20 @@ import { PhaseSignal, PhotoActions, PhotoProgress, phaseColor } from "./status";
 
 const photoHref = (key: string) => `#/retouch/${encodeURIComponent(key)}`;
 
-/* One photo, large: before/after, the candidates, Claude's reasoning, the
-   Basic panel (the chosen values, or sliders to adjust them), the scopes of
-   what is compared, downloads and timings. Keyed by photo, so view state
-   starts fresh for each one. */
+/* One photo, large: before (left) and after (right) with zoom down to single
+   pixels, the candidates, the scopes of what is compared, the edit wanted,
+   the Develop panels (the chosen values, or sliders to adjust them),
+   downloads and timings, and Claude's notes folded away at the foot. Keyed
+   by photo, so view state starts fresh for each one. */
 export function PhotoDetail({
+  defaultInstruction,
   photo,
   photos,
   position,
   session,
 }: {
+  /** The default box from the photos page. */
+  defaultInstruction: string;
   photo: Photo;
   photos: Photo[];
   position?: number;
@@ -90,27 +100,41 @@ export function PhotoDetail({
   const next = index >= 0 ? photos[index + 1] : undefined;
   usePhotoKeys(prev?.key, next?.key);
 
-  const before: CompareSide = { id: neutralId(photo), label: "As shot" };
+  const neutral = photo.inspect.status === "done" ? photo.inspect.output.neutral : undefined;
+  const before: CompareSide = { id: neutralId(photo), label: "As shot", params: neutral };
   let after: CompareSide | undefined;
   let note: string | undefined;
   if (mode === "manual" && manual) {
-    after = { id: manual.preview?.id, label: "Manual" };
+    after = { id: manual.preview?.id, label: "Manual", params: manual.params };
     const stale = !manual.preview || !sameParams(manual.preview.params, manual.params);
     note = manual.error ? "Preview failed" : stale ? "Rendering…" : undefined;
   } else if (result) {
     after = candidate
-      ? { id: candidate.preview.id, label: candidate.label }
-      : { id: result.after.id, label: chosenLabel(result) };
+      ? { id: candidate.preview.id, label: candidate.label, params: candidate.params }
+      : { id: result.after.id, label: chosenLabel(result), params: result.params };
   }
+  const renderTile = useCallback(
+    (params: Params, region: Region, signal: AbortSignal) => session.renderRegion(key, params, region, signal),
+    [session, key],
+  );
 
   const twoColumns = useTwoColumns();
-  const scopes = before.id || after?.id ? <ScopesPanel before={before} after={after} info={info} /> : null;
+  const scopes =
+    before.id || after?.id ? (
+      <ScopesPanel before={before} after={after} info={info} initial={mode === "manual" && twoColumns ? "overlay" : "side"} />
+    ) : null;
+  // Adjusting: the scopes stay in view with the photo (wide screens) or
+  // follow the sliders (narrow). Otherwise they take the wide spot under the
+  // photo and its candidates.
+  const scopesWithPhoto = mode === "manual" && twoColumns;
+  const scopesAfterDevelop = mode === "manual" && !twoColumns;
+  const scopesWide = mode !== "manual";
 
   const captured = info ? formatCaptured(info.captured_at) : undefined;
+  const place = info ? placeLine(info) : undefined;
   const facts = [
     info ? exposureLine(info) : undefined,
     size ? `${size.width} × ${size.height}` : undefined,
-    captured,
     formatBytes(photo.size),
   ].filter(Boolean);
 
@@ -131,7 +155,16 @@ export function PhotoDetail({
 
       <header className="space-y-1">
         <p className={text.eyebrowSm}>Photo</p>
-        <h1 className={cn(text.bandTitle, "break-all font-mono text-[var(--ds-gray-1000)]")}>{photo.filename}</h1>
+        <h1 className={cn(text.bandTitle, "break-words text-[var(--ds-gray-1000)]")} title={photo.filename}>
+          {captured ?? photo.filename}
+          {captured ? <span className="sr-only">, {photo.filename}</span> : null}
+        </h1>
+        {place ? (
+          <p className={cn(text.small, "flex items-center gap-1.5")}>
+            <MapPin aria-hidden="true" className="h-4 w-4 shrink-0 text-[var(--ds-gray-700)]" />
+            {place}
+          </p>
+        ) : null}
         {info ? <p className={text.small}>{cameraLine(info)}</p> : null}
         <p className={text.meta}>{facts.join(" · ")}</p>
       </header>
@@ -168,23 +201,33 @@ export function PhotoDetail({
             className={cn(
               "space-y-5",
               mode === "manual" &&
-                "xl:sticky xl:top-20 xl:z-10 xl:[--compare-max-h:max(16rem,min(72vh,100vh_-_440px))]",
+                "xl:sticky xl:top-20 xl:z-10 xl:[--compare-max-h:max(16rem,min(72vh,100vh_-_500px))]",
             )}
           >
             {before.id || after?.id ? (
-              <CompareView key={`${key}-${mode}`} before={before} after={after} ratio={ratio} note={note} />
+              <CompareView
+                key={`${key}-${mode}`}
+                before={before}
+                after={after}
+                ratio={ratio}
+                note={note}
+                full={size}
+                renderTile={photo.artifactId ? renderTile : undefined}
+                tileSource={photo.artifactId}
+              />
             ) : (
               <NoImage photo={photo} ratio={ratio} />
             )}
-            {scopes && twoColumns ? scopes : null}
+            {scopes && scopesWithPhoto ? scopes : null}
           </div>
           {result && mode === "auto" ? (
             <CandidateStrip output={result} selected={candidateId} onSelect={setCandidateId} />
           ) : null}
-          {photo.result && mode === "auto" ? <ClaudePanel result={photo.result} /> : null}
+          {scopes && scopesWide ? scopes : null}
         </div>
 
         <div className="space-y-5">
+          <InstructionPanel photo={photo} session={session} defaultInstruction={defaultInstruction} />
           <BasicPanel
             photo={photo}
             mode={mode}
@@ -193,12 +236,59 @@ export function PhotoDetail({
             candidate={candidate}
             session={session}
           />
-          {scopes && !twoColumns ? scopes : null}
+          {scopes && scopesAfterDevelop ? scopes : null}
           <DownloadsPanel photo={photo} />
           {photo.result ? <TimingsPanel result={photo.result} /> : null}
         </div>
       </div>
+
+      {photo.result ? <ClaudeNotes result={photo.result} /> : null}
     </div>
+  );
+}
+
+/* The edit wanted for this photo (its own box; empty uses the default box),
+   and what the shown result followed. */
+function InstructionPanel({
+  defaultInstruction,
+  photo,
+  session,
+}: {
+  defaultInstruction: string;
+  photo: Photo;
+  session: RetouchSession;
+}) {
+  const fallback = cleanInstruction(defaultInstruction);
+  const used = usedInstruction(photo.result);
+  return (
+    <Surface tone="flat" className="overflow-hidden">
+      <PanelHeader title="Edit wanted" />
+      <div className="space-y-3 p-4">
+        <InstructionField
+          label="Edit wanted for this photo (optional)"
+          labelHidden
+          rows={3}
+          value={photo.instruction ?? ""}
+          onChange={(value) => session.setInstruction(photo.key, value)}
+          placeholder={fallback ? `Default: ${fallback}` : INSTRUCTION_EXAMPLES.photo}
+          hint={
+            fallback
+              ? "Empty uses the default box on the photos page. Re-run to apply."
+              : "Empty lets the retouch choose. Re-run to apply."
+          }
+        />
+        {photo.result ? (
+          used ? (
+            <div className="space-y-1">
+              <p className={text.eyebrowSm}>This result followed</p>
+              <UsedInstruction instruction={used} />
+            </div>
+          ) : (
+            <p className={text.meta}>This result had no instruction.</p>
+          )
+        ) : null}
+      </div>
+    </Surface>
   );
 }
 
@@ -413,29 +503,25 @@ function PanelHeader({ action, title }: { action?: ReactNode; title: string }) {
   );
 }
 
-/* Claude's part: its read of the scene, why the winner won, how stable that
-   ranking was when the order was swapped, and the refinement's A/B. */
-function ClaudePanel({ result }: { result: AutoResult }) {
+/* Claude's notes, closed by default at the foot of the page: its read of
+   the scene, why the winner won, how stable that ranking was when the order
+   was swapped, and the refinement's A/B. */
+function ClaudeNotes({ result }: { result: AutoResult }) {
   const judge = result.output.judge;
-  if (!judge) {
-    return (
-      <Card tone="muted" depth="flat">
-        <p className={text.small}>Claude was off for this run, so the objective score picked the edit.</p>
-      </Card>
-    );
-  }
   const refineAsked = result.input?.refine !== false;
-  const refinement = judge.refined ? "Won the blind A/B" : refineAsked ? "Not kept" : "Off";
+  const refinement = judge?.refined ? "Won the blind A/B" : refineAsked ? "Not kept" : "Off";
 
   return (
-    <Surface tone="flat" aria-labelledby="claude-title" className="overflow-hidden">
-      <div className="flex flex-wrap items-center justify-between gap-x-3 border-b border-[var(--ds-gray-alpha-400)] px-4 py-3">
-        <h2 id="claude-title" className="text-[15px] font-semibold text-[var(--ds-gray-1000)]">
-          Claude's judgement
-        </h2>
-        <span className={text.meta}>{judge.model}</span>
-      </div>
-      <div className="space-y-4 p-4">
+    <details className="group rounded-[8px] border border-[var(--ds-gray-alpha-400)] bg-[var(--ds-background-100)]">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-[8px] px-4 py-3 outline-none focus-visible:shadow-[var(--ds-focus-ring)] [&::-webkit-details-marker]:hidden">
+        <span className="inline-flex items-center gap-2 text-[15px] font-semibold text-[var(--ds-gray-1000)]">
+          <ChevronRight aria-hidden="true" className="h-4 w-4 transition-transform group-open:rotate-90 motion-reduce:transition-none" />
+          Claude's notes
+        </span>
+        <span className={text.meta}>{judge ? judge.model : "Claude off"}</span>
+      </summary>
+      {judge ? (
+      <div className="space-y-4 border-t border-[var(--ds-gray-alpha-400)] p-4">
         {judge.error ? (
           <Card tone="warning" depth="flat" density="compact">
             <p className={cn(text.caption, "text-inherit")}>
@@ -470,7 +556,12 @@ function ClaudePanel({ result }: { result: AutoResult }) {
           />
         </dl>
       </div>
-    </Surface>
+      ) : (
+        <p className={cn(text.small, "border-t border-[var(--ds-gray-alpha-400)] p-4")}>
+          Claude was off for this run, so the objective score picked the edit.
+        </p>
+      )}
+    </details>
   );
 }
 
@@ -648,7 +739,7 @@ function ExportStatus({ exported, photo, session }: { exported: ExportState; pho
 function DownloadsPanel({ photo }: { photo: Photo }) {
   const result = photo.result;
   const files = result ? filesOf(result.output, photo, "auto") : undefined;
-  const any = files && (files.jpeg || files.xmp || files.tiff);
+  const any = files && (files.jpeg || files.png || files.xmp || files.tiff);
   const manualExport = photo.manual?.export?.status === "succeeded";
 
   return (
@@ -656,7 +747,7 @@ function DownloadsPanel({ photo }: { photo: Photo }) {
       <PanelHeader title="Downloads" />
       <div className="space-y-3 px-4 py-2">
         {!result ? (
-          <p className={cn(text.caption, "py-2")}>The JPEG and XMP appear here when the retouch is done.</p>
+          <p className={cn(text.caption, "py-2")}>The JPEG, PNG and XMP appear here when the retouch is done.</p>
         ) : any ? (
           <>
             <FileList files={files} />
@@ -664,7 +755,7 @@ function DownloadsPanel({ photo }: { photo: Photo }) {
           </>
         ) : (
           <p className={cn(text.caption, "py-2")}>
-            This run exported no files: JPEG and XMP were off. Use Adjust, then Export full size.
+            This run exported no files: every export was off. Use Adjust, then Export full size.
           </p>
         )}
         {manualExport ? (

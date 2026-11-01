@@ -12,4 +12,12 @@ tiff16: boolean,
 /**
  * Lightroom / Camera Raw XMP sidecar with every develop setting.
  */
-xmp: boolean, };
+xmp: boolean, 
+/**
+ * Full-resolution PNG.
+ */
+png: boolean, 
+/**
+ * PNG bit depth: 8 or 16.
+ */
+png_bits: number, };

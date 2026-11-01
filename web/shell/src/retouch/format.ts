@@ -72,6 +72,12 @@ export function isDefault(spec: ParamSpec, value: number, asShot?: { temperature
   return snapParam(spec.key, value) === snapParam(spec.key, neutral);
 }
 
+/** An on/off setting (stored as 0 or 1): the Lens Corrections switches and
+    Black & White. */
+export function isSwitch(spec: Pick<ParamSpec, "group" | "key">): boolean {
+  return spec.group === "Lens" || spec.key === "bw";
+}
+
 /** "+12", "-8", "0" (never "-0"); `decimals` fixed, so "+0.35" and "0.00". */
 export function formatSigned(value: number, decimals = 0): string {
   const factor = 10 ** decimals;
@@ -85,7 +91,7 @@ export function formatSigned(value: number, decimals = 0): string {
 export function formatParam(key: ParamKey, value: number): string {
   const spec = specOf(key);
   if (key === "temperature") return `${Math.round(value)} K`;
-  if (spec.group === "Lens") return value >= 0.5 ? "On" : "Off";
+  if (isSwitch(spec)) return value >= 0.5 ? "On" : "Off";
   const decimals = stepDecimals(spec.step);
   const shown = spec.min < 0 ? formatSigned(value, decimals) : (Math.round(value * 10 ** decimals) / 10 ** decimals).toFixed(decimals);
   return key === "exposure" ? `${shown} EV` : shown;
@@ -152,11 +158,57 @@ export function uprightSize(info: RawInfo): { width: number; height: number } {
   return turned ? { width: info.height, height: info.width } : { width: info.width, height: info.height };
 }
 
-/** EXIF "2024:05:01 10:23:45" as "2024-05-01 10:23". */
-export function formatCaptured(value: string | null): string | undefined {
+/** The capture time as the camera's clock showed it, from ISO 8601
+    ("2026-11-01T14:32:05+03:00", the offset optional) or as EXIF writes it
+    ("2026:11:01 14:32:05"). `wall` holds that clock reading in UTC fields,
+    so formatting it in UTC shows the local time where the photo was taken,
+    whatever the browser's time zone. */
+export function parseCaptured(value: string | null | undefined): { wall: Date; offset?: string } | undefined {
   if (!value) return undefined;
-  const m = /^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2})/.exec(value.trim());
-  return m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}` : value;
+  const m = /^(\d{4})[-:](\d{2})[-:](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?\s*(Z|[+-]\d{2}:?\d{2})?$/.exec(
+    value.trim(),
+  );
+  if (!m) return undefined;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map((part) => Number(part ?? 0)) as number[];
+  if (!year || !month || month > 12 || !day || day > 31 || hour! > 23 || minute! > 59) return undefined;
+  const wall = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  return Number.isNaN(wall.getTime()) ? undefined : { wall, offset: m[7] };
+}
+
+/** "1 Kasım 2026 14:32" in the browser's language (or `locale`): the time
+    on the camera's clock. */
+export function formatCaptured(value: string | null | undefined, locale?: string): string | undefined {
+  const parsed = parseCaptured(value);
+  if (!parsed) return undefined;
+  try {
+    return new Intl.DateTimeFormat(locale, {
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZone: "UTC",
+    }).format(parsed.wall);
+  } catch {
+    return parsed.wall.toISOString().slice(0, 16).replace("T", " ");
+  }
+}
+
+/** "38.4237° N, 27.1428° E". */
+export function formatCoordinates(lat: number, lon: number): string {
+  const part = (value: number, positive: string, negative: string) =>
+    `${Math.abs(value).toFixed(4)}° ${value >= 0 ? positive : negative}`;
+  return `${part(lat, "N", "S")}, ${part(lon, "E", "W")}`;
+}
+
+/** Where the photo was taken: the place name the host looked up offline,
+    else the GPS coordinates; undefined without GPS. */
+export function placeLine(info: Pick<RawInfo, "place" | "gps">): string | undefined {
+  const place = typeof info.place === "string" ? info.place.trim() : "";
+  if (place) return place;
+  const gps = info.gps;
+  if (gps && Number.isFinite(gps.lat) && Number.isFinite(gps.lon)) return formatCoordinates(gps.lat, gps.lon);
+  return undefined;
 }
 
 /** Decimal units, like the Finder: "48.2 MB". */

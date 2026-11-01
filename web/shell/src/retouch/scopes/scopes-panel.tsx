@@ -13,12 +13,15 @@ import {
   type ClipLevel,
   type ClipStats,
   type HistogramScale,
+  type Scopes,
 } from "./compute";
 import { Histogram, LAYER_FILL, OVERLAY_DASH, type Channels } from "./histogram";
-import { SAMPLE_EDGE, useScopes } from "./use-scopes";
+import { SAMPLE_EDGE, useScopes, type ScopesState } from "./use-scopes";
 import { Vectorscope } from "./vectorscope";
 
-type Source = "after" | "before" | "both";
+/** One image's scopes, or before and after side by side, or the before's
+    luma outlined over the after. */
+type Source = "before" | "after" | "side" | "overlay";
 
 /* Status lives in dots: grey for no clipping to speak of, amber for some,
    red for a lot (see clipLevel). */
@@ -69,29 +72,33 @@ export function useTwoColumns(): boolean {
    from the preview JPEGs: Lightroom's RGB histogram (or luma) with clipping,
    luma statistics, and a hue and saturation vectorscope. Before is the
    as-shot render, after the chosen edit, a selected candidate, or the live
-   manual preview; "Both" outlines the before's luma over the after. */
+   manual preview. Before sits on the left and after on the right, as in the
+   comparison: side by side (the default), or "Overlay" outlines the before's
+   luma over the after. */
 export function ScopesPanel({
   after,
   before,
   className,
   info,
+  initial = "side",
 }: {
   after?: CompareSide;
   before: CompareSide;
   className?: string;
   info?: RawInfo;
+  /** The first view: side by side, or the shorter overlay where height is tight. */
+  initial?: Source;
 }) {
   const titleId = useId();
-  const [source, setSource] = useState<Source>("after");
+  const [source, setSource] = useState<Source>(initial);
   const [prefs, setPrefs] = useState(loadPrefs);
   const beforeScopes = useScopes(before.id);
   const afterScopes = useScopes(after?.id);
 
   const view: Source = after ? source : "before";
-  const state = view === "before" ? beforeScopes : afterScopes;
-  const main = state.scopes;
-  const overlay = view === "both" ? beforeScopes.scopes : undefined;
-  const updating = Boolean(main) && (state.pending || (view === "both" && beforeScopes.pending));
+  const updating =
+    (view !== "after" && Boolean(beforeScopes.scopes) && beforeScopes.pending) ||
+    (view !== "before" && Boolean(afterScopes.scopes) && afterScopes.pending);
 
   const updatePrefs = (next: Partial<Prefs>) => {
     const merged = { ...prefs, ...next };
@@ -105,14 +112,9 @@ export function ScopesPanel({
       ? `Before · ${before.label}`
       : view === "after"
         ? `After · ${after.label}`
-        : `After · ${after.label}, before dashed`;
-  const band = main ? dominantBand(main.bands) : undefined;
-  const hue = !main ? "—" : band ? `Mostly ${band.name} (${formatShare(band.share)})` : "Nearly neutral";
-  const plotLabel = main
-    ? `${prefs.channels === "rgb" ? "RGB" : "Luma"} histogram, ${prefs.scale} scale: ${shown}. ` +
-      `Mean luma ${formatLevel(main.meanLuma)}, shadows clipped ${formatShare(main.shadows.any)}, ` +
-      `highlights clipped ${formatShare(main.highlights.any)}.`
-    : "Histogram";
+        : view === "side"
+          ? `Before · ${before.label} | After · ${after.label}`
+          : `After · ${after.label}, before dashed`;
 
   return (
     <Surface tone="flat" aria-labelledby={titleId} className={cn("overflow-hidden", className)}>
@@ -135,96 +137,56 @@ export function ScopesPanel({
             value={source}
             onChange={setSource}
             options={[
-              { value: "after", label: "After" },
               { value: "before", label: "Before" },
-              { value: "both", label: "Both" },
+              { value: "side", label: "Side by side" },
+              { value: "overlay", label: "Overlay" },
+              { value: "after", label: "After" },
             ]}
           />
         ) : null}
       </div>
 
-      <div className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_auto]">
-        <div className="min-w-0 space-y-2">
-          <div className="relative h-28 overflow-hidden rounded-[6px] border border-[var(--ds-gray-alpha-400)] bg-[var(--ds-background-200)] sm:h-32">
-            {main ? (
-              <Histogram
-                main={main}
-                overlay={overlay}
-                channels={prefs.channels}
-                scale={prefs.scale}
-                label={plotLabel}
-                className="absolute inset-0 h-full w-full"
-              />
-            ) : state.failed ? (
-              <Unavailable />
-            ) : (
-              <Skeleton className="absolute inset-0 rounded-none" />
-            )}
-          </div>
-          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
-            <ClipReadout kind="shadows" main={main?.shadows} before={overlay?.shadows} />
-            <ClipReadout kind="highlights" main={main?.highlights} before={overlay?.highlights} />
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <SegmentedControl
-              label="Histogram channels"
-              value={prefs.channels}
-              onChange={(channels) => updatePrefs({ channels })}
-              options={[
-                { value: "rgb", label: "RGB" },
-                { value: "luma", label: "Luma" },
-              ]}
-            />
-            <SegmentedControl
-              label="Histogram scale"
-              value={prefs.scale}
-              onChange={(scale) => updatePrefs({ scale })}
-              options={[
-                { value: "linear", label: "Linear" },
-                { value: "log", label: "Log" },
-              ]}
-            />
-            {view === "both" ? <Legend channels={prefs.channels} /> : null}
-          </div>
+      {view === "side" && after ? (
+        <div className="grid gap-x-6 gap-y-5 p-4 md:grid-cols-2">
+          <ScopeView
+            heading={`Before · ${before.label}`}
+            state={beforeScopes}
+            prefs={prefs}
+            info={info}
+            stacked
+          />
+          <ScopeView heading={`After · ${after.label}`} state={afterScopes} prefs={prefs} stacked />
         </div>
+      ) : (
+        <ScopeView
+          state={view === "before" ? beforeScopes : afterScopes}
+          overlay={view === "overlay" ? beforeScopes.scopes : undefined}
+          shown={shown}
+          prefs={prefs}
+          info={info}
+        />
+      )}
 
-        <div className="flex flex-wrap items-start gap-4 sm:flex-nowrap">
-          <figure className="w-36 shrink-0">
-            <Vectorscope
-              scopes={main}
-              label={
-                main
-                  ? `Hue and saturation scope: ${shown}. ${hue}, mean saturation ${formatLevel(main.meanChroma)}.`
-                  : "Hue and saturation scope"
-              }
-            />
-            <figcaption className={cn(text.meta, "mt-1 text-center")}>{hue}</figcaption>
-          </figure>
-          <dl className="grid min-w-36 flex-1 grid-cols-2 gap-x-4 gap-y-3 lg:w-40 lg:flex-none lg:grid-cols-1">
-            <Stat
-              label="Mean luma"
-              title="Average Rec. 709 luma of the preview, 0 (black) to 100% (white)"
-              main={main?.meanLuma}
-              before={overlay?.meanLuma}
-            />
-            <Stat label="Median luma" title="Half the pixels are darker than this" main={main?.medianLuma} before={overlay?.medianLuma} />
-            <Stat
-              label="Saturation"
-              title="Mean chroma: how far the pixels are from grey, 0 to 100%"
-              main={main?.meanChroma}
-              before={overlay?.meanChroma}
-            />
-            {info ? (
-              <div
-                className="min-w-0"
-                title="Pixels clipped in at least one channel in the RAW file itself; no edit brings these back"
-              >
-                <dt className={text.eyebrowSm}>RAW clipped</dt>
-                <dd className={cn(text.mono, "mt-0.5 tabular-nums")}>{formatShare(info.raw_clipped_fraction)}</dd>
-              </div>
-            ) : null}
-          </dl>
-        </div>
+      <div className="flex flex-wrap items-center gap-2 px-4 pb-4">
+        <SegmentedControl
+          label="Histogram channels"
+          value={prefs.channels}
+          onChange={(channels) => updatePrefs({ channels })}
+          options={[
+            { value: "rgb", label: "RGB" },
+            { value: "luma", label: "Luma" },
+          ]}
+        />
+        <SegmentedControl
+          label="Histogram scale"
+          value={prefs.scale}
+          onChange={(scale) => updatePrefs({ scale })}
+          options={[
+            { value: "linear", label: "Linear" },
+            { value: "log", label: "Log" },
+          ]}
+        />
+        {view === "overlay" ? <Legend channels={prefs.channels} /> : null}
       </div>
 
       {info ? (
@@ -236,6 +198,108 @@ export function ScopesPanel({
         </div>
       ) : null}
     </Surface>
+  );
+}
+
+/* One image's histogram, clipping, vectorscope and statistics; with
+   `overlay`, the before's values beside the after's ("31% → 38%").
+   `stacked` puts the vectorscope under the histogram (a half-width column). */
+function ScopeView({
+  heading,
+  info,
+  overlay,
+  prefs,
+  shown,
+  stacked = false,
+  state,
+}: {
+  heading?: string;
+  info?: RawInfo;
+  overlay?: Scopes;
+  prefs: Prefs;
+  shown?: string;
+  stacked?: boolean;
+  state: ScopesState;
+}) {
+  const main = state.scopes;
+  const name = heading ?? shown ?? "";
+  const band = main ? dominantBand(main.bands) : undefined;
+  const hue = !main ? "—" : band ? `Mostly ${band.name} (${formatShare(band.share)})` : "Nearly neutral";
+  const plotLabel = main
+    ? `${prefs.channels === "rgb" ? "RGB" : "Luma"} histogram, ${prefs.scale} scale: ${name}. ` +
+      `Mean luma ${formatLevel(main.meanLuma)}, shadows clipped ${formatShare(main.shadows.any)}, ` +
+      `highlights clipped ${formatShare(main.highlights.any)}.`
+    : "Histogram";
+
+  return (
+    <div className={cn("grid min-w-0 gap-4", stacked ? "" : "p-4 pb-3 lg:grid-cols-[minmax(0,1fr)_auto]")}>
+      <div className="min-w-0 space-y-2">
+        {heading ? <p className={cn(text.eyebrowSm, "truncate normal-case")}>{heading}</p> : null}
+        <div className="relative h-28 overflow-hidden rounded-[6px] border border-[var(--ds-gray-alpha-400)] bg-[var(--ds-background-200)] sm:h-32">
+          {main ? (
+            <Histogram
+              main={main}
+              overlay={overlay}
+              channels={prefs.channels}
+              scale={prefs.scale}
+              label={plotLabel}
+              className="absolute inset-0 h-full w-full"
+            />
+          ) : state.failed ? (
+            <Unavailable />
+          ) : (
+            <Skeleton className="absolute inset-0 rounded-none" />
+          )}
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
+          <ClipReadout kind="shadows" main={main?.shadows} before={overlay?.shadows} />
+          <ClipReadout kind="highlights" main={main?.highlights} before={overlay?.highlights} />
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-start gap-4 sm:flex-nowrap">
+        <figure className="w-36 shrink-0">
+          <Vectorscope
+            scopes={main}
+            label={
+              main
+                ? `Hue and saturation scope: ${name}. ${hue}, mean saturation ${formatLevel(main.meanChroma)}.`
+                : "Hue and saturation scope"
+            }
+          />
+          <figcaption className={cn(text.meta, "mt-1 text-center")}>{hue}</figcaption>
+        </figure>
+        <dl
+          className={cn(
+            "grid min-w-36 flex-1 grid-cols-2 gap-x-4 gap-y-3",
+            !stacked && "lg:w-40 lg:flex-none lg:grid-cols-1",
+          )}
+        >
+          <Stat
+            label="Mean luma"
+            title="Average Rec. 709 luma of the preview, 0 (black) to 100% (white)"
+            main={main?.meanLuma}
+            before={overlay?.meanLuma}
+          />
+          <Stat label="Median luma" title="Half the pixels are darker than this" main={main?.medianLuma} before={overlay?.medianLuma} />
+          <Stat
+            label="Saturation"
+            title="Mean chroma: how far the pixels are from grey, 0 to 100%"
+            main={main?.meanChroma}
+            before={overlay?.meanChroma}
+          />
+          {info ? (
+            <div
+              className="min-w-0"
+              title="Pixels clipped in at least one channel in the RAW file itself; no edit brings these back"
+            >
+              <dt className={text.eyebrowSm}>RAW clipped</dt>
+              <dd className={cn(text.mono, "mt-0.5 tabular-nums")}>{formatShare(info.raw_clipped_fraction)}</dd>
+            </div>
+          ) : null}
+        </dl>
+      </div>
+    </div>
   );
 }
 
@@ -302,6 +366,15 @@ function Legend({ channels }: { channels: Channels }) {
     <span className={cn(text.meta, "ml-auto flex flex-wrap items-center gap-x-3 gap-y-1")}>
       <LegendItem
         swatch={
+          <svg width="16" height="4" className="overflow-visible">
+            <line x1="0" y1="2" x2="16" y2="2" stroke="var(--ds-gray-1000)" strokeWidth="1.5" strokeDasharray={OVERLAY_DASH} />
+          </svg>
+        }
+      >
+        Before, luma
+      </LegendItem>
+      <LegendItem
+        swatch={
           <span
             className="h-2.5 w-3 rounded-[2px]"
             style={{ background: channels === "rgb" ? LAYER_FILL.neutral : "var(--ds-gray-alpha-500)" }}
@@ -309,15 +382,6 @@ function Legend({ channels }: { channels: Channels }) {
         }
       >
         After
-      </LegendItem>
-      <LegendItem
-        swatch={
-          <svg width="16" height="4" className="overflow-visible">
-            <line x1="0" y1="2" x2="16" y2="2" stroke="var(--ds-gray-1000)" strokeWidth="1.5" strokeDasharray={OVERLAY_DASH} />
-          </svg>
-        }
-      >
-        Before, luma
       </LegendItem>
     </span>
   );

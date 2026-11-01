@@ -104,4 +104,12 @@ lens_profile: number,
 /**
  * Remove Chromatic Aberration.
  */
-lens_ca: number, };
+lens_ca: number, 
+/**
+ * Black and white: 0 = colour, 1 = black and white.
+ */
+bw: number, 
+/**
+ * B&W mixer: how light each hue turns in black and white, -100 to +100.
+ */
+gray_red: number, gray_orange: number, gray_yellow: number, gray_green: number, gray_aqua: number, gray_blue: number, gray_purple: number, gray_magenta: number, };

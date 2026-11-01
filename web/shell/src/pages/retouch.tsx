@@ -7,7 +7,17 @@ import { PageIntro } from "../components/page-intro";
 import { TokenPrompt } from "../components/token-prompt";
 import { plural } from "../lib/format";
 import { DropZone, useFileDrop } from "../retouch/drop-zone";
-import { finalFiles, isActive, needsRetouch, photoPhase, queueOrder, type Phase, type Photo } from "../retouch/model";
+import { INSTRUCTION_EXAMPLES, InstructionField } from "../retouch/instruction";
+import {
+  finalFiles,
+  isActive,
+  needsRetouch,
+  photoPhase,
+  queueOrder,
+  type DownloadKind,
+  type Phase,
+  type Photo,
+} from "../retouch/model";
 import { OptionsPanel } from "../retouch/options-panel";
 import { PhotoCard } from "../retouch/photo-card";
 import { PhotoDetail } from "../retouch/photo-detail";
@@ -57,6 +67,7 @@ export function RetouchPage({ photoKey }: { photoKey?: string }) {
             photos={state.photos}
             position={positions.get(photo.key)}
             session={session}
+            defaultInstruction={state.instruction}
           />
         ) : (
           <NotInSession />
@@ -128,13 +139,15 @@ function Intro({ action }: { action?: ReactNode }) {
     <PageIntro
       eyebrow="App · raw_retouch"
       title="Retouch RAW photos"
-      lead="Each photo is developed on the GPU, given Lightroom develop settings by a per-photo search, judged by Claude, and exported as a full-resolution JPEG with an XMP sidecar."
+      lead="Each photo is developed on the GPU, given Lightroom develop settings by a per-photo search, judged by Claude, and exported as a full-resolution JPEG and PNG with an XMP sidecar."
       action={action}
     />
   );
 }
 
-const PHASE_ORDER: Phase[] = ["done", "working", "queued", "uploading", "reading", "ready", "failed", "cancelled"];
+const DOWNLOAD_NAMES: Record<DownloadKind, string> = { jpeg: "JPEGs", png: "PNGs", xmp: "XMPs" };
+
+const PHASE_ORDER: Phase[] =["done", "working", "queued", "uploading", "reading", "ready", "failed", "cancelled"];
 
 /* The toolbar (counts, Retouch all, Cancel all, Download all) and the grid. */
 function PhotosPanel({ canAdd, positions }: { canAdd: boolean; positions: Map<string, number> }) {
@@ -152,6 +165,7 @@ function PhotosPanel({ canAdd, positions }: { canAdd: boolean; positions: Map<st
   const pending = photos.filter(needsRetouch).length;
   const active = photos.filter(isActive).length;
   const jpegs = photos.filter((p) => finalFiles(p).jpeg).length;
+  const pngs = photos.filter((p) => finalFiles(p).png).length;
   const xmps = photos.filter((p) => finalFiles(p).xmp).length;
   const downloading = state.downloading;
 
@@ -187,6 +201,13 @@ function PhotosPanel({ canAdd, positions }: { canAdd: boolean; positions: Map<st
           </Button>
           <Button
             icon={Download}
+            disabled={pngs === 0 || downloading !== undefined}
+            onClick={() => void session.downloadAll("png")}
+          >
+            Download all PNGs{pngs ? ` (${pngs})` : ""}
+          </Button>
+          <Button
+            icon={Download}
             disabled={xmps === 0 || downloading !== undefined}
             onClick={() => void session.downloadAll("xmp")}
           >
@@ -202,9 +223,24 @@ function PhotosPanel({ canAdd, positions }: { canAdd: boolean; positions: Map<st
         )}
       >
         {downloading
-          ? `Downloading ${downloading.done + 1} of ${downloading.total} ${downloading.kind === "jpeg" ? "JPEGs" : "XMPs"}… Allow multiple downloads if the browser asks.`
+          ? `Downloading ${downloading.done + 1} of ${downloading.total} ${DOWNLOAD_NAMES[downloading.kind]}… Allow multiple downloads if the browser asks.`
           : ""}
       </p>
+      {state.follower ? (
+        <p role="status" className={cn(text.caption, "border-b border-[var(--ds-gray-alpha-300)] px-4 py-2")}>
+          This session is also open in another tab, which runs the retouch queue. Retouches queued in this tab start once
+          that tab closes.
+        </p>
+      ) : null}
+      <div className="border-b border-[var(--ds-gray-alpha-300)] p-4">
+        <InstructionField
+          label="Edit wanted for every photo (optional)"
+          value={state.instruction}
+          onChange={(value) => session.setDefaultInstruction(value)}
+          placeholder={INSTRUCTION_EXAMPLES.fallback}
+          hint="Applies to photos with an empty box. Read when each retouch starts; empty lets the retouch choose."
+        />
+      </div>
       <ul className="grid grid-cols-1 gap-3 p-3 sm:grid-cols-2 lg:grid-cols-3">
         {photos.map((photo) => (
           <li key={photo.key} className="flex min-w-0">
@@ -213,6 +249,7 @@ function PhotosPanel({ canAdd, positions }: { canAdd: boolean; positions: Map<st
               position={positions.get(photo.key)}
               session={session}
               canRetryUpload={session.hasFile(photo.key)}
+              defaultInstruction={state.instruction}
             />
           </li>
         ))}
@@ -229,7 +266,7 @@ const steps = [
   },
   {
     title: "Review and download",
-    body: "Compare before and after, adjust the sliders if you like, then take the JPEGs and XMP sidecars.",
+    body: "Compare before and after, adjust the sliders if you like, then take the JPEGs, PNGs and XMP sidecars.",
   },
 ];
 

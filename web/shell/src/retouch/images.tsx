@@ -71,15 +71,16 @@ export function ImageUnavailable({ label = "Image unavailable" }: { label?: stri
   );
 }
 
-/** The newest image for `id` that has finished decoding. While a new one
-    loads, the previous stays up, so stepping through renders never flashes. */
-export function useDecodedSrc(id: string | undefined): {
-  src?: string;
+/** The newest image for `id` that has finished decoding, for drawing on a
+    canvas. While a new one loads the previous stays up, so stepping through
+    renders never flashes. */
+export function useDecodedImage(id: string | undefined): {
+  image?: HTMLImageElement;
   pending: boolean;
   failed: boolean;
 } {
   const { src: wanted, failed: fetchFailed } = useArtifactSrc(id);
-  const [shown, setShown] = useState<string>();
+  const [shown, setShown] = useState<{ src: string; image: HTMLImageElement }>();
   const [broken, setBroken] = useState<string>();
 
   useEffect(() => {
@@ -89,7 +90,7 @@ export function useDecodedSrc(id: string | undefined): {
     image.decoding = "async";
     image.src = wanted;
     image.decode().then(
-      () => live && setShown(wanted),
+      () => live && setShown({ src: wanted, image }),
       () => live && setBroken(wanted),
     );
     return () => {
@@ -99,8 +100,8 @@ export function useDecodedSrc(id: string | undefined): {
 
   const failed = fetchFailed || (wanted !== undefined && broken === wanted);
   return {
-    src: id ? shown : undefined,
-    pending: id !== undefined && !failed && shown !== wanted,
+    image: id ? shown?.image : undefined,
+    pending: id !== undefined && !failed && shown?.src !== wanted,
     failed,
   };
 }

@@ -3,4 +3,4 @@
 /**
  * The Lightroom panel a setting belongs to.
  */
-export type ParamGroup = "Basic" | "ToneCurve" | "Presence" | "ColorMixer" | "Calibration" | "Detail" | "Lens";
+export type ParamGroup = "Basic" | "ToneCurve" | "Presence" | "ColorMixer" | "Calibration" | "Detail" | "Lens" | "BlackWhite";

@@ -33,4 +33,8 @@ refine: boolean,
 /**
  * Parameter-search evaluations per look.
  */
-evals_per_look: number, export: ExportOptions, };
+evals_per_look: number, export: ExportOptions, 
+/**
+ * What the edit should do, in a few words (at most 500 characters).
+ */
+instruction?: string | null, };
