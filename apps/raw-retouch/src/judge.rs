@@ -10,10 +10,17 @@
 //! bias cancels out. Verdicts are cached on disk, so a re-run costs nothing.
 //!
 //! Planning and refining set the Basic panel and every Tone Curve,
-//! Presence, Color Mixer and Calibration setting the photo's search box lets
-//! move (`search::bounds`): the Basic, curve and presence sliders by value,
-//! Color Mixer bands and Calibration settings only when Claude changes
-//! them. Detail and Lens Corrections are never Claude's.
+//! Presence, Color Mixer, Calibration and Black & White setting the photo's
+//! search box lets move (`search::bounds`, opened by [`open_black_white`]
+//! when the photographer asks for an edit): the Basic, curve, presence and
+//! Black & White sliders by value, Color Mixer bands and Calibration
+//! settings only when Claude changes them. Detail and Lens Corrections are
+//! never Claude's.
+//!
+//! The photographer may describe the edit they want in a few words
+//! ([`PhotoBrief::request`]). Every prompt then quotes it as data: the plan
+//! proposes looks that fulfil it, and rank, compare and refine judge which
+//! version fulfils it best while looking excellent, still blind.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -84,6 +91,10 @@ pub struct PhotoBrief {
     pub exposure: String,
     /// Histogram percentiles and clipping of the neutral render.
     pub stats: serde_json::Value,
+    /// The edit the photographer asked for in their own words ("siyah
+    /// beyaz", "high contrast, saturated"), cleaned by [`clean_request`];
+    /// None for the usual natural taste.
+    pub request: Option<String>,
 }
 
 impl PhotoBrief {
@@ -107,8 +118,36 @@ impl PhotoBrief {
             camera: camera_line(info),
             exposure: exposure_line(info),
             stats,
+            request: None,
         }
     }
+
+    /// The brief with the photographer's request, cleaned (see
+    /// [`clean_request`]); an empty one leaves the usual natural taste.
+    pub fn with_request(mut self, request: Option<&str>) -> Self {
+        self.request = request.and_then(clean_request);
+        self
+    }
+}
+
+/// Longest request a prompt quotes, in characters.
+pub const MAX_REQUEST_CHARS: usize = 500;
+
+/// The photographer's request as prompts quote it: one line (whitespace and
+/// control characters collapsed to single spaces), no triple quote that
+/// could close the quotation, at most [`MAX_REQUEST_CHARS`] characters.
+/// None when nothing is left.
+pub fn clean_request(raw: &str) -> Option<String> {
+    let mut text = raw
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    while text.contains("\"\"\"") {
+        text = text.replace("\"\"\"", "\"");
+    }
+    let text = head(&text, MAX_REQUEST_CHARS).trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
@@ -173,6 +212,9 @@ const PLAN_PROMPT: &str = include_str!("../prompts/plan.txt");
 const RANK_PROMPT: &str = include_str!("../prompts/rank.txt");
 const REFINE_PROMPT: &str = include_str!("../prompts/refine.txt");
 const COMPARE_PROMPT: &str = include_str!("../prompts/compare.txt");
+/// What changes in the prompts when the photographer asks for an edit, by
+/// `[section]`.
+const REQUEST_PROMPT: &str = include_str!("../prompts/request.txt");
 /// What each setting does, by panel (`[basic]`, `[tone_curve]`, ...): the
 /// plan and refine prompts show the panels and settings Claude may set.
 const SLIDERS: &str = include_str!("../prompts/sliders.txt");
@@ -233,6 +275,19 @@ impl Claude {
         check_images(&[neutral, auto])?;
         let ranges = Ranges::new(lo, hi);
         let stats = compact(&photo.stats).to_string();
+        let task = match photo.request.as_deref() {
+            None => request_section("plan_default"),
+            Some(request) => {
+                let mut task = request_section("plan").replace("{request}", request);
+                if ranges.offers_black_white() {
+                    task.push('\n');
+                    task.push_str(&request_section("plan_black_white"));
+                }
+                task
+            }
+        };
+        // The task goes in last, so the request's words are never read as
+        // a placeholder.
         let text = fill(
             PLAN_PROMPT,
             &[
@@ -242,6 +297,7 @@ impl Claude {
                 ("auto", &ranges.describe_params(auto_params)),
                 ("stats", &stats),
                 ("bounds", &ranges.describe()),
+                ("task", &task),
             ],
         );
         let images = [
@@ -366,15 +422,19 @@ impl Claude {
     ) -> Result<RefineVerdict> {
         check_images(&[current])?;
         let ranges = Ranges::new(lo, hi);
-        let text = fill(
-            REFINE_PROMPT,
-            &[
-                ("params", &ranges.describe_params(params)),
-                ("sliders", &ranges.glossary()),
-                ("camera", &photo.camera),
-                ("shot", &photo.exposure),
-                ("bounds", &ranges.describe()),
-            ],
+        let text = with_request(
+            &fill(
+                REFINE_PROMPT,
+                &[
+                    ("params", &ranges.describe_params(params)),
+                    ("sliders", &ranges.glossary()),
+                    ("camera", &photo.camera),
+                    ("shot", &photo.exposure),
+                    ("bounds", &ranges.describe()),
+                ],
+            ),
+            "refine",
+            photo.request.as_deref(),
         );
         let blocks = with_images(
             &text,
@@ -480,9 +540,13 @@ impl Claude {
         first: &JudgeImage,
         second: &JudgeImage,
     ) -> Result<CompareReply> {
-        let text = fill(
-            COMPARE_PROMPT,
-            &[("camera", &photo.camera), ("shot", &photo.exposure)],
+        let text = with_request(
+            &fill(
+                COMPARE_PROMPT,
+                &[("camera", &photo.camera), ("shot", &photo.exposure)],
+            ),
+            "judge",
+            photo.request.as_deref(),
         );
         let images = [
             ("Image A:".to_owned(), first.jpeg.as_slice()),
@@ -898,6 +962,31 @@ fn fill(template: &str, vars: &[(&str, &str)]) -> String {
     })
 }
 
+/// One `[name]` section of `prompts/request.txt`, its lines joined.
+fn request_section(name: &str) -> String {
+    sections(REQUEST_PROMPT)
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, lines)| lines.join("\n"))
+        .unwrap_or_default()
+}
+
+/// A filled prompt with its `{request}` line: the `section` of
+/// `prompts/request.txt` quoting the photographer's request or, without
+/// one, nothing (the line and the blank line after it go), so the prompt
+/// reads exactly as it did before requests existed and cached verdicts
+/// still answer it. Call it after [`fill`], so the request's words are
+/// never read as a placeholder.
+fn with_request(text: &str, section: &str, request: Option<&str>) -> String {
+    match request {
+        Some(request) => text.replace(
+            "{request}",
+            &request_section(section).replace("{request}", request),
+        ),
+        None => text.replace("{request}\n\n", ""),
+    }
+}
+
 fn check_images(images: &[&JudgeImage]) -> Result<()> {
     for img in images {
         if !img.jpeg.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -974,14 +1063,18 @@ fn rank_request<'a>(
     order: &[usize],
 ) -> (Value, Vec<Block<'a>>) {
     let labels = &LABELS[..order.len()];
-    let text = fill(
-        RANK_PROMPT,
-        &[
-            ("n", &order.len().to_string()),
-            ("labels", &join_labels(labels)),
-            ("camera", &photo.camera),
-            ("shot", &photo.exposure),
-        ],
+    let text = with_request(
+        &fill(
+            RANK_PROMPT,
+            &[
+                ("n", &order.len().to_string()),
+                ("labels", &join_labels(labels)),
+                ("camera", &photo.camera),
+                ("shot", &photo.exposure),
+            ],
+        ),
+        "judge",
+        photo.request.as_deref(),
     );
     let images: Vec<(String, &[u8])> = order
         .iter()
@@ -1134,7 +1227,27 @@ fn by_value(i: usize) -> bool {
     matches!(
         PARAM_SPECS[i].group,
         ParamGroup::Basic | ParamGroup::ToneCurve | ParamGroup::Presence
-    )
+    ) || is_black_white(i)
+}
+
+/// Whether field `i` is part of the Black & White treatment: `bw` and the
+/// gray mixer's `gray_<band>` sliders. Read from the key, so this module
+/// does not depend on how the panel is grouped.
+fn is_black_white(i: usize) -> bool {
+    let key = PARAM_SPECS[i].key;
+    key == "bw" || key.starts_with("gray_")
+}
+
+/// The search box `lo`..`hi` with the Black & White treatment open over its
+/// whole legal range, for a photographer's request: the search holds it
+/// still, and only Claude converts to black and white.
+pub fn open_black_white(lo: &Params, hi: &Params) -> (Params, Params) {
+    let (mut lo, mut hi) = (lo.to_array(), hi.to_array());
+    for i in (0..Params::COUNT).filter(|&i| is_black_white(i)) {
+        lo[i] = PARAM_SPECS[i].min;
+        hi[i] = PARAM_SPECS[i].max;
+    }
+    (Params::from_array(lo), Params::from_array(hi))
 }
 
 /// Index of the field named `key` in [`Params::NAMES`].
@@ -1187,7 +1300,13 @@ impl Ranges {
     /// panels it may set where the box is wider than one step.
     fn offered(&self, i: usize) -> bool {
         let group = PARAM_SPECS[i].group;
-        group == ParamGroup::Basic || (CLAUDE_GROUPS.contains(&group) && self.lo[i] < self.hi[i])
+        group == ParamGroup::Basic
+            || ((CLAUDE_GROUPS.contains(&group) || is_black_white(i)) && self.lo[i] < self.hi[i])
+    }
+
+    /// Whether Claude may convert the photo to black and white.
+    fn offers_black_white(&self) -> bool {
+        (0..Params::COUNT).any(|i| is_black_white(i) && self.offered(i))
     }
 
     /// The offered fields of `group`, in field order.
@@ -1478,11 +1597,10 @@ impl Ranges {
         sections(SLIDERS)
             .into_iter()
             .filter_map(|(name, lines)| {
-                let group = group_of(name)?;
-                self.offered_in(group).next()?;
+                (0..Params::COUNT).find(|&i| section_of(i) == Some(name) && self.offered(i))?;
                 let kept: Vec<&str> = lines
                     .into_iter()
-                    .filter(|line| self.explains(group, line))
+                    .filter(|line| self.explains(name, line))
                     .collect();
                 Some(kept.join("\n"))
             })
@@ -1490,19 +1608,35 @@ impl Ranges {
             .join("\n\n")
     }
 
-    /// Whether a glossary line belongs in the prompt: a "- name: ..." line
-    /// only when Claude may set that setting (in the Color Mixer section, a
-    /// band setting such as "saturation" of any band).
-    fn explains(&self, group: ParamGroup, line: &str) -> bool {
+    /// Whether a line of glossary `section` belongs in the prompt: a "-
+    /// name: ..." line only when Claude may set that setting (in the Color
+    /// Mixer section, a band setting such as "saturation" of any band).
+    fn explains(&self, section: &str, line: &str) -> bool {
         let Some((name, _)) = line.strip_prefix("- ").and_then(|l| l.split_once(':')) else {
             return true;
         };
         let name = name.trim();
-        if group == ParamGroup::ColorMixer && MIXER_KINDS.contains(&name) {
+        if section == "color_mixer" && MIXER_KINDS.contains(&name) {
             return !self.mixer_fields(name).is_empty();
         }
         field(name).is_none_or(|i| self.offered(i))
     }
+}
+
+/// The `prompts/sliders.txt` section that explains field `i`; none for
+/// panels Claude never sets.
+fn section_of(i: usize) -> Option<&'static str> {
+    if is_black_white(i) {
+        return Some("black_white");
+    }
+    Some(match PARAM_SPECS[i].group {
+        ParamGroup::Basic => "basic",
+        ParamGroup::ToneCurve => "tone_curve",
+        ParamGroup::Presence => "presence",
+        ParamGroup::ColorMixer => "color_mixer",
+        ParamGroup::Calibration => "calibration",
+        _ => return None,
+    })
 }
 
 /// `[name]` sections of a prompt file and their lines.
@@ -1519,18 +1653,6 @@ fn sections(text: &str) -> Vec<(&str, Vec<&str>)> {
         }
     }
     out
-}
-
-/// The panel a `prompts/sliders.txt` section describes.
-fn group_of(section: &str) -> Option<ParamGroup> {
-    Some(match section {
-        "basic" => ParamGroup::Basic,
-        "tone_curve" => ParamGroup::ToneCurve,
-        "presence" => ParamGroup::Presence,
-        "color_mixer" => ParamGroup::ColorMixer,
-        "calibration" => ParamGroup::Calibration,
-        _ => return None,
-    })
 }
 
 /// Field `i`'s bounds within Lightroom's legal range, rounded inward to

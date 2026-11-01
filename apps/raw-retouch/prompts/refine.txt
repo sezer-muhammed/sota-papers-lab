@@ -11,6 +11,8 @@ Camera: {camera}. Shot at {shot}.
 Allowed range of each setting for this photo:
 {bounds}
 
+{request}
+
 Look at it as a finished print. Is there one small, targeted change that would clearly improve it? For example: recover a slightly hot sky or face, open up shadows that hide the subject, remove a slight colour cast, calm colour that is a little loud, deepen a pale sky, or add a touch of contrast or clarity to a flat image. Change only the one or two settings this needs, by a modest amount, and keep every other setting exactly as it is. If the image is already right, return the same values unchanged.
 
 Answer with:

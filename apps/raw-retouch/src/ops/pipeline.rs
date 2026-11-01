@@ -6,6 +6,15 @@
 //! failure while ranking) the objective's best finalist is the result. A
 //! failed plan only costs the proposed looks, and a failed refinement keeps
 //! Claude's ranked winner.
+//!
+//! With an edit request (`AutoInput::instruction`), Claude plans three
+//! looks that fulfil it, the built-in looks shrink to natural (plus black
+//! and white when asked for), and every judgement is by the request.
+//! Without Claude, keywords pick the looks and the one chosen
+//! ([`request`]), and the output says so.
+
+mod bw_stub;
+mod request;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -25,11 +34,13 @@ use crate::auto::auto_params;
 use crate::finish;
 use crate::judge::{
     Claude, CompareVerdict, JudgeImage, JudgeOptions, PhotoBrief, PlannedLook, RankVerdict,
+    clean_request, open_black_white,
 };
 use crate::objective::LookSpec;
 use crate::render::RenderEngine;
-use crate::search::{self, Candidate, SearchConfig};
+use crate::search::{self, Candidate, CandidateSource, SearchConfig};
 use crate::types::{Gpu, PARAM_SPECS, Params, Scene, Stats};
+use request::{Routed, Style, route};
 
 /// Images Claude ranks at once: the finalists and the neutral render.
 const MAX_SHOWN: usize = 7;
@@ -78,6 +89,8 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
     let plan = input.use_claude && input.plan;
     let refine = input.use_claude && input.refine;
     let full_res = input.export.jpeg || input.export.tiff16;
+    let instruction = input.instruction.as_deref().and_then(clean_request);
+    let routed = instruction.as_deref().map(route).unwrap_or_default();
     let timeline = Timeline::new(&[
         (Stage::Load, LOAD_S),
         (Stage::Plan, if plan { PLAN_S } else { 0.0 }),
@@ -145,9 +158,25 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
     .await?;
     let mut search_ms = ms(measuring);
     let before = put_jpeg(cx, first.before).await?;
-    let brief = PhotoBrief::new(&info, &first.stats);
+    let brief = PhotoBrief::new(&info, &first.stats).with_request(instruction.as_deref());
     let (lo, hi) = search::bounds(&bench.scene);
+    // Claude may convert to black and white only for a request.
+    let (lo, hi) = match &instruction {
+        Some(_) => open_black_white(&lo, &hi),
+        None => (lo, hi),
+    };
     cx.log(format!("Auto: {}", describe(&first.auto)));
+    if let Some(request) = &instruction {
+        let styles: Vec<&str> = routed.found.iter().map(|(s, _)| s.label()).collect();
+        cx.log(format!(
+            "Request: \"{request}\" (keywords: {})",
+            if styles.is_empty() {
+                "none".to_owned()
+            } else {
+                styles.join(", ")
+            }
+        ));
+    }
 
     // Claude, when asked for and installed.
     let mut failure: Option<String> = None;
@@ -207,7 +236,12 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
                 ensure_live(cx)?;
                 claude_failures += 1;
                 cx.log(format!(
-                    "Claude could not plan looks, so the search runs the built-in ones: {e:#}"
+                    "Claude could not plan looks, so the search runs {}: {e:#}",
+                    if instruction.is_some() {
+                        "the looks the request's keywords name"
+                    } else {
+                        "the built-in ones"
+                    }
                 ));
             }
         }
@@ -215,7 +249,8 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
 
     // Search every look over the same archive of renders.
     ensure_live(cx)?;
-    let mut looks = LookSpec::builtin();
+    let planned = !proposals.is_empty();
+    let mut looks = base_looks(instruction.is_some(), &routed, planned, &first.auto);
     let mut rationales: HashMap<String, String> = HashMap::new();
     for (i, look) in proposals.iter().enumerate() {
         let id = format!("claude-{}", i + 1);
@@ -229,8 +264,9 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
     let searching = Instant::now();
     let look_count = looks.len();
     let labels: Vec<String> = looks.iter().map(|l| l.label.clone()).collect();
+    let look_ids: Vec<String> = looks.iter().map(|l| l.id.clone()).collect();
     let search_cfg = cfg.clone();
-    let (b, result) = blocking(cx, timeline.span(Stage::Search), move |r| {
+    let (b, mut result) = blocking(cx, timeline.span(Stage::Search), move |r| {
         let mut bench = bench;
         let Bench { engine, scene, .. } = &mut bench;
         let mut eval = Cancellable {
@@ -246,6 +282,19 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
     bench = b;
     search_ms += ms(searching);
     let evaluations = result.evaluations;
+    // Looks built from the request's keywords are anchored like Claude's,
+    // but they are not Claude's.
+    for c in result.looks.iter_mut().chain(&mut result.finalists) {
+        if Routed::built(&c.id) {
+            c.source = CandidateSource::Look;
+        }
+    }
+    // The look the request's keywords name, when it was searched: the
+    // result unless Claude ranks.
+    let target = routed
+        .target()
+        .and_then(|id| look_ids.iter().position(|l| *l == id))
+        .and_then(|k| result.looks.get(k).cloned());
 
     // The finalists, best first, and the neutral render to fall back on.
     let mut pool: Vec<Candidate> = result
@@ -257,6 +306,20 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
     if !pool.iter().any(|c| c.params == result.neutral.params) {
         pool.push(result.neutral.clone());
     }
+    if let Some(t) = &target {
+        include_first(&mut pool, t, &result.neutral.params);
+    }
+    // Without Claude's verdict: the keywords' look, else for a request the
+    // best of Claude's looks, else the objective's best.
+    let fallback = target
+        .as_ref()
+        .and_then(|t| pool.iter().position(|c| c.params == t.params))
+        .or_else(|| {
+            instruction.as_ref()?;
+            pool.iter()
+                .position(|c| c.source == CandidateSource::Claude)
+        })
+        .unwrap_or(0);
     cx.log(format!(
         "Finalists: {}",
         pool.iter()
@@ -332,7 +395,9 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
             }
         }
     }
-    let winner = verdict.as_ref().map_or(0, |v| v.winner.min(pool.len() - 1));
+    let winner = verdict
+        .as_ref()
+        .map_or(fallback, |v| v.winner.min(pool.len() - 1));
 
     // Refine: one tweak of the winner, polished by the search and kept
     // only if it wins a blind A/B in both orders.
@@ -452,6 +517,18 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
         describe(&chosen.params),
         chosen.score.total
     ));
+    let instruction_note = instruction.as_ref().map(|_| {
+        let how = Followed {
+            claude: input.use_claude && claude.is_some(),
+            use_claude: input.use_claude,
+            planned,
+            ranked: verdict.is_some(),
+        };
+        how.note(&routed, &chosen.label)
+    });
+    if let Some(note) = &instruction_note {
+        cx.log(format!("Request: {note}"));
+    }
     let Bench {
         gpu, engine, photo, ..
     } = bench;
@@ -505,6 +582,7 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
         let usage = claude.as_ref().map(Claude::usage).unwrap_or_default();
         JudgeSummary {
             model: input.model.trim().to_owned(),
+            instruction: brief.request.clone(),
             scene: scene.or_else(|| verdict.as_ref().and_then(|v| v.scene.clone())),
             reasons: verdict
                 .as_ref()
@@ -562,7 +640,96 @@ pub(super) async fn run(cx: &RunCx, input: AutoInput) -> Result<AutoOutput> {
         xmp: files.xmp,
         stem,
         timings,
+        instruction,
+        instruction_note,
     })
+}
+
+/// The looks searched before Claude's proposals join them. Without a
+/// request, the built-in four as always. With one, natural as a baseline
+/// beside Claude's looks (and black and white when asked for); when Claude
+/// planned nothing, the looks the request's keywords name, or the built-in
+/// four when none matched.
+fn base_looks(request: bool, routed: &Routed, planned: bool, auto: &Params) -> Vec<LookSpec> {
+    match (request, planned) {
+        (false, _) => LookSpec::builtin(),
+        (true, true) => {
+            let mut looks = vec![LookSpec::natural()];
+            if routed.has(Style::BlackWhite) {
+                looks.push(LookSpec::black_and_white());
+            }
+            looks
+        }
+        (true, false) if routed.found.is_empty() => LookSpec::builtin(),
+        (true, false) => routed.looks(auto),
+    }
+}
+
+/// `target` in `pool`, first when it was not there (ties in Claude's
+/// ranking go to it), keeping the pool within [`MAX_SHOWN`] by dropping its
+/// weakest finalist other than the neutral render.
+fn include_first(pool: &mut Vec<Candidate>, target: &Candidate, neutral: &Params) {
+    if pool.iter().any(|c| c.params == target.params) {
+        return;
+    }
+    pool.insert(0, target.clone());
+    while pool.len() > MAX_SHOWN {
+        match pool.iter().rposition(|c| c.params != *neutral) {
+            Some(i) if i > 0 => {
+                pool.remove(i);
+            }
+            _ => break,
+        }
+    }
+}
+
+/// How a run with a request went, for its note.
+struct Followed {
+    /// Claude was asked for and found.
+    claude: bool,
+    use_claude: bool,
+    /// Claude planned looks for the request.
+    planned: bool,
+    /// Claude ranked the finalists by the request.
+    ranked: bool,
+}
+
+impl Followed {
+    /// What the output says about the request: Claude followed it, or
+    /// (Claude off or failing) only its keywords were read.
+    fn note(&self, routed: &Routed, chosen: &str) -> String {
+        match (self.planned, self.ranked) {
+            (true, true) => {
+                "Claude planned looks for the request and chose the one that fulfils it best."
+                    .to_owned()
+            }
+            (false, true) if routed.found.is_empty() => {
+                "Claude did not plan looks for the request and no keyword in it named a known \
+                 style, so the usual looks were searched; Claude chose the one that fulfils the \
+                 request best."
+                    .to_owned()
+            }
+            (false, true) => format!(
+                "Claude did not plan looks for the request, so its keywords picked the looks \
+                 to search ({}); Claude then chose the one that fulfils the request best.",
+                routed.understood()
+            ),
+            (true, false) => format!(
+                "Claude planned looks for the request but could not rank them, so the \
+                 best-scoring of its looks was chosen: {chosen}."
+            ),
+            (false, false) => {
+                let why = if !self.use_claude {
+                    "Claude was off"
+                } else if !self.claude {
+                    "Claude was not available"
+                } else {
+                    "Claude could not judge the looks"
+                };
+                routed.note(why, Some(chosen))
+            }
+        }
+    }
 }
 
 /// One Claude step: dropped (its CLI processes killed) when the run is
@@ -740,6 +907,131 @@ mod tests {
         assert_eq!(
             compare_note("", &lost),
             "Not kept: it won 1 of 2 blind comparisons with the winner. Something else."
+        );
+    }
+
+    fn ids(looks: &[LookSpec]) -> Vec<String> {
+        looks.iter().map(|l| l.id.clone()).collect()
+    }
+
+    #[test]
+    fn requests_choose_the_looks_to_search() {
+        let auto = Params::neutral(5500.0, 0.0);
+        let none = Routed::default();
+        let builtin = ids(&LookSpec::builtin());
+        // No request: the built-in looks, Claude planning or not.
+        assert_eq!(ids(&base_looks(false, &none, true, &auto)), builtin);
+        assert_eq!(ids(&base_looks(false, &none, false, &auto)), builtin);
+        let bw = LookSpec::black_and_white().id;
+        let gray = route("siyah beyaz, içeriğe göre en iyi siyah beyaz");
+        let punchy = route("high contrast, saturated");
+        // Claude planned for the request: natural as the baseline, plus
+        // black and white when asked for.
+        assert_eq!(
+            ids(&base_looks(true, &gray, true, &auto)),
+            ["natural", bw.as_str()]
+        );
+        assert_eq!(ids(&base_looks(true, &punchy, true, &auto)), ["natural"]);
+        // No plan: the keywords' looks, or the built-in ones without any.
+        assert_eq!(
+            ids(&base_looks(true, &gray, false, &auto)),
+            ["natural", bw.as_str()]
+        );
+        assert_eq!(
+            ids(&base_looks(true, &punchy, false, &auto)),
+            ["natural", "contrast", "vivid", "request"]
+        );
+        let vague = route("güzel olsun");
+        assert_eq!(ids(&base_looks(true, &vague, false, &auto)), builtin);
+    }
+
+    fn candidate(id: &str, exposure: f32) -> Candidate {
+        Candidate {
+            id: id.into(),
+            label: id.into(),
+            source: CandidateSource::Look,
+            params: Params {
+                exposure,
+                ..Params::neutral(5500.0, 0.0)
+            },
+            score: crate::objective::Score {
+                total: 0.0,
+                feasible: true,
+                terms: Vec::new(),
+            },
+            stats: Stats::default(),
+        }
+    }
+
+    #[test]
+    fn the_keywords_look_joins_the_pool_first() {
+        let neutral = candidate("neutral", 0.0);
+        let mut pool: Vec<Candidate> = (1..MAX_SHOWN)
+            .map(|k| candidate(&format!("look:{k}"), k as f32 * 0.1))
+            .chain([neutral.clone()])
+            .collect();
+        let target = candidate("look:bw", 0.05);
+        include_first(&mut pool, &target, &neutral.params);
+        let got: Vec<&str> = pool.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            got,
+            [
+                "look:bw", "look:1", "look:2", "look:3", "look:4", "look:5", "neutral"
+            ]
+        );
+        // Already there: nothing moves.
+        let before: Vec<String> = pool.iter().map(|c| c.id.clone()).collect();
+        include_first(&mut pool, &candidate("look:3", 0.3), &neutral.params);
+        let after: Vec<String> = pool.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn notes_say_how_the_request_was_followed() {
+        let gray = route("siyah beyaz");
+        let off = Followed {
+            claude: false,
+            use_claude: false,
+            planned: false,
+            ranked: false,
+        };
+        assert_eq!(
+            off.note(&gray, "Black and white"),
+            "Claude was off, so only keywords in the request were used: \"siyah beyaz\" as \
+             black and white. Chosen: Black and white."
+        );
+        let missing = Followed {
+            use_claude: true,
+            ..off
+        };
+        assert!(
+            missing
+                .note(&gray, "x")
+                .starts_with("Claude was not available, so only keywords")
+        );
+        let failed = Followed {
+            claude: true,
+            ..missing
+        };
+        assert!(
+            failed
+                .note(&route("hmm"), "Natural")
+                .contains("none matched a known style")
+        );
+        let full = Followed {
+            planned: true,
+            ranked: true,
+            ..failed
+        };
+        assert!(full.note(&gray, "x").starts_with("Claude planned looks"));
+        let unplanned = Followed {
+            planned: false,
+            ..full
+        };
+        assert!(
+            unplanned
+                .note(&gray, "x")
+                .contains("its keywords picked the looks to search (\"siyah beyaz\"")
         );
     }
 

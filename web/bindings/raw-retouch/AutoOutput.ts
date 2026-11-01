@@ -22,4 +22,13 @@ before: ArtifactRef, after: ArtifactRef, jpeg: ArtifactRef | null, tiff: Artifac
 /**
  * Download name stem: the RAW's file name without extension.
  */
-stem: string, timings: Timings, };
+stem: string, timings: Timings, 
+/**
+ * The edit request as used (cleaned); null when there was none.
+ */
+instruction: string | null, 
+/**
+ * How the request was followed: by Claude, or by keywords only when
+ * Claude was off or failed. Null when there was no request.
+ */
+instruction_note: string | null, };
