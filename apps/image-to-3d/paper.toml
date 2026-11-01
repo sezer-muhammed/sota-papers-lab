@@ -1,0 +1,54 @@
+# Claims next to which `spl bench` will put our numbers (Phase 3: the splat
+# optimizer on COLMAP poses). Numbers are as published, on the papers' GPUs;
+# Phase 0 re-measures every baseline on the RTX 4070 SUPER. LPIPS conventions
+# differ (spec-train 7.4): Faster-GS feeds [-1, 1], FastGS/3DGS feed [0, 1].
+
+[paper]
+# Primary reference for the Phase 3 trainer; FastGS claims below cite their own paper.
+title = "Faster-GS"
+authors = []
+venue = "CVPR 2026"
+arxiv = "2602.09999"
+code = "https://github.com/nerficg-project/faster-gaussian-splatting"
+
+[[claimed]]
+dataset = "mipnerf360"
+metric = "psnr"
+value = 27.56
+unit = "dB"
+at = { method = "faster-gs", gpu = "RTX 4090" }
+
+[[claimed]]
+dataset = "mipnerf360"
+metric = "train_time"
+value = 271
+unit = "s"
+at = { method = "faster-gs", gpu = "RTX 4090" }
+
+[[claimed]]
+dataset = "mipnerf360"
+metric = "psnr"
+value = 27.56
+unit = "dB"
+at = { method = "fastgs", gpu = "RTX 4090", paper = "arXiv 2511.04283" }
+
+[[claimed]]
+dataset = "mipnerf360"
+metric = "train_time"
+value = 115.8
+unit = "s"
+at = { method = "fastgs", gpu = "RTX 4090", paper = "arXiv 2511.04283" }
+
+[[claimed]]
+dataset = "mipnerf360"
+metric = "psnr"
+value = 27.93
+unit = "dB"
+at = { method = "fastgs-big", gpu = "RTX 4090", paper = "arXiv 2511.04283" }
+
+[[claimed]]
+dataset = "mipnerf360"
+metric = "train_time"
+value = 214.8
+unit = "s"
+at = { method = "fastgs-big", gpu = "RTX 4090", paper = "arXiv 2511.04283" }
