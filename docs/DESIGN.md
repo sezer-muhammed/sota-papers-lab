@@ -7,7 +7,7 @@ different brand mark.
 ## Principles
 
 - **Neutral first.** Surfaces are grayscale. Color carries meaning only.
-- **One action color.** `--ds-blue-700` for primary buttons, focus rings and the brand mark's top sheet.
+- **One action color.** `--ds-blue-700` for primary buttons, focus rings and the brand mark's top sheet. Inline text links (`text.link`) use the same hue one step darker, `--ds-blue-900`, because blue-700 text at 13px is below AA contrast in both themes.
 - **Status lives in dots.** `StatusSignal` / `Badge` boxes stay neutral; the dot is green (ok), red (failed), amber (warning), blue (running, pulsing), gray (idle).
 - **Mono for machine things.** Geist Mono for uppercase eyebrows, IDs, numbers, metadata. Geist Sans for everything else.
 - **Quiet depth.** 1px hairline borders (`--ds-gray-alpha-400`), `depth-surface` for raised panels, a 72px grid page background.
@@ -34,7 +34,7 @@ different brand mark.
 
 ## Components (`@spl/ui`)
 
-`Button`, `ButtonLink`, `Card` (+ header/title/description/footer), `Surface`, `SectionHeader`, `Badge`, `StatusSignal`, `Gauge`, `BrandLogo`/`BrandMark`, `text` (type scale), `cn`.
+`Button`, `ButtonLink`, `Card` (+ header/title/description/footer), `Surface`, `SectionHeader`, `DataPanel` (titled panel: Surface + SectionHeader + body), `ActionBar` (wrapping row of actions), `Skeleton` (shimmer placeholder), `IconTile` (40px icon or label tile), `Badge`, `StatusSignal`, `Gauge`, `BrandLogo`/`BrandMark`, `text` (type scale), `cn`.
 
 ## Motion
 

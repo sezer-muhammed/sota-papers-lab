@@ -2,20 +2,26 @@ import { useEffect, useState } from "react";
 import { Play } from "lucide-react";
 import type { RunRecord } from "@spl/sdk";
 import { Badge, Button, Card, SectionHeader, Surface, cn, text } from "@spl/ui";
-import { client, errorMessage, useLoad } from "../api";
+import { client, errorMessage, isUnauthorized, useLoad } from "../api";
 import { JsonView } from "../components/json-view";
 import { PageIntro } from "../components/page-intro";
 import { RunStatusSignal, runDuration } from "../components/run-status";
+import { TokenPrompt } from "../components/token-prompt";
 
-export function OpsPage() {
+export function OpsPage({ initialOpId }: { initialOpId?: string }) {
   const ops = useLoad(() => client.ops());
-  const [selectedId, setSelectedId] = useState<string>();
+  const [selectedId, setSelectedId] = useState<string | undefined>(initialOpId);
   const [input, setInput] = useState("{}");
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<RunRecord>();
   const [runError, setRunError] = useState<string>();
 
+  // #/ops/<op> selects that op; an unknown id falls back to the first op.
   const selected = ops.data?.find((op) => op.id === selectedId) ?? ops.data?.[0];
+
+  useEffect(() => {
+    if (initialOpId) setSelectedId(initialOpId);
+  }, [initialOpId]);
 
   useEffect(() => {
     setInput("{}");
@@ -36,13 +42,27 @@ export function OpsPage() {
     }
   }
 
+  const intro = (
+    <PageIntro
+      eyebrow="Ops"
+      title="Run any op"
+      lead="Every app exposes typed ops. Pick one, give it JSON input, and the host records the run, its metrics and the environment it ran in."
+    />
+  );
+
+  // /v1/ops sits behind SPL_AUTH_TOKEN; /v1/health does not.
+  if (isUnauthorized(ops.error)) {
+    return (
+      <div className="space-y-6">
+        {intro}
+        <TokenPrompt />
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
-      <PageIntro
-        eyebrow="Ops"
-        title="Run any op"
-        lead="Every app exposes typed ops. Pick one, give it JSON input, and the host records the run, its metrics and the environment it ran in."
-      />
+      {intro}
       {ops.error ? (
         <Card tone="warning" depth="flat">
           {errorMessage(ops.error)}

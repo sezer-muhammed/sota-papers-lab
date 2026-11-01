@@ -1,6 +1,6 @@
 [package]
 name = "spl-app-device-info"
-description = "Lists CUDA devices; the first check that a machine is ready."
+description = "Lists CUDA devices and runs an end-to-end kernel check; the first thing to run on a new machine."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

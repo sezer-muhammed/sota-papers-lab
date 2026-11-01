@@ -3,12 +3,14 @@ import { KeyRound } from "lucide-react";
 import { Button, Card, CardDescription, CardHeader, CardTitle } from "@spl/ui";
 import { saveToken } from "../api";
 
-export function TokenPrompt() {
+/* `level` is the title's heading level: 2 right under a page's h1, 3 inside a
+   panel that has its own h2. */
+export function TokenPrompt({ level = 2 }: { level?: 2 | 3 }) {
   const [token, setToken] = useState("");
   return (
     <Card depth="deep" density="spacious" className="mx-auto max-w-md">
       <CardHeader>
-        <CardTitle>This host needs a token</CardTitle>
+        <CardTitle as={level === 3 ? "h3" : "h2"}>This host needs a token</CardTitle>
         <CardDescription>
           Paste the value of SPL_AUTH_TOKEN. It is stored in this browser only.
         </CardDescription>
@@ -22,6 +24,7 @@ export function TokenPrompt() {
         }}
       >
         <input
+          id="spl-token-input"
           type="password"
           value={token}
           onChange={(event) => setToken(event.target.value)}

@@ -9,7 +9,8 @@ import type { LucideIcon } from "lucide-react";
 import { cn } from "../lib/cn";
 
 export const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-2 rounded-[7px] border font-medium leading-none outline-none transition-colors focus-visible:shadow-[var(--ds-focus-ring)] disabled:pointer-events-none disabled:opacity-50",
+  // aria-disabled looks like disabled but keeps keyboard focus on the button.
+  "inline-flex shrink-0 items-center justify-center gap-2 rounded-[7px] border font-medium leading-none outline-none transition-colors focus-visible:shadow-[var(--ds-focus-ring)] disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50",
   {
     defaultVariants: {
       size: "md",

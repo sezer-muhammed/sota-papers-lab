@@ -71,16 +71,19 @@ export function CardHeader({
 }
 
 export function CardTitle({
+  as: Heading = "h3",
   children,
   className,
 }: {
+  /** h2 when the card sits directly under the page's h1. */
+  as?: "h2" | "h3";
   children: ReactNode;
   className?: string;
 }) {
   return (
-    <h3 className={cn("text-[17px] font-semibold leading-6", className)}>
+    <Heading className={cn("text-[17px] font-semibold leading-6", className)}>
       {children}
-    </h3>
+    </Heading>
   );
 }
 

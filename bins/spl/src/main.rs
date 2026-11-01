@@ -70,8 +70,8 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&run)?);
         }
         Command::Serve => {
-            if config.auth_token.is_none() && !config.bind.starts_with("127.") {
-                tracing::warn!(bind = %config.bind, "serving without SPL_AUTH_TOKEN on a non-loopback address");
+            if config.auth_token.is_none() && !is_private_bind(&config.bind) {
+                tracing::warn!(bind = %config.bind, "serving without SPL_AUTH_TOKEN on a non-loopback, non-tailnet address");
             }
             let host = Host::open(&config, registry).await?;
             let app = spl_host::router(host, &config);
@@ -84,6 +84,20 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Loopback, or Tailscale's 100.64.0.0/10 range: reachable only from this
+/// machine or from devices on the tailnet.
+fn is_private_bind(bind: &str) -> bool {
+    match bind.parse::<std::net::SocketAddr>() {
+        Ok(std::net::SocketAddr::V4(addr)) => {
+            let ip = addr.ip();
+            let [a, b, ..] = ip.octets();
+            ip.is_loopback() || (a == 100 && (64..128).contains(&b))
+        }
+        Ok(std::net::SocketAddr::V6(addr)) => addr.ip().is_loopback(),
+        Err(_) => false,
+    }
 }
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> std::io::Result<()> {

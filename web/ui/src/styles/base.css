@@ -49,6 +49,11 @@ body {
   position: relative;
 }
 
+/* Phones: the two-row header scrolls away instead of covering content (ATSGrade). */
+@media (max-width: 767px) {
+  .depth-surface.mobile-header-scrolls { position: relative; }
+}
+
 .depth-surface::after {
   pointer-events: none;
   position: absolute;
@@ -161,6 +166,10 @@ body {
   .ds-skeleton::after { display: none; }
   .ds-check { animation: none; stroke-dashoffset: 0; }
   .ds-drawer { animation: none; }
+  /* After the @supports block above, so these win. */
+  html { scroll-behavior: auto; }
+  .reveal,
+  .stagger > * { animation: none; }
 }
 
 .hairline-grid {

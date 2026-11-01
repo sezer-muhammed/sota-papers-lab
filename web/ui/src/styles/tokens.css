@@ -200,6 +200,7 @@
     --ds-amber-100-value: 35, 100%, 8%;
     --ds-amber-400-value: 35, 100%, 17%;
     --ds-amber-900-value: 39, 90%, 50%;
+    --ds-amber-1000-value: 40, 94%, 93%; /* warning Card text; ATSGrade's dark block lacks it */
     --ds-red-100-value: 0, 45%, 10%;
     --ds-red-400-value: 0, 55%, 20%;
     --ds-red-900-value: 358, 90%, 66%;
@@ -253,6 +254,7 @@
     --ds-amber-100-value: 35, 100%, 8%;
     --ds-amber-400-value: 35, 100%, 17%;
     --ds-amber-900-value: 39, 90%, 50%;
+    --ds-amber-1000-value: 40, 94%, 93%; /* warning Card text; ATSGrade's dark block lacks it */
     --ds-red-100-value: 0, 45%, 10%;
     --ds-red-400-value: 0, 55%, 20%;
     --ds-red-900-value: 358, 90%, 66%;

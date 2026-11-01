@@ -35,11 +35,14 @@ export function SectionHeader({
   action,
   eyebrow,
   title,
+  titleId,
   summary,
 }: {
   action?: ReactNode;
   eyebrow?: string;
   title: string;
+  /** id for the h2, so a panel can be aria-labelledby it. */
+  titleId?: string;
   summary?: string;
 }) {
   return (
@@ -50,7 +53,7 @@ export function SectionHeader({
             {eyebrow}
           </p>
         ) : null}
-        <h2 className="text-[22px] font-semibold leading-7 text-[var(--ds-gray-1000)]">
+        <h2 id={titleId} className="text-[22px] font-semibold leading-7 text-[var(--ds-gray-1000)]">
           {title}
         </h2>
         {summary ? (

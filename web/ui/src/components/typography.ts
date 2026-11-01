@@ -21,4 +21,11 @@ export const text = {
   small: "text-[14px] leading-6 text-[var(--ds-gray-900)]",
   /* mono metadata (dates, counters, read time) */
   meta: "font-mono text-[12px] text-[var(--ds-gray-700)]",
+  /* op ids, commands, machine values */
+  mono: "font-mono text-[13px] text-[var(--ds-gray-1000)]",
+  /* op summaries, run errors, footer */
+  caption: "text-[13px] leading-5 text-[var(--ds-gray-900)]",
+  /* inline blue text action (ATSGrade "Open CV library" idiom). blue-900, not
+     700: 700 is 4.4:1 at 13px in both themes, under AA */
+  link: "text-[13px] font-medium text-[var(--ds-blue-900)] underline-offset-2 hover:underline",
 } as const;

@@ -1,8 +1,12 @@
+export { ActionBar } from "./components/action-bar";
 export { Badge } from "./components/badge";
 export { BrandLogo, BrandMark } from "./components/brand-mark";
 export { Button, ButtonLink, buttonVariants } from "./components/button";
 export { Card, CardDescription, CardFooter, CardHeader, CardTitle, cardVariants } from "./components/card";
+export { DataPanel } from "./components/data-panel";
 export { Gauge } from "./components/gauge";
+export { IconTile } from "./components/icon-tile";
+export { Skeleton } from "./components/skeleton";
 export { StatusSignal } from "./components/status-signal";
 export { SectionHeader, Surface } from "./components/surface";
 export { text } from "./components/typography";
