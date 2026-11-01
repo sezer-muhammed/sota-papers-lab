@@ -44,8 +44,7 @@ Controls:
 - `RangeInput`: native range in the system look (`.ds-range`): 4px track, 14px neutral thumb, focus ring on the thumb. The fill starts at `origin` (0 for a bipolar slider); `track` swaps in a token gradient, e.g. white balance blue→amber.
 
 Pages with app-specific views (the Retouch page, `#/retouch`) compose these; photos and other user content may carry their own colours, and labels laid over a photo use a translucent black chip with white text so they read on any image. Its scopes are data, drawn with tokens: histogram channels in the red, green and blue 700 steps, their overlaps in amber, teal and pink 700, all three in gray-700; only the vectorscope's dots take the photo's own hues.
-
-Its Develop panel (Lightroom's Basic, Tone Curve, Color Mixer, Detail, Lens Corrections and Calibration, laid out from the host's `PARAM_SPECS`) shows each section as a disclosure row with a mono summary, remembered per browser. The Color Mixer's and Calibration's slider tracks and band chips are data like the vectorscope: hues computed from Lightroom's band centres, not brand colours. A 6px blue-700 dot marks a value set away from Lightroom's default (as shot for white balance); a gray tick under a track marks the auto edit's value once a slider leaves it.
+Its Develop panels (Basic, Tone Curve, Color Mixer, Detail, Lens Corrections, Calibration) are built from the app's `PARAM_SPECS` table and open and close per browser. A setting the auto edit moved off Lightroom's default carries a neutral gray-1000 dot before its name (not a status colour). White balance and tint tracks use tokens; the Color Mixer chips and tracks and the Calibration primaries show the real hues they act on, like the vectorscope's dots.
 
 ## Motion
 

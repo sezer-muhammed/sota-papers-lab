@@ -1,116 +1,72 @@
 import { Fragment, useId, useState } from "react";
 import type { Params } from "@spl/bindings/raw-retouch/Params";
 import { cn, text } from "@spl/ui";
-import { MixerEditor, MixerTable } from "./develop/color-mixer";
-import type { Region } from "./develop/curve";
-import { BlockTitle, DevelopSection, SetMark } from "./develop/section";
+import { MixerSliders, MixerTable } from "./develop/color-mixer";
+import { AUTO_NOTE, AutoMark, BlockTitle, DevelopSection, MarkLegend, SliderRow, SwitchRow } from "./develop/controls";
 import {
-  DESCRIPTIONS,
-  HAS_MIXER,
   SECTIONS,
-  accessibleName,
-  sectionKeys,
-  shortLabel,
-  trackOf,
-  type Section,
-} from "./develop/sections";
-import { SliderRow, SwitchRow } from "./develop/slider-row";
-import { CURVE_REGION, CurvePreview } from "./develop/tone-curve";
-import {
   TEMPERATURE_SLIDER,
-  awayFromDefault,
-  formatParam,
-  formatSigned,
-  isSwitch,
-  snapParam,
-  specOf,
-  type ParamKey,
-  type ParamSpec,
-} from "./format";
+  countSet,
+  rowsOf,
+  trackOf,
+  type AsShot,
+  type Block,
+  type Section,
+} from "./develop/layout";
+import type { CurveRegion } from "./develop/tone-curve";
+import { CURVE_KEY, ToneCurvePreview } from "./develop/tone-curve-preview";
+import { formatParam, formatSigned, isDefault, paramValue, snapParam, type ParamKey, type ParamSpec } from "./format";
 
-type AsShot = { temperature: number; tint: number };
+const REGION_OF = new Map<ParamKey, CurveRegion>(
+  (Object.entries(CURVE_KEY) as [CurveRegion, ParamKey][]).map(([region, key]) => [key, region]),
+);
 
-/** Why a value is marked, or undefined when it sits at Lightroom's default
-    (white balance: as shot). */
-type Marks = (key: ParamKey, value: number) => string | undefined;
-
-function marksFor(asShot: AsShot | undefined, who: string): Marks {
-  return (key, value) => {
-    if (!awayFromDefault(key, value, asShot)) return undefined;
-    const spec = specOf(key);
-    const reference =
-      spec.neutral != null
-        ? `default ${formatParam(key, spec.neutral)}`
-        : asShot && (key === "temperature" || key === "tint")
-          ? `as shot ${formatParam(key, asShot[key])}`
-          : "default";
-    return `${who} (${reference})`;
-  };
-}
-
-const edited = (params: Params, base: Params, key: ParamKey) => Math.abs(params[key] - base[key]) > 1e-6;
-
-/* Lightroom's Develop panels as numbers, every setting the host has
-   (PARAM_SPECS): Basic, Tone Curve with its curve, the Color Mixer as one
-   grid, Detail, Lens Corrections and Calibration, each collapsible. Values
-   away from Lightroom's default are marked and read at full strength. */
-export function ParamsTable({
-  asShot,
-  caption,
-  params,
-}: {
-  asShot?: AsShot;
-  caption: string;
-  params: Params;
-}) {
-  const marks = marksFor(asShot, "Away from Lightroom's default");
-
+/* Lightroom's Develop panels as numbers, read-only: Basic, Tone Curve,
+   Color Mixer, Detail, Lens Corrections and Calibration, each one opening
+   and closing (kept per browser). Bars from the centre for the bipolar
+   sliders, values off Lightroom's default in full ink with a dot, and the
+   as-shot white balance for reference. */
+export function ParamsTable({ asShot, caption, params }: { asShot?: AsShot; caption: string; params: Params }) {
   return (
     <div>
-      {SECTIONS.map((section) => {
-        const marked = sectionKeys(section).filter((key) => marks(key, params[key])).length;
-        return (
-          <DevelopSection
-            key={section.id}
-            id={section.id}
-            title={section.title}
-            summary={marked ? `${marked} set` : "Default"}
-          >
-            {section.id === "toneCurve" ? <CurvePreview params={params} className="mb-3" /> : null}
-            {section.id === "colorMixer" && HAS_MIXER ? (
-              <MixerTable caption={`${section.title}: ${caption}`} marks={marks} params={params} />
-            ) : (
-              <ValuesTable section={section} caption={caption} marks={marks} params={params} />
-            )}
-            {section.id === "basic" && asShot ? (
-              <p className={cn(text.meta, "mt-3")}>
-                As shot: {Math.round(asShot.temperature)} K, tint {formatSigned(asShot.tint)}
-              </p>
-            ) : null}
-          </DevelopSection>
-        );
-      })}
-      <Legend />
+      {SECTIONS.map((section) => (
+        <DevelopSection key={section.id} section={section} marked={countSet(section, params, asShot)}>
+          {section.id === "colorMixer" ? (
+            <MixerTable params={params} />
+          ) : (
+            <div className="space-y-3">
+              {section.id === "toneCurve" ? <ToneCurvePreview params={params} className="mx-auto max-w-44" /> : null}
+              <ValuesTable section={section} caption={`${section.title}: ${caption}`} params={params} asShot={asShot} />
+            </div>
+          )}
+        </DevelopSection>
+      ))}
+      <div className="mt-3 space-y-1">
+        {asShot ? (
+          <p className={text.meta}>
+            As shot: {Math.round(asShot.temperature)} K, tint {formatSigned(asShot.tint)}
+          </p>
+        ) : null}
+        <MarkLegend />
+      </div>
     </div>
   );
 }
 
 function ValuesTable({
+  asShot,
   caption,
-  marks,
   params,
   section,
 }: {
+  asShot?: AsShot;
   caption: string;
-  marks: Marks;
   params: Params;
   section: Section;
 }) {
   return (
     <table className="w-full border-collapse">
-      <caption className="sr-only">
-        {section.title}: {caption}
-      </caption>
+      <caption className="sr-only">{caption}</caption>
       <tbody>
         {section.blocks.map((block, index) => (
           <Fragment key={block.title ?? index}>
@@ -125,9 +81,34 @@ function ValuesTable({
                 </th>
               </tr>
             ) : null}
-            {block.keys.map((key) => (
-              <ValueRow key={key} spec={specOf(key)} value={params[key]} mark={marks(key, params[key])} />
-            ))}
+            {block.rows.map(({ label, spec }) => {
+              const value = paramValue(params, spec.key);
+              const set = !isDefault(spec, value, asShot);
+              return (
+                <tr key={spec.key} className="h-7">
+                  <th scope="row" className="w-28 text-left text-[13px] font-normal text-[var(--ds-gray-900)]">
+                    <span className="flex items-center gap-1.5">
+                      <AutoMark on={set} />
+                      <span className="truncate" title={spec.label}>
+                        {label}
+                      </span>
+                    </span>
+                    {set ? <span className="sr-only">, {AUTO_NOTE}</span> : null}
+                  </th>
+                  <td className="px-3">
+                    <ValueBar spec={spec} value={value} />
+                  </td>
+                  <td
+                    className={cn(
+                      "w-16 whitespace-nowrap text-right font-mono text-[13px] tabular-nums",
+                      set ? "text-[var(--ds-gray-1000)]" : "text-[var(--ds-gray-700)]",
+                    )}
+                  >
+                    {formatParam(spec.key, value)}
+                  </td>
+                </tr>
+              );
+            })}
           </Fragment>
         ))}
       </tbody>
@@ -135,190 +116,181 @@ function ValuesTable({
   );
 }
 
-function ValueRow({ mark, spec, value }: { mark?: string; spec: ParamSpec; value: number }) {
-  const onOff = isSwitch(spec);
-  return (
-    <tr className="h-7">
-      <th
-        scope="row"
-        colSpan={onOff ? 2 : 1}
-        className={cn("text-left text-[13px] font-normal text-[var(--ds-gray-900)]", !onOff && "w-28")}
-      >
-        <span className="inline-flex items-center gap-1.5">
-          {shortLabel(spec.key, spec.label)}
-          {mark ? <SetMark title={mark} /> : null}
-        </span>
-      </th>
-      {onOff ? null : (
-        <td className="px-3">
-          <ValueBar spec={spec} value={value} />
-        </td>
-      )}
-      <td
-        className={cn(
-          "w-20 whitespace-nowrap text-right font-mono text-[13px] tabular-nums",
-          mark ? "font-medium text-[var(--ds-gray-1000)]" : "text-[var(--ds-gray-700)]",
-        )}
-      >
-        {formatParam(spec.key, value)}
-      </td>
-    </tr>
-  );
-}
-
 /* Bipolar sliders: a bar from the centre, as wide as the value's share of
-   the range. Others (Detail): a bar from the left. Temperature has no
-   centre: a mark on the white-balance scale. */
+   the range. One-sided ones (Detail) fill from the left; temperature, which
+   has no centre, is a mark on its scale; switches have no bar. The colour
+   sliders' bars run over their tinted scale. */
 function ValueBar({ spec, value }: { spec: ParamSpec; value: number }) {
-  if (spec.key === "temperature") {
-    const { max, min } = TEMPERATURE_SLIDER;
-    const share = Math.min(1, Math.max(0, (value - min) / (max - min)));
+  if (spec.group === "Lens") return null;
+  // Temperature on its slider's scale, where photos live.
+  const range = spec.key === "temperature" ? TEMPERATURE_SLIDER : spec;
+  const share = (value - range.min) / (range.max - range.min || 1);
+  const track = trackOf(spec.key);
+  if (track) return <ScaleMark track={track} at={Math.min(1, Math.max(0, share))} />;
+  if (spec.min >= 0) {
     return (
-      <span aria-hidden="true" className="relative block h-1.5 rounded-full" style={{ background: trackOf("temperature") }}>
+      <span aria-hidden="true" className="relative block h-1.5 rounded-full bg-[var(--ds-gray-alpha-200)]">
         <span
-          className="absolute -top-[3px] h-3 w-1 -translate-x-1/2 rounded-full border border-[var(--ds-gray-alpha-600)] bg-[var(--ds-background-100)]"
-          style={{ left: `${share * 100}%` }}
+          className="absolute inset-y-0 left-0 rounded-full bg-[var(--ds-gray-900)]"
+          style={{ width: `${Math.min(1, Math.max(0, share)) * 100}%` }}
         />
       </span>
     );
   }
-  const bipolar = spec.min < 0;
-  const span = bipolar ? Math.max(-spec.min, spec.max) : spec.max - spec.min;
-  const share = Math.max(-1, Math.min(1, (bipolar ? value : value - spec.min) / (span || 1)));
+  const half = Math.max(-1, Math.min(1, value / spec.max));
   return (
     <span aria-hidden="true" className="relative block h-1.5 rounded-full bg-[var(--ds-gray-alpha-200)]">
-      {bipolar ? <span className="absolute inset-y-0 left-1/2 w-px bg-[var(--ds-gray-alpha-500)]" /> : null}
+      <span className="absolute inset-y-0 left-1/2 w-px bg-[var(--ds-gray-alpha-500)]" />
       <span
         className="absolute inset-y-0 rounded-full bg-[var(--ds-gray-900)]"
-        style={
-          !bipolar
-            ? { left: 0, width: `${share * 100}%` }
-            : share >= 0
-              ? { left: "50%", width: `${share * 50}%` }
-              : { right: "50%", width: `${-share * 50}%` }
-        }
+        style={half >= 0 ? { left: "50%", width: `${half * 50}%` } : { right: "50%", width: `${-half * 50}%` }}
       />
     </span>
   );
 }
 
-/* Every setting, live, in the same sections. Double-click a name (or press
-   Delete on its slider) to put it back to `base`, the auto edit; a section
-   with changes has its own Reset. Values the auto edit set away from
-   Lightroom's default carry the mark. */
+function ScaleMark({ at, track }: { at: number; track: string }) {
+  return (
+    <span aria-hidden="true" className="relative block h-1.5 rounded-full" style={{ background: track }}>
+      <span
+        className="absolute -top-[3px] h-3 w-1 -translate-x-1/2 rounded-full border border-[var(--ds-gray-alpha-600)] bg-[var(--ds-background-100)]"
+        style={{ left: `${at * 100}%` }}
+      />
+    </span>
+  );
+}
+
+/* Every panel, live, starting from `base` (the auto edit, or as shot before
+   one exists). Each change snaps to Lightroom's step and goes to `onChange`,
+   which renders the preview once the sliders rest. */
 export function AdjustSliders({
   asShot,
   base,
+  baseName = "auto value",
   disabled = false,
   onChange,
   params,
 }: {
   asShot?: AsShot;
   base: Params;
+  /** What a reset returns to, in the hints: "auto value", "as-shot value". */
+  baseName?: string;
   disabled?: boolean;
   onChange: (params: Params) => void;
   params: Params;
 }) {
-  const prefix = useId();
-  // The tone-curve region in use: the hovered slider's, else the focused one's.
-  const [hovered, setHovered] = useState<Region>();
-  const [focused, setFocused] = useState<Region>();
-  const marks = marksFor(asShot, "Set by the auto edit");
-
+  const [region, setRegion] = useState<CurveRegion>();
   const set = (key: ParamKey, value: number) => {
     const next = snapParam(key, value);
-    if (next !== params[key]) onChange({ ...params, [key]: next });
+    if (next !== paramValue(params, key)) onChange({ ...params, [key]: next });
   };
-
-  const row = (key: ParamKey) => {
-    const spec = specOf(key);
-    const props = {
-      spec,
-      label: shortLabel(key, spec.label),
-      name: accessibleName(key, spec.label),
-      value: params[key],
-      base: base[key],
-      marked: marks(key, base[key]),
-      disabled,
-      onChange: (value: number) => set(key, value),
-    };
-    if (isSwitch(spec)) return <SwitchRow key={key} {...props} description={DESCRIPTIONS[key]} />;
-    const region = CURVE_REGION[key];
-    const track = (set: typeof setHovered) => (on: boolean) =>
-      set((current) => (on ? region : current === region ? undefined : current));
-    return (
-      <SliderRow
-        key={key}
-        {...props}
-        onHover={region ? track(setHovered) : undefined}
-        onFocusChange={region ? track(setFocused) : undefined}
-      />
-    );
-  };
+  const marked = (spec: ParamSpec) => !isDefault(spec, paramValue(base, spec.key), asShot);
 
   return (
     <div>
       {SECTIONS.map((section) => {
-        const keys = sectionKeys(section);
-        const marked = keys.filter((key) => marks(key, base[key])).length;
-        const changes = keys.filter((key) => edited(params, base, key));
-        const summary = [marked ? `${marked} set` : "Default", changes.length ? `${changes.length} edited` : undefined]
-          .filter(Boolean)
-          .join(" · ");
+        const changed = rowsOf(section).filter(
+          ({ spec }) => Math.abs(paramValue(params, spec.key) - paramValue(base, spec.key)) > 1e-6,
+        );
         const reset = () => {
           const next = { ...params };
-          for (const key of changes) next[key] = base[key];
+          for (const { spec } of changed) next[spec.key] = paramValue(base, spec.key);
           onChange(next);
         };
         return (
           <DevelopSection
             key={section.id}
-            id={section.id}
-            title={section.title}
-            summary={summary}
-            onReset={changes.length && !disabled ? reset : undefined}
+            section={section}
+            marked={countSet(section, base, asShot)}
+            edited={changed.length}
+            onReset={disabled ? undefined : reset}
           >
-            {section.id === "toneCurve" ? (
-              <CurvePreview params={params} base={base} active={hovered ?? focused} className="mb-3" />
-            ) : null}
-            {section.id === "colorMixer" && HAS_MIXER ? (
-              <MixerEditor base={base} params={params} marks={marks} disabled={disabled} onSet={set} />
+            {section.id === "colorMixer" ? (
+              <MixerSliders params={params} base={base} baseName={baseName} disabled={disabled} onSet={set} />
             ) : (
               <div className="space-y-4">
-                {section.blocks.map((block, index) => {
-                  const titleId = `${prefix}-${section.id}-${index}`;
-                  return (
-                    <div
-                      key={block.title ?? index}
-                      role="group"
-                      aria-labelledby={block.title ? titleId : undefined}
-                      className="space-y-2"
-                    >
-                      {block.title ? <BlockTitle id={titleId}>{block.title}</BlockTitle> : null}
-                      {block.keys.map(row)}
-                    </div>
-                  );
-                })}
+                {section.id === "toneCurve" ? (
+                  <ToneCurvePreview params={params} base={base} active={region} className="mx-auto max-w-44" />
+                ) : null}
+                {section.blocks.map((block, index) => (
+                  <BlockSliders
+                    key={block.title ?? index}
+                    block={block}
+                    params={params}
+                    base={base}
+                    baseName={baseName}
+                    disabled={disabled}
+                    marked={marked}
+                    onSet={set}
+                    onRegion={section.id === "toneCurve" ? setRegion : undefined}
+                  />
+                ))}
               </div>
             )}
           </DevelopSection>
         );
       })}
-      <Legend adjust />
+      <div className="mt-3">
+        <MarkLegend>
+          Bold: changed by you. Double-click a name, or press Delete on a slider, to reset it to the {baseName}.
+        </MarkLegend>
+      </div>
     </div>
   );
 }
 
-function Legend({ adjust = false }: { adjust?: boolean }) {
+function BlockSliders({
+  base,
+  baseName,
+  block,
+  disabled,
+  marked,
+  onRegion,
+  onSet,
+  params,
+}: {
+  base: Params;
+  baseName: string;
+  block: Block;
+  disabled: boolean;
+  marked: (spec: ParamSpec) => boolean;
+  onRegion?: (region: CurveRegion | undefined) => void;
+  onSet: (key: ParamKey, value: number) => void;
+  params: Params;
+}) {
+  const titleId = useId();
   return (
-    <div className={cn(text.meta, "mt-1 space-y-1 border-t border-[var(--ds-gray-alpha-400)] pt-3")}>
-      <p className="flex items-baseline gap-1.5">
-        <span aria-hidden="true" className="inline-block h-1.5 w-1.5 shrink-0 translate-y-[-1px] rounded-full bg-[var(--ds-blue-700)]" />
-        <span>
-          {adjust ? "Set by the auto edit" : "Away from Lightroom's default"} (white balance: away from as shot).
-        </span>
-      </p>
-      {adjust ? <p>Double-click a name, or press Delete on its slider, to go back to the auto value.</p> : null}
+    <div role="group" aria-labelledby={block.title ? titleId : undefined} className="space-y-2.5">
+      {block.title ? <BlockTitle id={titleId}>{block.title}</BlockTitle> : null}
+      {block.rows.map((row) => {
+        const { key } = row.spec;
+        if (row.spec.group === "Lens") {
+          return (
+            <SwitchRow
+              key={key}
+              row={row}
+              value={paramValue(params, key)}
+              marked={marked(row.spec)}
+              disabled={disabled}
+              onChange={(value) => onSet(key, value)}
+            />
+          );
+        }
+        const region = REGION_OF.get(key);
+        return (
+          <SliderRow
+            key={key}
+            row={row}
+            value={paramValue(params, key)}
+            base={paramValue(base, key)}
+            baseName={baseName}
+            marked={marked(row.spec)}
+            disabled={disabled}
+            onChange={(value) => onSet(key, value)}
+            onActive={onRegion && region ? (active) => onRegion(active ? region : undefined) : undefined}
+          />
+        );
+      })}
     </div>
   );
 }

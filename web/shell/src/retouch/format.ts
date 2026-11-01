@@ -1,92 +1,75 @@
-import type { ParamSpec as SpecRow } from "@spl/bindings/raw-retouch/ParamSpec";
 import type { Params } from "@spl/bindings/raw-retouch/Params";
+import type { ParamSpec as BoundSpec } from "@spl/bindings/raw-retouch/ParamSpec";
 import { PARAM_SPECS } from "@spl/bindings/raw-retouch/paramSpecs";
 import type { RawInfo } from "@spl/bindings/raw-retouch/RawInfo";
 
 export type ParamKey = keyof Params;
 
-/** One Params field as the host's PARAM_SPECS (apps/raw-retouch/src/types.rs)
-    describes it: Lightroom's label, XMP name, panel, range, step, default. */
-export type ParamSpec = Omit<SpecRow, "key"> & { key: ParamKey };
+/** One Lightroom setting as the app's PARAM_SPECS table describes it: label,
+    XMP name, panel, legal range and step, and Lightroom's default. */
+export type ParamSpec = Omit<BoundSpec, "key"> & { key: ParamKey };
 
-/** Every Params field, in the host's order. */
+/** Every setting, in Params order (generated from the Rust table). */
 export const SPECS = PARAM_SPECS as ParamSpec[];
+
+const SPEC_OF = new Map(SPECS.map((spec) => [spec.key, spec]));
+
+export function specOf(key: ParamKey): ParamSpec {
+  return SPEC_OF.get(key)!;
+}
 
 export const PARAM_KEYS: ParamKey[] = SPECS.map((spec) => spec.key);
 
-/** The Basic panel: the fields every run has carried. Runs recorded before
-    the other fields existed lack them (see completeParams). */
+/** The Basic panel, which every host's Params carries. The other settings
+    are missing from runs recorded before they existed and read as
+    Lightroom's defaults (`paramValue`, `completeParams`), as on the host. */
 export const BASIC_KEYS: ParamKey[] = SPECS.filter((spec) => spec.group === "Basic").map((spec) => spec.key);
 
-const BY_KEY = new Map(SPECS.map((spec) => [spec.key, spec]));
-
-export function specOf(key: ParamKey): ParamSpec {
-  const spec = BY_KEY.get(key);
-  if (!spec) throw new Error(`No ParamSpec for ${key}`);
-  return spec;
-}
-
-/** Lightroom's whole temperature range, which the kelvin field takes. */
+/** Lightroom's whole temperature range, for the typed kelvin field. */
 export const TEMPERATURE_RANGE = { min: specOf("temperature").min, max: specOf("temperature").max } as const;
 
-/** The temperature slider spans 2000 to 12000 K, where photos live. */
-export const TEMPERATURE_SLIDER = { min: 2000, max: 12000, step: 50 } as const;
-
-/** An on/off setting (Lens Corrections), stored as 0 or 1 like Lightroom. */
-export const isSwitch = (spec: ParamSpec) => spec.min === 0 && spec.max === 1 && spec.step === 1;
-
-/** Decimals the step shows: 2 for exposure, 1 for the sharpening radius. */
-export const decimalsOf = (spec: ParamSpec) => (spec.step >= 1 ? 0 : Math.round(-Math.log10(spec.step)));
-
-/** A field's value, or Lightroom's default where an older run lacks it. */
-function valueOf(params: Params, spec: ParamSpec): number {
-  const value = (params as Record<string, unknown>)[spec.key];
-  return typeof value === "number" && Number.isFinite(value) ? value : (spec.neutral ?? 0);
+/** `key` of `params`, or Lightroom's default when an older run lacks it. */
+export function paramValue(params: Params, key: ParamKey): number {
+  const value: unknown = params[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : (specOf(key).neutral ?? 0);
 }
 
-/** `params` with every field: those a run recorded before they existed take
-    Lightroom's defaults, as the host's serde defaults do. Complete input
-    comes back as is. */
+/** `params` with every setting present (older runs carry only the Basic panel). */
 export function completeParams(params: Params): Params {
-  const raw = params as Record<string, unknown>;
-  const missing = SPECS.filter((spec) => {
-    const value = raw[spec.key];
-    return typeof value !== "number" || !Number.isFinite(value);
-  });
-  if (missing.length === 0) return params;
-  const out: Record<string, unknown> = { ...raw };
-  for (const spec of missing) out[spec.key] = spec.neutral ?? 0;
-  return out as Params;
+  if (PARAM_KEYS.every((key) => typeof params[key] === "number")) return params;
+  const out = { ...params };
+  for (const key of PARAM_KEYS) out[key] = paramValue(params, key);
+  return out;
 }
 
 export function sameParams(a: Params | undefined, b: Params | undefined): boolean {
   if (!a || !b) return false;
-  return SPECS.every((spec) => Math.abs(valueOf(a, spec) - valueOf(b, spec)) < 1e-6);
+  return PARAM_KEYS.every((key) => Math.abs(paramValue(a, key) - paramValue(b, key)) < 1e-6);
 }
 
-/** Clamped to the field's legal range and rounded to its step, the way
-    Lightroom stores it (whole kelvin, 0.01 EV, 0.1 px, whole units): the
-    host's `ParamSpec::quantize`. */
+/** Decimal places of a step: 0.01 → 2, 0.1 → 1, 1 → 0. */
+export function stepDecimals(step: number): number {
+  return step < 1 ? Math.ceil(-Math.log10(step) - 1e-9) : 0;
+}
+
+/** Clamped to the setting's legal range and rounded to its step, the way
+    Lightroom stores it (whole kelvin, 0.01 EV, 0.1 px, whole units). */
 export function snapParam(key: ParamKey, value: number): number {
   const spec = specOf(key);
   const clamped = Math.min(spec.max, Math.max(spec.min, value));
-  if (spec.step >= 1) return Math.round(clamped);
-  const per = Math.round(1 / spec.step);
-  return Math.round(clamped * per) / per;
+  const factor = 10 ** stepDecimals(spec.step);
+  return Math.round(clamped * factor) / factor;
 }
 
-/** Whether `value` is away from Lightroom's default: the spec's, or for white
-    balance (whose default is as shot) the photo's as-shot value. False when
-    there is nothing to compare with. */
-export function awayFromDefault(
-  key: ParamKey,
-  value: number,
-  asShot?: { temperature: number; tint: number },
-): boolean {
-  const spec = specOf(key);
-  const reference = spec.neutral ?? (key === "temperature" || key === "tint" ? asShot?.[key] : undefined);
-  if (reference == null || !Number.isFinite(reference) || !Number.isFinite(value)) return false;
-  return Math.abs(snapParam(key, value) - snapParam(key, reference)) > 1e-6;
+/** Whether `value` is the setting's default: Lightroom's own, or for white
+    balance (whose default is as shot) `asShot` when it is known. */
+export function isDefault(spec: ParamSpec, value: number, asShot?: { temperature: number; tint: number }): boolean {
+  let neutral = spec.neutral;
+  if (neutral === null) {
+    if (!asShot || (spec.key !== "temperature" && spec.key !== "tint")) return true;
+    neutral = asShot[spec.key];
+  }
+  return snapParam(spec.key, value) === snapParam(spec.key, neutral);
 }
 
 /** "+12", "-8", "0" (never "-0"); `decimals` fixed, so "+0.35" and "0.00". */
@@ -97,15 +80,14 @@ export function formatSigned(value: number, decimals = 0): string {
   return `${rounded > 0 ? "+" : "-"}${Math.abs(rounded).toFixed(decimals)}`;
 }
 
-/** A value as Lightroom shows it, with the unit where one helps: "5200 K",
-    "+0.35 EV", "+12", "40", "1.0", "On". */
+/** A setting as Lightroom shows it: signed for the bipolar sliders, with the
+    unit where one helps, On/Off for the lens switches. */
 export function formatParam(key: ParamKey, value: number): string {
-  if (key === "temperature") return `${Math.round(value)} K`;
   const spec = specOf(key);
-  if (isSwitch(spec)) return value >= 0.5 ? "On" : "Off";
-  const decimals = decimalsOf(spec);
-  const factor = 10 ** decimals;
-  const shown = spec.min < 0 ? formatSigned(value, decimals) : (Math.round(value * factor) / factor).toFixed(decimals);
+  if (key === "temperature") return `${Math.round(value)} K`;
+  if (spec.group === "Lens") return value >= 0.5 ? "On" : "Off";
+  const decimals = stepDecimals(spec.step);
+  const shown = spec.min < 0 ? formatSigned(value, decimals) : (Math.round(value * 10 ** decimals) / 10 ** decimals).toFixed(decimals);
   return key === "exposure" ? `${shown} EV` : shown;
 }
 

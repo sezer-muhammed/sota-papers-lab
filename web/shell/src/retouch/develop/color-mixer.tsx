@@ -1,82 +1,83 @@
 import { useId } from "react";
 import type { Params } from "@spl/bindings/raw-retouch/Params";
 import { SegmentedControl, cn, text } from "@spl/ui";
-import { formatParam, specOf, type ParamKey } from "../format";
-import { updatePrefs, useDevelopPrefs } from "./prefs";
-import { BlockTitle, SetMark } from "./section";
-import { MIXER_BANDS, MIXER_KINDS, bandColor, mixerKey, type MixerBand } from "./sections";
-import { SliderRow } from "./slider-row";
+import { formatParam, isDefault, paramValue, specOf, type ParamKey } from "../format";
+import type { HueBand } from "../scopes/compute";
+import { AUTO_NOTE, AutoMark, SliderRow } from "./controls";
+import { BANDS, MIXER_PROPERTIES, bandColor, mixerKey, rowOf, type Band } from "./layout";
+import { setDevelopPrefs, useDevelopPrefs, type MixerMode } from "./prefs";
 
-type Marks = (key: ParamKey, value: number) => string | undefined;
+const MODES: { value: MixerMode; label: string }[] = [
+  { value: "hsl", label: "HSL" },
+  { value: "color", label: "Color" },
+];
 
-/* Lightroom's Color Mixer, editable. HSL: one property (hue, saturation or
-   luminance) for all eight bands. Color: pick a band by its chip, then its
-   three sliders. Tracks are tinted by band; the view is kept per browser. */
-export function MixerEditor({
+const bandSet = (params: Params, band: HueBand) =>
+  MIXER_PROPERTIES.some((p) => {
+    const key = mixerKey(p.value, band);
+    return !isDefault(specOf(key), paramValue(params, key));
+  });
+
+/* Lightroom's Color Mixer, live. HSL: one property (Hue, Saturation or
+   Luminance) across the eight bands. Color: pick a band's chip, then its
+   three sliders. Tracks show what each slider does to its band. */
+export function MixerSliders({
   base,
+  baseName,
   disabled,
-  marks,
   onSet,
   params,
 }: {
   base: Params;
+  baseName: string;
   disabled?: boolean;
-  marks: Marks;
   onSet: (key: ParamKey, value: number) => void;
   params: Params;
 }) {
   const prefs = useDevelopPrefs();
-  const bandTitle = useId();
-  const row = (key: ParamKey, label: string) => (
+  const slider = (key: ParamKey, label: string) => (
     <SliderRow
       key={key}
-      spec={specOf(key)}
-      label={label}
-      value={params[key]}
-      base={base[key]}
-      marked={marks(key, base[key])}
+      row={rowOf(specOf(key), label)}
+      value={paramValue(params, key)}
+      base={paramValue(base, key)}
+      baseName={baseName}
+      marked={!isDefault(specOf(key), paramValue(base, key))}
       disabled={disabled}
       onChange={(value) => onSet(key, value)}
     />
   );
-  const band = MIXER_BANDS.find((b) => b.band === prefs.band) ?? MIXER_BANDS[0];
 
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className={text.eyebrowSm}>Adjust</span>
         <SegmentedControl
-          label="Color Mixer view"
+          label="Color Mixer adjusts"
           value={prefs.mixer}
-          options={[
-            { value: "hsl", label: "HSL" },
-            { value: "color", label: "Color" },
-          ]}
-          onChange={(mixer) => updatePrefs({ mixer })}
+          options={MODES}
+          onChange={(mixer) => setDevelopPrefs((p) => ({ ...p, mixer }))}
         />
-        {prefs.mixer === "hsl" ? (
-          <SegmentedControl
-            label="Property"
-            value={prefs.kind}
-            options={MIXER_KINDS.map((k) => ({ value: k.kind, label: k.label }))}
-            onChange={(kind) => updatePrefs({ kind })}
-          />
-        ) : null}
       </div>
       {prefs.mixer === "hsl" ? (
-        <div role="group" aria-label={`${MIXER_KINDS.find((k) => k.kind === prefs.kind)?.label} by band`} className="space-y-2">
-          {MIXER_BANDS.map((b) => row(mixerKey(prefs.kind, b.band), b.label))}
-        </div>
+        <>
+          <SegmentedControl
+            label="Property"
+            value={prefs.property}
+            options={MIXER_PROPERTIES}
+            onChange={(property) => setDevelopPrefs((p) => ({ ...p, property }))}
+          />
+          <div className="space-y-2.5">{BANDS.map((band) => slider(mixerKey(prefs.property, band.name), band.label))}</div>
+        </>
       ) : (
         <>
-          <BandPicker
-            value={band.band}
-            onChange={(next) => updatePrefs({ band: next })}
-            marked={(b) => MIXER_KINDS.some(({ kind }) => marks(mixerKey(kind, b), base[mixerKey(kind, b)]))}
-            edited={(b) => MIXER_KINDS.some(({ kind }) => Math.abs(params[mixerKey(kind, b)] - base[mixerKey(kind, b)]) > 1e-6)}
+          <BandChips
+            value={prefs.band}
+            marked={(band) => bandSet(base, band.name)}
+            onChange={(band) => setDevelopPrefs((p) => ({ ...p, band }))}
           />
-          <div role="group" aria-labelledby={bandTitle} className="space-y-2">
-            <BlockTitle id={bandTitle}>{band.label}</BlockTitle>
-            {MIXER_KINDS.map((k) => row(mixerKey(k.kind, band.band), k.label))}
+          <div className="space-y-2.5">
+            {MIXER_PROPERTIES.map((p) => slider(mixerKey(p.value, prefs.band), p.label))}
           </div>
         </>
       )}
@@ -84,114 +85,112 @@ export function MixerEditor({
   );
 }
 
-/* Eight colour chips as a radio group (native radios, so arrow keys move
-   between bands). A ring marks the selected band, a dot one the auto edit
-   changed, and a band you changed has a dark rim. */
-function BandPicker({
-  edited,
+/* The eight bands as colour chips: a radio group (arrow keys move between
+   them). A dot on a chip marks a band the auto edit changed. */
+function BandChips({
   marked,
   onChange,
   value,
 }: {
-  edited: (band: MixerBand) => boolean;
-  marked: (band: MixerBand) => boolean;
-  onChange: (band: MixerBand) => void;
-  value: MixerBand;
+  marked: (band: Band) => boolean;
+  onChange: (band: HueBand) => void;
+  value: HueBand;
 }) {
   const name = useId();
+  const current = BANDS.find((b) => b.name === value);
   return (
-    <div role="radiogroup" aria-label="Band" className="grid grid-cols-8 gap-1">
-      {MIXER_BANDS.map((b) => {
-        const auto = marked(b.band);
-        const mine = edited(b.band);
-        return (
-          <label key={b.band} className="relative flex cursor-pointer justify-center py-1" title={b.label}>
-            <input
-              type="radio"
-              name={name}
-              value={b.band}
-              checked={value === b.band}
-              onChange={() => onChange(b.band)}
-              className="peer sr-only"
-            />
-            <span
-              aria-hidden="true"
-              className={cn(
-                "h-7 w-7 rounded-full border transition-shadow motion-reduce:transition-none",
-                "peer-checked:shadow-[0_0_0_2px_var(--ds-background-100),0_0_0_4px_var(--ds-gray-1000)] peer-focus-visible:shadow-[var(--ds-focus-ring)]",
-                mine ? "border-2 border-[var(--ds-gray-1000)]" : "border-[var(--ds-gray-alpha-400)]",
-              )}
-              style={{ background: bandColor(b.hue) }}
-            />
-            {auto ? (
+    <div className="space-y-1.5">
+      <div role="radiogroup" aria-label="Color" className="flex flex-wrap gap-2">
+        {BANDS.map((band) => {
+          const set = marked(band);
+          return (
+            <label key={band.name} className="relative flex" title={band.label}>
+              <input
+                type="radio"
+                name={name}
+                value={band.name}
+                checked={band.name === value}
+                onChange={() => onChange(band.name)}
+                className="peer sr-only"
+              />
               <span
                 aria-hidden="true"
-                className="absolute left-1/2 top-0 ml-2.5 h-2 w-2 rounded-full border border-[var(--ds-background-100)] bg-[var(--ds-blue-700)]"
+                className={cn(
+                  "block size-7 cursor-pointer rounded-full border border-[var(--ds-gray-alpha-500)] transition-shadow",
+                  "peer-checked:shadow-[0_0_0_2px_var(--ds-background-100),0_0_0_4px_var(--ds-gray-1000)]",
+                  "peer-focus-visible:shadow-[var(--ds-focus-ring)]",
+                )}
+                style={{ background: bandColor(band.hue) }}
               />
-            ) : null}
-            <span className="sr-only">
-              {b.label}
-              {auto ? ", set by the auto edit" : ""}
-              {mine ? ", changed" : ""}
-            </span>
-          </label>
-        );
-      })}
+              {set ? (
+                <span
+                  aria-hidden="true"
+                  className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-[var(--ds-background-100)] bg-[var(--ds-gray-1000)]"
+                />
+              ) : null}
+              <span className="sr-only">
+                {band.label}
+                {set ? `, ${AUTO_NOTE}` : ""}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+      <p className={text.meta}>{current?.label}</p>
     </div>
   );
 }
 
-/* The Color Mixer read-only: hue, saturation and luminance for all eight
-   bands at once. Values away from the default read at full strength. */
-export function MixerTable({ caption, marks, params }: { caption: string; marks: Marks; params: Params }) {
+/* The Color Mixer read-only: the eight bands down, hue, saturation and
+   luminance across, values off the default in full ink and marked. */
+export function MixerTable({ params }: { params: Params }) {
   return (
-    <table className="w-full table-fixed border-collapse">
-      <caption className="sr-only">{caption}</caption>
+    <table className="w-full border-collapse">
+      <caption className="sr-only">Color Mixer</caption>
       <thead>
         <tr>
-          <td className="w-9" />
-          {MIXER_BANDS.map((b) => {
-            const auto = MIXER_KINDS.some(({ kind }) => marks(mixerKey(kind, b.band), params[mixerKey(kind, b.band)]));
-            return (
-              <th key={b.band} scope="col" className="pb-1.5 font-normal" title={b.label}>
-                <span className="relative mx-auto block h-4 w-4">
-                  <span
-                    aria-hidden="true"
-                    className="block h-4 w-4 rounded-full border border-[var(--ds-gray-alpha-400)]"
-                    style={{ background: bandColor(b.hue) }}
-                  />
-                  {auto ? (
-                    <span className="absolute -right-1 -top-1">
-                      <SetMark title={`${b.label}: set by the auto edit`} />
-                    </span>
-                  ) : null}
-                </span>
-                <span className="sr-only">{b.label}</span>
-              </th>
-            );
-          })}
+          <th scope="col" className={cn(text.eyebrowSm, "pb-1 text-left font-normal")}>
+            Band
+          </th>
+          {MIXER_PROPERTIES.map((p) => (
+            <th key={p.value} scope="col" className={cn(text.eyebrowSm, "pb-1 text-right font-normal")}>
+              <abbr title={p.label} className="no-underline">
+                {p.label.slice(0, 3)}
+              </abbr>
+            </th>
+          ))}
         </tr>
       </thead>
       <tbody>
-        {MIXER_KINDS.map((k) => (
-          <tr key={k.kind} className="h-7">
-            <th scope="row" className={cn(text.eyebrowSm, "text-left font-normal")}>
-              <abbr title={k.label} className="no-underline">
-                {k.short}
-              </abbr>
+        {BANDS.map((band) => (
+          <tr key={band.name} className="h-7">
+            <th scope="row" className="text-left text-[13px] font-normal text-[var(--ds-gray-900)]">
+              <span className="inline-flex items-center gap-2">
+                <span
+                  aria-hidden="true"
+                  className="size-3 shrink-0 rounded-full border border-[var(--ds-gray-alpha-500)]"
+                  style={{ background: bandColor(band.hue) }}
+                />
+                {band.label}
+              </span>
             </th>
-            {MIXER_BANDS.map((b) => {
-              const key = mixerKey(k.kind, b.band);
-              const set = marks(key, params[key]) !== undefined;
+            {MIXER_PROPERTIES.map((p) => {
+              const key = mixerKey(p.value, band.name);
+              const value = paramValue(params, key);
+              const set = !isDefault(specOf(key), value);
               return (
                 <td
-                  key={b.band}
+                  key={p.value}
                   className={cn(
-                    "text-center font-mono text-[12px] tabular-nums",
-                    set ? "font-medium text-[var(--ds-gray-1000)]" : "text-[var(--ds-gray-700)]",
+                    "w-16 whitespace-nowrap text-right font-mono text-[13px] tabular-nums",
+                    set ? "text-[var(--ds-gray-1000)]" : "text-[var(--ds-gray-700)]",
                   )}
                 >
-                  {formatParam(key, params[key])}
+                  <span className="inline-flex items-center justify-end gap-1.5">
+                    <AutoMark on={set} />
+                    {formatParam(key, value)}
+                  </span>
+                  {set ? <span className="sr-only">, {AUTO_NOTE}</span> : null}
                 </td>
               );
             })}

@@ -224,16 +224,16 @@ function isRef(value: unknown): boolean {
   return isObject(value) && typeof value.id === "string";
 }
 
-/** Settings with at least the Basic panel. Runs recorded before the other
-    panels existed lack them: read such params through completeParams. */
+/** Params with at least the Basic panel. Runs recorded before the other
+    panels existed lack them; `completeParams` fills in Lightroom's defaults. */
 export function isParams(value: unknown): value is Params {
   return isObject(value) && BASIC_KEYS.every((key) => typeof value[key] === "number");
 }
 
 export function asInspectOutput(value: unknown): InspectOutput | undefined {
-  return isObject(value) && isObject(value.info) && isParams(value.neutral) && isRef(value.preview)
-    ? { ...(value as InspectOutput), neutral: completeParams(value.neutral) }
-    : undefined;
+  if (!isObject(value) || !isObject(value.info) || !isParams(value.neutral) || !isRef(value.preview)) return undefined;
+  const output = value as InspectOutput;
+  return { ...output, neutral: completeParams(output.neutral) };
 }
 
 function isCandidate(value: unknown): value is CandidateSummary {

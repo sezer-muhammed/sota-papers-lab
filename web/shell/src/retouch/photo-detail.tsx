@@ -50,7 +50,7 @@ import { PhaseSignal, PhotoActions, PhotoProgress, phaseColor } from "./status";
 const photoHref = (key: string) => `#/retouch/${encodeURIComponent(key)}`;
 
 /* One photo, large: before/after, the candidates, Claude's reasoning, the
-   Develop panels (the chosen values, or sliders to adjust them), the scopes of
+   Basic panel (the chosen values, or sliders to adjust them), the scopes of
    what is compared, downloads and timings. Keyed by photo, so view state
    starts fresh for each one. */
 export function PhotoDetail({
@@ -185,7 +185,7 @@ export function PhotoDetail({
         </div>
 
         <div className="space-y-5">
-          <DevelopPanel
+          <BasicPanel
             photo={photo}
             mode={mode}
             onMode={setMode}
@@ -496,7 +496,7 @@ function Fact({ label, title, value }: { label: string; title?: string; value: s
    Corrections, Calibration). Auto: the values shown in the comparison (the
    chosen edit, a selected candidate, or as shot before a retouch). Manual:
    sliders with a live preview, Reset, and a full-size export. */
-function DevelopPanel({
+function BasicPanel({
   canAdjust,
   candidate,
   mode,
@@ -518,11 +518,7 @@ function DevelopPanel({
 
   let body: ReactNode;
   if (mode === "manual") {
-    body = photo.manual ? (
-      <ManualEditor photo={photo} session={session} asShot={asShot} />
-    ) : (
-      <Skeleton className="h-64" />
-    );
+    body = photo.manual ? <ManualEditor photo={photo} session={session} /> : <Skeleton className="h-64" />;
   } else {
     const shown = candidate?.params ?? result?.params ?? neutral;
     const caption = candidate
@@ -567,19 +563,13 @@ function DevelopPanel({
   );
 }
 
-function ManualEditor({
-  asShot,
-  photo,
-  session,
-}: {
-  asShot?: { temperature: number; tint: number };
-  photo: Photo;
-  session: RetouchSession;
-}) {
+function ManualEditor({ photo, session }: { photo: Photo; session: RetouchSession }) {
   const manual = photo.manual!;
   const exporting = manual.export?.status === "running";
   const stale = !manual.preview || !sameParams(manual.preview.params, manual.params);
   const atBase = sameParams(manual.params, manual.base);
+  const info = photoInfo(photo);
+  const asShot = info ? { temperature: info.as_shot_temperature, tint: info.as_shot_tint } : undefined;
   const status = manual.error
     ? manual.error
     : stale
@@ -589,8 +579,9 @@ function ManualEditor({
   return (
     <div className="space-y-4">
       <AdjustSliders
-        asShot={asShot}
         base={manual.base}
+        baseName={photo.result ? "auto value" : "as-shot value"}
+        asShot={asShot}
         params={manual.params}
         onChange={(params) => session.setManual(photo.key, params)}
       />
