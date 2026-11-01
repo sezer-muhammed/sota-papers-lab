@@ -400,8 +400,6 @@ pub fn run_with<E: Evaluator + ?Sized>(
     );
     let auto = book.candidate(auto_at, "auto", "Auto", CandidateSource::Auto, &natural);
 
-    let looks: Vec<LookSpec> = looks.iter().map(|l| planned(l, &auto_params)).collect();
-    let looks = looks.as_slice();
     let objectives: Vec<Objective> = looks.iter().map(|l| Objective::new(l, &cx)).collect();
     let share = 0.95 / looks.len().max(1) as f32;
     progress(0.04, "Searching looks");
@@ -667,15 +665,6 @@ fn repair_auto<E: Evaluator + ?Sized>(
             d(a).total_cmp(&d(b))
         });
     Ok(closest.unwrap_or(at))
-}
-
-/// Claude plans the Basic panel only, so an anchor look takes every other
-/// setting from auto (the plan's own values there are placeholders).
-fn planned(look: &LookSpec, auto: &Params) -> LookSpec {
-    LookSpec {
-        anchor: look.anchor.map(|a| auto.with_basic(a.basic())),
-        ..look.clone()
-    }
 }
 
 /// The tone stage's fields: Basic, Tone Curve, Presence.
@@ -1506,27 +1495,41 @@ mod tests {
     }
 
     #[test]
-    fn claude_anchors_take_the_new_settings_from_auto() {
+    fn claude_anchors_keep_their_new_settings() {
         let mut syn = Synthetic::colourful();
         let scene = syn.scene();
-        let (lo, _) = bounds(&scene);
-        // The judge fills the settings it does not plan with the box's low
-        // corner (clarity -25, every band -30): placeholders.
-        let anchor = Params {
+        let (lo, hi) = bounds(&scene);
+        // The judge fills what Claude leaves alone from auto; what it sets
+        // beyond the Basic panel (a curve, clarity, a band) is its look.
+        let band = (0..hues::BANDS)
+            .map(|b| SAT + b)
+            .find(|&i| lo.to_array()[i] < -10.0 && hi.to_array()[i] > 0.0)
+            .expect("a band the scene holds");
+        let mut a = Params {
             exposure: 0.4,
             contrast: 10.0,
             highlights: -40.0,
             shadows: 20.0,
             vibrance: 15.0,
-            ..lo
-        };
+            curve_lights: 8.0,
+            curve_darks: -5.0,
+            clarity: 12.0,
+            ..clamp_params(
+                &Params::neutral(scene.info.as_shot_temperature, scene.info.as_shot_tint),
+                &lo,
+                &hi,
+            )
+        }
+        .to_array();
+        a[band] = -10.0;
+        let anchor = Params::from_array(a);
         let looks = [LookSpec::proposal("claude-1", "Warm and soft", anchor)];
         let r = run_synthetic(&mut syn, &looks, &SearchConfig::default());
         let c = &r.looks[0].params;
-        let auto = r.auto.params;
-        assert!((c.clarity - auto.clarity).abs() <= 6.0, "{}", extra(c));
-        assert!(c.curve_shadows.abs() <= 10.0, "{}", extra(c));
-        assert!(c.saturation_blue.abs() <= 12.0, "{}", extra(c));
+        assert!((c.curve_lights - 8.0).abs() <= 4.0, "{}", extra(c));
+        assert!((c.curve_darks + 5.0).abs() <= 4.0, "{}", extra(c));
+        assert!((c.clarity - 12.0).abs() <= 5.0, "{}", extra(c));
+        assert!((c.to_array()[band] + 10.0).abs() <= 5.0, "{}", extra(c));
         assert!((c.exposure - 0.4).abs() < 0.35, "{c:?}");
     }
 }

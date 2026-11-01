@@ -589,8 +589,11 @@ fn engine(gpu: &Gpu, s: &testkit::Sample) -> RenderEngine {
     RenderEngine::with_color(gpu, &s.scene, s.color.clone()).expect("engine")
 }
 
+/// As shot with Detail off, so display() shows the mixer alone (colour noise
+/// reduction would otherwise blend a patch's edge with its neighbours').
 fn neutral_of(s: &testkit::Sample) -> Params {
-    Params::neutral(s.scene.info.as_shot_temperature, s.scene.info.as_shot_tint)
+    let n = Params::neutral(s.scene.info.as_shot_temperature, s.scene.info.as_shot_tint);
+    crate::finish::Detail::from(crate::detail::DetailSettings::OFF).apply(&n)
 }
 
 /// Oklab of an 8-bit sRGB pixel.

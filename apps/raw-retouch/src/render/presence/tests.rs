@@ -411,7 +411,9 @@ fn gpu_presence_full_matches_display() {
     for file in SAMPLES {
         let s = testkit::load(file);
         let mut e = engine(&gpu, &s);
-        let n = neutral(&s.scene);
+        // Detail off: display() would sharpen, the bare export below not.
+        let n = crate::finish::Detail::from(crate::detail::DetailSettings::OFF)
+            .apply(&neutral(&s.scene));
         for (label, p) in [
             (
                 "texture+clarity",
