@@ -3,11 +3,13 @@
 //!   spl serve                       universal HTTP API (+ web shell)
 //!   spl ops                         list every registered op
 //!   spl run <op> [--input JSON]     run an op in-process and record it
+//!   spl put <file>                  store a file as an artifact, print its ref
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use spl_core::ArtifactKind;
 use spl_host::{Config, Host};
 
 #[derive(Parser)]
@@ -36,6 +38,14 @@ enum Command {
         /// Op input as JSON.
         #[arg(long, default_value = "{}")]
         input: String,
+    },
+    /// Store a file as a `blob` artifact, recording its file name, and print
+    /// the artifact reference (its `id` is what op inputs take).
+    Put {
+        file: PathBuf,
+        /// Media type; guessed from the extension when omitted.
+        #[arg(long)]
+        media_type: Option<String>,
     },
 }
 
@@ -69,11 +79,29 @@ async fn main() -> Result<()> {
             let run = host.run(&op, serde_json::from_str(&input)?).await?;
             println!("{}", serde_json::to_string_pretty(&run)?);
         }
+        Command::Put { file, media_type } => {
+            let bytes = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+            let media_type = media_type.unwrap_or_else(|| guess_media_type(&file).to_owned());
+            let meta = file
+                .file_name()
+                .map(|name| serde_json::json!({ "filename": name.to_string_lossy() }));
+            let host = Host::open(&config, registry).await?;
+            let artifact = host
+                .put_artifact(bytes, ArtifactKind::Blob, &media_type, meta)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&artifact)?);
+        }
         Command::Serve => {
             if config.auth_token.is_none() && !is_private_bind(&config.bind) {
                 tracing::warn!(bind = %config.bind, "serving without SPL_AUTH_TOKEN on a non-loopback, non-tailnet address");
             }
             let host = Host::open(&config, registry).await?;
+            let interrupted = host.fail_interrupted_runs().await?;
+            if interrupted > 0 {
+                tracing::warn!(
+                    "marked {interrupted} unfinished runs of a previous process as failed"
+                );
+            }
             let app = spl_host::router(host, &config);
             let listener = tokio::net::TcpListener::bind(&config.bind).await?;
             tracing::info!(
@@ -84,6 +112,27 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Media types for the files people feed this lab; anything else is a
+/// plain byte stream.
+fn guess_media_type(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("arw") => "image/x-sony-arw",
+        Some("dng") => "image/x-adobe-dng",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("tif" | "tiff") => "image/tiff",
+        Some("webp") => "image/webp",
+        Some("xmp") => "application/rdf+xml",
+        Some("json") => "application/json",
+        Some("txt") => "text/plain",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Loopback, or Tailscale's 100.64.0.0/10 range: reachable only from this
@@ -102,8 +151,31 @@ fn is_private_bind(bind: &str) -> bool {
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> std::io::Result<()> {
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
+}
+
+/// Ctrl-C, or SIGTERM from `docker stop`: as PID 1 in the container, `spl`
+/// would otherwise ignore SIGTERM and be killed after Docker's timeout.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutting down");
 }

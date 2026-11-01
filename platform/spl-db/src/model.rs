@@ -85,6 +85,16 @@ pub struct ArtifactRecord {
     pub created_at_ms: i64,
 }
 
+/// One lineage edge: a run read (`input`) or wrote (`output`) an artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunArtifact {
+    pub run_id: String,
+    pub artifact_id: String,
+    pub direction: String,
+    /// The op's name for the artifact; hosts number unnamed outputs `out-0`, `out-1`, ...
+    pub slot_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct MetricRecord {

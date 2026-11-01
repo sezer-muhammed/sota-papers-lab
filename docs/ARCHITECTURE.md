@@ -26,7 +26,7 @@ storage         SQLite → Postgres / Oracle ADB · local disk → S3-compatible
 | `spl-gpu` | Device discovery, contexts, runtime kernel compilation (NVRTC). Loads CUDA at runtime, so it compiles everywhere. |
 | `spl-data` | `ArtifactStore` implementations: content-addressed local disk (blake3). S3 via `object_store` next. |
 | `spl-db` | `Store` trait + SQLite backend; schema migrations for SQLite, PostgreSQL and Oracle. |
-| `spl-host` | Running ops, recording runs/metrics/environment, the HTTP API, config. |
+| `spl-host` | Running ops (queued, async, cancellable), recording runs, metrics, artifact lineage and environment, the HTTP API, config. |
 | `spl-catalog` | Which apps a binary links (one Cargo feature per app). |
 | `spl-cli` | The `spl` binary. |
 
@@ -45,19 +45,40 @@ Example: a new image codec.
 | Connected | pipeline: load → `imgcodec.encode` → `imgcodec.decode` → `metrics.compare` |
 | Benchmark | suite: that pipeline × Kodak × quality sweep → RD curves next to `paper.toml` claims and baseline codecs |
 
+## Runs and the host API
+
+Every front door goes through `spl-host`, which executes each run in a task
+of its own: a client that hangs up never strands a run, and a panicking op
+becomes a failed run. At most `max_concurrent_runs` ops execute at once (one
+GPU is shared); later runs wait as `queued` and start in submission order.
+
+| Route | Does |
+|---|---|
+| `POST /v1/runs` `{op, input}` | Runs to completion: 200 with the finished `RunRecord` (a failed op is still 200) |
+| `POST /v1/runs` `{op, input, wait: false}` | 202 at once with the run `running` or `queued` |
+| `GET /v1/runs/{id}` | `RunDetail`. While the run goes: latest progress, last 50 log lines, metrics so far. Afterwards: saved metrics |
+| `POST /v1/runs/{id}/cancel` | 202; the op sees `cx.is_cancelled()` and the run ends `cancelled` (a queued run never starts). 404 unknown, 409 not running |
+| `POST /v1/artifacts` | Raw body; `content-type` is the media type, `x-spl-filename` (percent-encoded) is recorded as `meta.filename`. 201 with the `ArtifactRef`; 413 over `max_upload_mb` |
+| `GET /v1/artifacts/{id}` | The bytes, cacheable forever (ETag = id). `?download=<name>` answers as an attachment |
+
+Runs a previous process left unfinished are marked `failed` when
+`spl serve` starts. `spl put <file>` stores a file the same way an upload does.
+
 ## Reproducibility
 
 Every run stores its input, output, status, timings, metrics, and an
 environment snapshot (OS, architecture, GPU model, compute capability,
 driver version, `spl` version, git SHA when built with `SPL_GIT_SHA`).
+Every artifact an op stores is recorded and linked to its run as an output
+(`out-0`, `out-1`, ...), so lineage needs nothing from the op.
 
 ## Roadmap
 
-Done: op contract, registry, SQLite store with portable schema, local artifact store, HTTP API, CLI, web shell, `device_info` app, app template.
+Done: op contract, registry, SQLite store with portable schema, local artifact store, HTTP API, CLI, web shell, `device_info` app, app template, async runs (queue, live progress and logs, cancellation), uploads, output lineage.
 
 Next, roughly in order:
 
-1. **Async runs:** job queue in `spl-host`, `RunStatus::Queued/Running`, WebSocket `/v1/runs/{id}/events` streaming `RunEvent`s, cancellation.
+1. **Run events:** WebSocket `/v1/runs/{id}/events` streaming `RunEvent`s instead of polling; input lineage.
 2. **First real apps:** `metrics` (PSNR, SSIM, MS-SSIM on GPU), `baseline-codecs`, then the first paper app.
 3. **Pipelines:** TOML definitions in `pipelines/`, GPU-resident artifact hand-off for in-process steps.
 4. **Benchmarks:** `spl-bench` (warm-up, repeats, CUDA-event timing, sweeps), `paper.toml` claim comparison, RD-curve views in the shell.

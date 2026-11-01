@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use spl_core::{Context, Result};
+use spl_core::{Context, Result, bail};
 
 /// Loaded from TOML (`deploy/config/*.toml`), then overridden by `SPL_*`
 /// environment variables so one image serves every deployment.
@@ -16,6 +16,12 @@ pub struct Config {
     pub web_dir: Option<PathBuf>,
     /// Bearer token for `/v1/*`. Set it on anything reachable from the internet.
     pub auth_token: Option<String>,
+    /// Ops executing at once; further runs wait, in order, as `queued`.
+    /// One GPU is shared by every run, so keep this small.
+    pub max_concurrent_runs: usize,
+    /// Largest `POST /v1/artifacts` body in MiB. Uploads are held in memory
+    /// while they are hashed, so this also bounds memory per upload.
+    pub max_upload_mb: u64,
 }
 
 impl Default for Config {
@@ -26,6 +32,8 @@ impl Default for Config {
             database_url: "sqlite://./data/spl.db".into(),
             web_dir: None,
             auth_token: None,
+            max_concurrent_runs: 3,
+            max_upload_mb: 1024,
         }
     }
 }
@@ -56,10 +64,37 @@ impl Config {
         if let Some(v) = env("SPL_AUTH_TOKEN") {
             config.auth_token = Some(v);
         }
+        if let Some(v) = env("SPL_MAX_CONCURRENT_RUNS") {
+            config.max_concurrent_runs = v
+                .parse()
+                .with_context(|| format!("SPL_MAX_CONCURRENT_RUNS `{v}` is not a count"))?;
+        }
+        if let Some(v) = env("SPL_MAX_UPLOAD_MB") {
+            config.max_upload_mb = v
+                .parse()
+                .with_context(|| format!("SPL_MAX_UPLOAD_MB `{v}` is not a size in MiB"))?;
+        }
+        config.validate()?;
         Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.max_concurrent_runs == 0 {
+            bail!("max_concurrent_runs must be at least 1");
+        }
+        if self.max_upload_mb == 0 {
+            bail!("max_upload_mb must be at least 1");
+        }
+        Ok(())
     }
 
     pub fn artifact_dir(&self) -> PathBuf {
         self.data_dir.join("artifacts")
+    }
+
+    pub fn max_upload_bytes(&self) -> usize {
+        usize::try_from(self.max_upload_mb)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(1024 * 1024)
     }
 }
