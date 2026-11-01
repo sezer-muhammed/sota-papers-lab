@@ -42,7 +42,7 @@ use layout::{CAND_STRIDE, N_SUMS, PART_U32, STATS_THREADS};
 /// camera's JPEG (middle grey near 0.46 sRGB). The integrator calibrates it
 /// against camera JPEGs; the tone curve's white point follows it, so raw
 /// clip at Exposure 0 always lands just below white.
-pub const BASELINE_EV: f32 = 0.5;
+pub const BASELINE_EV: f32 = 0.95;
 
 /// Candidates per stats launch: bounds the accumulator memory (about 5 KB each).
 const MAX_BATCH: usize = 4096;
