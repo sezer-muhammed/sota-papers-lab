@@ -1,0 +1,6 @@
+# Cloud GPU VM. Put TLS in front (Caddy or the provider's load balancer) and
+# always set SPL_AUTH_TOKEN. Keep data_dir on a persistent disk.
+bind = "0.0.0.0:7070"
+data_dir = "/var/lib/spl"
+database_url = "sqlite:///var/lib/spl/spl.db"
+# Later: database_url = "postgres://..." or "oracle://..." (docs/DATABASE.md)

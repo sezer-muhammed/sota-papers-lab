@@ -1,0 +1,19 @@
+[package]
+name = "spl-catalog"
+description = "The single list of apps a host links in. One feature per app."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["device-info"]
+device-info = ["dep:spl-app-device-info"]
+
+[lints]
+workspace = true
+
+# Keep last: scripts/new-app.sh appends app dependencies here.
+[dependencies]
+spl-core.workspace = true
+spl-app-device-info = { workspace = true, optional = true }

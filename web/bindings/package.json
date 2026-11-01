@@ -1,0 +1,9 @@
+{
+  "name": "@spl/bindings",
+  "private": true,
+  "description": "TypeScript types generated from Rust by ts-rs (`cargo test`). Never edit the .ts files by hand.",
+  "type": "module",
+  "exports": {
+    "./*": "./*.ts"
+  }
+}

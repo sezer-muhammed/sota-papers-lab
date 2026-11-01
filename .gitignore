@@ -1,0 +1,12 @@
+/target
+node_modules/
+dist/
+/data/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+.DS_Store
+*.tsbuildinfo

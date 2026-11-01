@@ -1,0 +1,5 @@
+# Local Linux GPU machine on a trusted network (reach it from your laptop
+# through an SSH tunnel or Tailscale).
+bind = "0.0.0.0:7070"
+data_dir = "/var/lib/spl"
+database_url = "sqlite:///var/lib/spl/spl.db"

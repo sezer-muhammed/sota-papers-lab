@@ -1,0 +1,6 @@
+/* Import after `@import "tailwindcss"` in the app's own stylesheet. Fonts are
+   bundled (no Google Fonts) so the UI works on air-gapped GPU machines. */
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+@import "./tokens.css";
+@import "./base.css";

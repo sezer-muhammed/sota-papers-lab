@@ -1,0 +1,10 @@
+{
+  "name": "sota-papers-lab",
+  "private": true,
+  "packageManager": "pnpm@11.24.0",
+  "scripts": {
+    "dev": "pnpm --filter @spl/shell dev",
+    "build": "pnpm --filter @spl/shell build",
+    "typecheck": "pnpm -r typecheck"
+  }
+}

@@ -1,0 +1,171 @@
+/* Page chrome, surfaces and the micro-animation kit, ported from ATSGrade. */
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--ds-background-200);
+  color: var(--foreground);
+  scroll-behavior: smooth;
+}
+
+body {
+  min-width: 320px;
+  margin: 0;
+  background:
+    radial-gradient(circle at 50% 0%, var(--page-grid-softener) 0, transparent 720px),
+    linear-gradient(var(--page-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--page-grid-line) 1px, transparent 1px),
+    var(--background);
+  background-position: center top;
+  background-size: auto, 72px 72px, 72px 72px, auto;
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+::selection {
+  background: var(--ds-blue-200);
+  color: var(--ds-blue-1000);
+}
+
+/* Layered so Tailwind utility classes (e.g. button text colors) win over it */
+@layer base {
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+}
+
+.depth-surface {
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.85),
+    inset 0 -1px 0 rgb(0 0 0 / 0.035),
+    0 1px 1px rgb(0 0 0 / 0.04),
+    0 18px 32px -28px rgb(0 0 0 / 0.55);
+}
+
+.depth-surface:not(.fixed):not(.absolute):not(.sticky) {
+  position: relative;
+}
+
+.depth-surface::after {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.28);
+  content: "";
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(-4px); }
+}
+
+@keyframes fade-out {
+  to { opacity: 0; transform: translateY(-4px); }
+}
+
+@keyframes reveal-up {
+  from {
+    opacity: 0;
+    translate: 0 10px;
+  }
+}
+
+@supports (animation-timeline: scroll()) {
+  .reveal {
+    animation: reveal-up 0.4s ease both;
+    animation-timeline: view();
+    animation-range: entry 0% entry 22%;
+  }
+
+  .stagger > * {
+    animation: reveal-up 0.4s ease both;
+    animation-timeline: view();
+    animation-range: entry 0% entry 28%;
+  }
+
+  .stagger > *:nth-child(2) { animation-delay: 55ms; }
+  .stagger > *:nth-child(3) { animation-delay: 110ms; }
+  .stagger > *:nth-child(4) { animation-delay: 165ms; }
+  .stagger > *:nth-child(5) { animation-delay: 220ms; }
+  .stagger > *:nth-child(6) { animation-delay: 275ms; }
+}
+
+/* Frosted badge chip: the box stays neutral; status color lives in the dot
+   (.ds-dot). Mirrors the base-react-design-template badge idiom. */
+.badge-frost {
+  position: relative;
+  background-color: hsla(var(--ds-gray-700-value), 0.1);
+  border-color: hsla(var(--ds-gray-700-value), 0.34);
+  -webkit-backdrop-filter: blur(6px) saturate(160%);
+  backdrop-filter: blur(6px) saturate(160%);
+  box-shadow:
+    inset 0 1px 0 hsla(0, 0%, 100%, 0.5),
+    0 1px 2px rgb(0 0 0 / 0.06);
+}
+
+.ds-dot {
+  border: 1px solid rgb(0 0 0 / 0.55);
+}
+
+/* ---- Micro-animation kit (ported from base-react-design-template) ----
+   Live pulse ring, skeleton shimmer, indeterminate bar, checkmark draw, copy
+   pop, dialog enter/exit. All guarded for prefers-reduced-motion. */
+@keyframes ds-ping { from { transform: scale(1); opacity: 0.5; } to { transform: scale(3.2); opacity: 0; } }
+@keyframes ds-shimmer { from { transform: translateX(-160%); } to { transform: translateX(260%); } }
+@keyframes ds-indeterminate { from { transform: translateX(-130%); } to { transform: translateX(360%); } }
+@keyframes ds-check-draw { to { stroke-dashoffset: 0; } }
+@keyframes ds-pop { 0% { transform: scale(0.9); } 60% { transform: scale(1.05); } 100% { transform: scale(1); } }
+@keyframes ds-dialog-in { from { opacity: 0; transform: translate(-50%, -48%) scale(0.96); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+@keyframes ds-dialog-out { from { opacity: 1; transform: translate(-50%, -50%) scale(1); } to { opacity: 0; transform: translate(-50%, -48%) scale(0.97); } }
+/* Phone sheet (DialogFrame below 640px): no centring translate, so it never starts off-screen. */
+@keyframes ds-sheet-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@keyframes ds-sheet-out { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(12px); } }
+@keyframes ds-drawer-in { from { opacity: 0; transform: translateX(24px); } }
+
+.ds-ping { animation: ds-ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite; }
+
+/* Right-side drawer (components/ui/drawer.tsx) slides in from the edge. */
+.ds-drawer { animation: ds-drawer-in 0.2s ease-out; }
+
+.ds-skeleton { position: relative; overflow: hidden; background: var(--ds-gray-alpha-200); }
+.ds-skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-160%);
+  background: linear-gradient(90deg, transparent, var(--ds-gray-alpha-400), transparent);
+  animation: ds-shimmer 1.4s ease-in-out infinite;
+}
+
+.ds-indeterminate { position: relative; overflow: hidden; }
+.ds-indeterminate::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 35%;
+  border-radius: inherit;
+  background: var(--ds-gray-1000);
+  animation: ds-indeterminate 1.3s ease-in-out infinite;
+}
+
+.ds-check { stroke-dasharray: 30; stroke-dashoffset: 30; animation: ds-check-draw 0.45s ease-out 0.08s forwards; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ds-ping,
+  .ds-indeterminate::after { animation: none; }
+  .ds-skeleton::after { display: none; }
+  .ds-check { animation: none; stroke-dashoffset: 0; }
+  .ds-drawer { animation: none; }
+}
+
+.hairline-grid {
+  background-image:
+    linear-gradient(var(--ds-gray-alpha-200) 1px, transparent 1px),
+    linear-gradient(90deg, var(--ds-gray-alpha-200) 1px, transparent 1px);
+  background-size: 24px 24px;
+}

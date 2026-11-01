@@ -1,0 +1,22 @@
+[package]
+name = "spl-app-device-info"
+description = "Lists CUDA devices; the first check that a machine is ready."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "device-info"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
+spl-core.workspace = true
+spl-gpu.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

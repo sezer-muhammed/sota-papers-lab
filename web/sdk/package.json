@@ -1,0 +1,18 @@
+{
+  "name": "@spl/sdk",
+  "private": true,
+  "description": "Typed client for the universal API (/v1). Used by the shell and every app UI.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@spl/bindings": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

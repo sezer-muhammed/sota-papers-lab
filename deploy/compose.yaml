@@ -1,0 +1,24 @@
+# Local Linux machine with an NVIDIA GPU:
+#   SPL_GIT_SHA=$(git rev-parse --short HEAD) docker compose -f deploy/compose.yaml up -d --build
+services:
+  spl:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        SPL_GIT_SHA: ${SPL_GIT_SHA:-unknown}
+    ports:
+      - "7070:7070"
+    environment:
+      SPL_CONFIG: /etc/spl/local.toml
+      SPL_AUTH_TOKEN: ${SPL_AUTH_TOKEN:-}
+    volumes:
+      - ../data:/var/lib/spl
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

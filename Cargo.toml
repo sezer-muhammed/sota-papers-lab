@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["platform/*", "apps/*", "catalog", "bins/*"]
+exclude = ["templates", "experimental"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+repository = "https://github.com/sezer-muhammed/sota-papers-lab"
+publish = false
+
+[workspace.dependencies]
+# platform
+spl-core = { path = "platform/spl-core" }
+spl-gpu = { path = "platform/spl-gpu" }
+spl-data = { path = "platform/spl-data" }
+spl-db = { path = "platform/spl-db" }
+spl-host = { path = "platform/spl-host" }
+spl-catalog = { path = "catalog", default-features = false }
+
+# apps
+spl-app-device-info = { path = "apps/device-info" }
+
+# third party
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+blake3 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+# CUDA libraries are loaded at runtime, so every crate still compiles and
+# type-checks on machines without CUDA (macOS dev). cuda-12080 is the API
+# floor: binaries run on any driver that supports CUDA 12.8 or newer.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12080"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "1"
+tower-http = { version = "0.7", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ts-rs = { version = "12", features = ["serde-json-impl"] }
+uuid = { version = "1", features = ["v7"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

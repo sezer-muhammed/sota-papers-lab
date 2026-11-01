@@ -1,0 +1,17 @@
+[package]
+name = "spl-gpu"
+description = "CUDA access for apps: device discovery, contexts, runtime kernel compilation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cudarc.workspace = true
+schemars.workspace = true
+serde.workspace = true
+spl-core.workspace = true
+ts-rs.workspace = true
+
+[lints]
+workspace = true

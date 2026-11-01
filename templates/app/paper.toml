@@ -1,0 +1,18 @@
+# Only for apps that implement a paper; delete for helper apps (metrics,
+# baselines, tools). `spl bench` will read this to put the paper's own numbers
+# next to ours.
+
+[paper]
+title = ""
+authors = []
+venue = ""          # e.g. "CVPR 2026"
+arxiv = ""          # e.g. "2605.01234"
+code = ""           # official implementation URL, if any
+
+# One block per number the paper reports.
+# [[claimed]]
+# dataset = "kodak"
+# metric = "psnr"
+# value = 32.1
+# unit = "dB"
+# at = { bpp = 0.25 }
