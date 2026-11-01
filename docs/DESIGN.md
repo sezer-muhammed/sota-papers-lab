@@ -43,7 +43,7 @@ Controls:
 - `SegmentedControl`: two to five exclusive choices (a model, a count, a mode) on native radios, so arrow keys and screen readers work as a radio group.
 - `RangeInput`: native range in the system look (`.ds-range`): 4px track, 14px neutral thumb, focus ring on the thumb. The fill starts at `origin` (0 for a bipolar slider); `track` swaps in a token gradient, e.g. white balance blue→amber.
 
-Pages with app-specific views (the Retouch page, `#/retouch`) compose these; photos and other user content may carry their own colours, and labels laid over a photo use a translucent black chip with white text so they read on any image.
+Pages with app-specific views (the Retouch page, `#/retouch`) compose these; photos and other user content may carry their own colours, and labels laid over a photo use a translucent black chip with white text so they read on any image. Its scopes are data, drawn with tokens: histogram channels in the red, green and blue 700 steps, their overlaps in amber, teal and pink 700, all three in gray-700; only the vectorscope's dots take the photo's own hues.
 
 ## Motion
 

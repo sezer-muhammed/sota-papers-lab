@@ -43,14 +43,16 @@ import {
   type Photo,
 } from "./model";
 import { AdjustSliders, ParamsTable } from "./params";
+import { ScopesPanel, useTwoColumns } from "./scopes/scopes-panel";
 import type { RetouchSession } from "./session";
 import { PhaseSignal, PhotoActions, PhotoProgress, phaseColor } from "./status";
 
 const photoHref = (key: string) => `#/retouch/${encodeURIComponent(key)}`;
 
 /* One photo, large: before/after, the candidates, Claude's reasoning, the
-   Basic panel (the chosen values, or sliders to adjust them), downloads and
-   timings. Keyed by photo, so view state starts fresh for each one. */
+   Basic panel (the chosen values, or sliders to adjust them), the scopes of
+   what is compared, downloads and timings. Keyed by photo, so view state
+   starts fresh for each one. */
 export function PhotoDetail({
   photo,
   photos,
@@ -100,6 +102,9 @@ export function PhotoDetail({
       ? { id: candidate.preview.id, label: candidate.label }
       : { id: result.after.id, label: chosenLabel(result) };
   }
+
+  const twoColumns = useTwoColumns();
+  const scopes = before.id || after?.id ? <ScopesPanel before={before} after={after} info={info} /> : null;
 
   const captured = info ? formatCaptured(info.captured_at) : undefined;
   const facts = [
@@ -157,13 +162,21 @@ export function PhotoDetail({
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
         <div className="min-w-0 space-y-5">
           {/* While adjusting, the preview stays in view beside the sliders on
-              wide screens, and nothing sits between them on narrow ones. */}
-          <div className={cn(mode === "manual" && "xl:sticky xl:top-20 xl:z-10")}>
+              wide screens (with its scopes: the photo shrinks to leave them
+              room), and nothing sits between them on narrow ones. */}
+          <div
+            className={cn(
+              "space-y-5",
+              mode === "manual" &&
+                "xl:sticky xl:top-20 xl:z-10 xl:[--compare-max-h:max(16rem,min(72vh,100vh_-_440px))]",
+            )}
+          >
             {before.id || after?.id ? (
               <CompareView key={`${key}-${mode}`} before={before} after={after} ratio={ratio} note={note} />
             ) : (
               <NoImage photo={photo} ratio={ratio} />
             )}
+            {scopes && twoColumns ? scopes : null}
           </div>
           {result && mode === "auto" ? (
             <CandidateStrip output={result} selected={candidateId} onSelect={setCandidateId} />
@@ -180,6 +193,7 @@ export function PhotoDetail({
             candidate={candidate}
             session={session}
           />
+          {scopes && !twoColumns ? scopes : null}
           <DownloadsPanel photo={photo} />
           {photo.result ? <TimingsPanel result={photo.result} /> : null}
         </div>
