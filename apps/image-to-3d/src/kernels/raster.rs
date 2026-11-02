@@ -25,7 +25,7 @@ use spl_gpu::cudarc::driver::{
     ValidAsZeroBits, result,
 };
 
-use super::densify::{DensifyStats, ViewScores};
+use super::densify::{DensifyKernels, DensifyStats, ViewScores, scores_add};
 use super::layout::{BWD_WARPS, MODE_COUNT, MODE_INFER, MODE_TRAIN};
 use super::sort::{RadixSorter, bin_tiles, sort_depth};
 use super::{
@@ -35,7 +35,6 @@ use super::{
 use crate::frame::{CameraTable, FrameRing, IterParams, IterParamsDev, PinnedStatus};
 use crate::gpu::{
     COMMON_CUH, CudaFile, CudaResultExt, Defines, Gpu, KernelSource, SPLAT_COMMON_CUH,
-    not_implemented,
 };
 use crate::model::Gaussians;
 
@@ -427,6 +426,8 @@ pub struct GpuRaster {
     pub pixel_grads: PixelGrads,
     pub g2d: Grad2d,
     pub sorter: RadixSorter,
+    /// `scores_add` for the count pass, loaded on first use.
+    densify: Option<DensifyKernels>,
 }
 
 impl GpuRaster {
@@ -438,7 +439,20 @@ impl GpuRaster {
             pixel_grads: PixelGrads::alloc(gpu, cap, &v, true)?,
             g2d: Grad2d::alloc(gpu, cap, &v, abs_grad)?,
             sorter: RadixSorter::new(gpu, cap.instances.max(cap.visible))?,
+            densify: None,
         })
+    }
+
+    pub fn capacity(&self) -> Capacity {
+        self.frame.cap
+    }
+
+    /// Sets the device iteration counter that picks the ring slot (a new
+    /// raster continuing a run starts at the ring's push count).
+    pub fn set_iteration_counter(&mut self, gpu: &Gpu, value: u32) -> Result<()> {
+        gpu.stream
+            .memcpy_htod(&[value], &mut self.frame.iter.iter_counter)
+            .cuda("set iteration counter")
     }
 }
 
@@ -456,9 +470,10 @@ impl SplatRaster for GpuRaster {
             FrameSource::Ring(ring) => {
                 preprocess::frame_begin(&self.kernels, s, ring, cams, &mut self.frame)?
             }
-            // Needs a frame_begin that composes the FrameCam from uploaded
-            // params instead of a ring slot (preprocess, E1).
-            FrameSource::Eager(_) => return Err(not_implemented("eager frame_begin", OWNER)),
+            FrameSource::Eager(p) => {
+                self.frame.iter.upload(gpu, p, None)?;
+                preprocess::frame_begin_eager(&self.kernels, s, cams, &mut self.frame)?
+            }
         }
         preprocess::preprocess_fwd(&self.kernels, s, g, &mut self.frame, &mut self.g2d)?;
         sort_depth(&self.kernels, s, &mut self.sorter, &mut self.frame)?;
@@ -528,17 +543,30 @@ impl SplatRaster for GpuRaster {
         cams: &CameraTable,
         frame: FrameSource<'_>,
         mask: &CudaSlice<u8>,
-        _view_weight: f32,
-        _acc: &mut ViewScores,
+        view_weight: f32,
+        acc: &mut ViewScores,
     ) -> Result<()> {
-        // The raster half is real: RenderOut::count[v] holds the masked pixels
-        // each visible Gaussian blends into. Scattering it into the p-space
-        // ViewScores is densify.cu's `scores_add`, which has no stage function yet.
+        // RenderOut::count[v] holds the masked pixels each visible Gaussian
+        // blends into; scores_add scatters it into the p-space ViewScores.
         self.forward(gpu, g, cams, frame, RenderMode::Count { mask })?;
-        Err(not_implemented(
-            "scores_add stage (count_masked)",
-            "densify (E6)",
-        ))
+        let dk = match &self.densify {
+            Some(k) => k,
+            None => self.densify.insert(DensifyKernels::load(gpu)?),
+        };
+        let count = self
+            .out
+            .count
+            .as_mut()
+            .ok_or_else(|| anyhow!("count_masked: RenderOut has no count buffer"))?;
+        scores_add(
+            gpu,
+            dk,
+            count,
+            &self.frame.vis_idx,
+            &self.frame.iter.status,
+            view_weight,
+            acc,
+        )
     }
 
     fn overflow_flag(&self) -> &CudaSlice<u32> {

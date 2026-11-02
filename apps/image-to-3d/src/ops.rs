@@ -6,23 +6,29 @@
 //!   exports, metrics. `dry_run` loads and validates the dataset only.
 //! - `image_to_3d.render`: one view of a trained splat → PNG.
 //!
-//! Dataset loading is real; training and rendering return "not implemented"
-//! until the kernel owners land their stages (see DESIGN.md).
 
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::ensure;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use spl_core::{ArtifactRef, Context, DataDir, Op, Result, RunCx, anyhow, bail};
+use spl_core::{ArtifactKind, ArtifactRef, Context, DataDir, Op, Result, RunCx, anyhow, bail};
 use ts_rs::TS;
 
-use crate::eval::ImageMetrics;
-use crate::gpu::{Gpu, not_implemented};
-use crate::io::scene::{LoadOptions, Scene, find_dataset_root, load_colmap_scene};
-use crate::kernels::raster::GpuRaster;
-use crate::kernels::{Capacity, RasterVariant};
-use crate::trainer::{TrainConfig, TrainSummary, Trainer};
+use crate::eval::{ImageMetrics, evaluate};
+use crate::export::colmap::write_colmap;
+use crate::export::ply::{read_inria_ply, write_inria_ply};
+use crate::export::spz::{SpzOptions, read_spz, write_spz};
+use crate::export::{MEDIA_PLY, MEDIA_SPZ, MEDIA_ZIP};
+use crate::frame::{CameraTable, FrameParams, IterParams};
+use crate::gpu::{CudaResultExt, Gpu};
+use crate::io::images::Rgb8Image;
+use crate::io::scene::{LoadOptions, Scene, View, find_dataset_root, load_colmap_scene};
+use crate::kernels::layout::{EPS2D_DEFAULT, FLAG_AA};
+use crate::kernels::raster::{FrameSource, GpuRaster, SplatRaster};
+use crate::kernels::{Capacity, RasterVariant, RenderMode};
+use crate::model::{Gaussians, GaussiansHost};
+use crate::trainer::{TrainConfig, TrainProgress, TrainSummary, Trainer, planar_to_rgb8};
 
 fn yes() -> bool {
     true
@@ -181,27 +187,123 @@ impl Op for Train {
 
         let cfg = input.train.clone();
         let cancel = cx.cancel.clone();
-        let summary = tokio::task::spawn_blocking(move || -> Result<TrainSummary> {
+        let do_eval = input.eval;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TrainProgress>();
+        let views = scene.views.clone();
+        let job = tokio::task::spawn_blocking(move || -> Result<Trained> {
             let gpu = Gpu::open()?;
-            let preset = cfg.resolve();
-            let (w, h) = scene
-                .views
-                .iter()
-                .fold((1, 1), |(w, h), v| (w.max(v.width), h.max(v.height)));
-            // E7: size from VRAM (spec-train 5.10) and grow on overflow (spec-raster 1.5).
-            let cap = Capacity::new(1 << 22, 1 << 24, w, h, &preset.variant);
-            let raster = GpuRaster::new(&gpu, cap, RasterVariant { ..preset.variant }, true)?;
-            let mut trainer = Trainer::new(&gpu, scene, Box::new(raster), cfg)?;
-            trainer.run(&cancel, &mut |_| {})
-        })
-        .await??;
+            let mut trainer = Trainer::new(&gpu, scene, cfg)?;
+            let summary = trainer.run(&cancel, &mut |p| {
+                let _ = tx.send(p.clone());
+            })?;
+            let eval = if do_eval {
+                Some(evaluate(&mut trainer, None)?.mean)
+            } else {
+                None
+            };
+            let (cloud, summary) = {
+                let (cloud, mut s) = trainer.finish()?;
+                s.train_s = summary.train_s;
+                (cloud, s)
+            };
+            Ok(Trained {
+                cloud,
+                summary,
+                eval,
+            })
+        });
+        while let Some(p) = rx.recv().await {
+            let loss = p.loss.map_or(String::new(), |l| format!(", loss {l:.4}"));
+            cx.progress(
+                p.t as f64 / p.total.max(1) as f64,
+                format!(
+                    "iteration {}/{}: {} Gaussians, {:.0} it/s{loss}",
+                    p.t, p.total, p.n_gaussians, p.iterations_per_s
+                ),
+            );
+        }
+        let Trained {
+            cloud,
+            summary,
+            eval,
+        } = job.await??;
         cx.metric("train_time", summary.train_s, "s");
         cx.metric("final_gaussians", summary.final_gaussians as f64, "");
-        Err(not_implemented(
-            "image_to_3d.train exports and eval",
-            "trainer (E7)",
-        ))
+        cx.metric(
+            "peak_vram",
+            summary.peak_vram_bytes as f64 / (1u64 << 20) as f64,
+            "MiB",
+        );
+        if let Some(m) = &eval {
+            cx.metric("psnr", m.psnr, "dB");
+            cx.metric("ssim", m.ssim, "");
+        }
+        let mut out = TrainOutput {
+            scene: info,
+            summary: Some(summary),
+            eval,
+            ply: None,
+            spz: None,
+            colmap: None,
+        };
+        for fmt in &input.export {
+            match fmt {
+                ExportFormat::Ply => {
+                    let mut bytes = Vec::new();
+                    write_inria_ply(&cloud, &mut bytes)?;
+                    out.ply = Some(
+                        cx.artifacts
+                            .put(bytes, ArtifactKind::Splat, MEDIA_PLY)
+                            .await?,
+                    );
+                }
+                ExportFormat::Spz => {
+                    let bytes = write_spz(&cloud, &SpzOptions::default())?;
+                    out.spz = Some(
+                        cx.artifacts
+                            .put(bytes, ArtifactKind::Splat, MEDIA_SPZ)
+                            .await?,
+                    );
+                }
+                ExportFormat::Colmap => {
+                    let (views, cloud) = (views.clone(), cloud.clone());
+                    let bytes =
+                        tokio::task::spawn_blocking(move || colmap_zip(&views, &cloud)).await??;
+                    out.colmap = Some(
+                        cx.artifacts
+                            .put(bytes, ArtifactKind::Cameras, MEDIA_ZIP)
+                            .await?,
+                    );
+                }
+            }
+        }
+        Ok(out)
     }
+}
+
+struct Trained {
+    cloud: GaussiansHost,
+    summary: TrainSummary,
+    eval: Option<ImageMetrics>,
+}
+
+/// The COLMAP sparse model (bin) of the cameras plus points from the splat
+/// means, zipped as `sparse/0/*.bin`.
+fn colmap_zip(views: &[View], cloud: &GaussiansHost) -> Result<Vec<u8>> {
+    let dir = tempfile::tempdir().context("temp dir for the COLMAP export")?;
+    let sparse = dir.path().join("sparse").join("0");
+    std::fs::create_dir_all(&sparse)?;
+    write_colmap(views, cloud, &sparse, false)?;
+    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+        let path = sparse.join(name);
+        if path.is_file() {
+            z.start_file(format!("sparse/0/{name}"), opts)?;
+            std::io::Write::write_all(&mut z, &std::fs::read(&path)?)?;
+        }
+    }
+    Ok(z.finish()?.into_inner())
 }
 
 /// A pinhole camera in COLMAP conventions (world → camera, x right, y down).
@@ -256,12 +358,110 @@ impl Op for Render {
             c.width > 0 && c.height > 0 && c.width <= 8192 && c.height <= 8192,
             "image size must be 1..=8192 per side"
         );
-        let _bytes = cx.artifacts.get(&input.splat).await?;
-        Err(not_implemented(
-            "image_to_3d.render (PLY/SPZ read + raster_fwd)",
-            "raster (E3)",
-        ))
+        let bytes = cx.artifacts.get(&input.splat).await?;
+        let camera = input.camera.clone();
+        let (sh, bg) = (input.sh_degree, input.background);
+        let (img, render_ms) = tokio::task::spawn_blocking(move || -> Result<(Rgb8Image, f64)> {
+            let cloud = if bytes.starts_with(b"ply") {
+                read_inria_ply(&bytes)?
+            } else {
+                read_spz(&bytes)?
+            };
+            render_cloud(&cloud, &camera, sh, bg)
+        })
+        .await??;
+        let mut png = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut png),
+            &img.data,
+            img.width,
+            img.height,
+            image::ExtendedColorType::Rgb8,
+            image::ImageFormat::Png,
+        )
+        .context("encode PNG")?;
+        let image = cx
+            .artifacts
+            .put(png, ArtifactKind::Image, "image/png")
+            .await?;
+        Ok(RenderOutput { image, render_ms })
     }
+}
+
+/// One eager Infer render of `cloud` (blocking; opens the GPU).
+pub fn render_cloud(
+    cloud: &GaussiansHost,
+    c: &RenderCamera,
+    sh_degree: u32,
+    background: [f32; 3],
+) -> Result<(Rgb8Image, f64)> {
+    let gpu = Gpu::open()?;
+    let n = cloud.len();
+    ensure!(n > 0, "the splat is empty");
+    let cap = n.next_multiple_of(1024);
+    let mut g = Gaussians::alloc(&gpu, cap, cloud.antialiased)?;
+    g.upload(&gpu, cloud)?;
+    let view = View {
+        name: "render".into(),
+        camera: 0,
+        r_cw: [
+            [c.r_cw[0], c.r_cw[1], c.r_cw[2]],
+            [c.r_cw[3], c.r_cw[4], c.r_cw[5]],
+            [c.r_cw[6], c.r_cw[7], c.r_cw[8]],
+        ],
+        t_cw: c.t_cw,
+        fx: c.fx,
+        fy: c.fy,
+        cx: c.cx,
+        cy: c.cy,
+        width: c.width,
+        height: c.height,
+        image_path: PathBuf::new(),
+    };
+    let cams = CameraTable::upload(&gpu, std::slice::from_ref(&view))?;
+    let variant = RasterVariant::default();
+    let mut instances = (n as u64 * 16).clamp(1 << 20, 1 << 26) as u32;
+    let params = IterParams {
+        frame: FrameParams {
+            iteration: 1,
+            n_gaussians: n as u32,
+            sh_degree: sh_degree.min(cloud.sh_degree),
+            bg: background,
+            eps2d: EPS2D_DEFAULT,
+            flags: if cloud.antialiased { FLAG_AA } else { 0 },
+            render_w: c.width,
+            render_h: c.height,
+            box_beta: 1.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for _ in 0..4 {
+        let cap = Capacity::new(cap as u32, instances, c.width, c.height, &variant);
+        let mut raster = GpuRaster::new(&gpu, cap, variant, false)?;
+        let started = std::time::Instant::now();
+        raster.forward(
+            &gpu,
+            &mut g,
+            &cams,
+            FrameSource::Eager(&params),
+            RenderMode::Infer,
+        )?;
+        let st = raster.frame.iter.read_status(&gpu)?;
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        if st.overflow == 0 {
+            let px = (c.width * c.height) as usize;
+            let planar = gpu
+                .stream
+                .clone_dtoh(&raster.out.rgb.slice(0..3 * px))
+                .cuda("download render")?;
+            return Ok((planar_to_rgb8(&planar, c.width, c.height), ms));
+        }
+        instances = (st.n_instances as u64 * 5 / 4)
+            .max(instances as u64 * 2)
+            .min(1 << 30) as u32;
+    }
+    bail!("render: raster buffers kept overflowing")
 }
 
 /// The dataset directory a train run reads: a validated name under the

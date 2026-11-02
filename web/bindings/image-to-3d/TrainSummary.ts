@@ -5,4 +5,16 @@ export type TrainSummary = { iterations: number,
  * From the first launch to the last completion, incl. densify, scoring,
  * Morton, captures; excl. decode, init, eval, export (spec-train 7.5).
  */
-train_s: number, final_gaussians: number, peak_vram_bytes: number, graph_captures: number, densify_steps: number, capped: number, };
+train_s: number, final_gaussians: number, 
+/**
+ * Largest `total − free` device memory seen (whole device, sampled).
+ */
+peak_vram_bytes: number, graph_captures: number, densify_steps: number, capped: number, 
+/**
+ * Raster buffers grown after an overflow (each loses the poisoned iterations).
+ */
+raster_regrows: number, 
+/**
+ * Mean training loss over the last progress window.
+ */
+final_loss?: number, };

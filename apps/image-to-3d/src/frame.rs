@@ -12,13 +12,16 @@
 //! sizes are asserted at compile time here and on the device by the selftest
 //! layout probe.
 
+use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::Arc;
 
 use spl_core::Result;
-use spl_gpu::cudarc::driver::{CudaGraph, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits};
+use spl_gpu::cudarc::driver::{
+    CudaContext, CudaEvent, CudaGraph, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits, sys,
+};
 
-use crate::gpu::{CudaResultExt, Gpu, not_implemented};
+use crate::gpu::{CudaResultExt, Gpu};
 use crate::io::scene::View;
 use crate::kernels::adam::AdamIterPlan;
 use crate::kernels::layout::{
@@ -280,52 +283,153 @@ impl Status {
     }
 }
 
+/// `count` values of `T` in mapped pinned host memory (`cuMemHostAlloc` with
+/// `DEVICEMAP`): the host writes or reads them directly, kernels through
+/// `device_ptr`. Zeroed on allocation.
+struct MappedPinned<T> {
+    host: *mut T,
+    device_ptr: u64,
+    count: usize,
+    ctx: Arc<CudaContext>,
+}
+
+// SAFETY: the allocation is plain host memory owned by this value; access is
+// serialized by `&mut self` (writes) and the stream order (device side).
+unsafe impl<T: Send> Send for MappedPinned<T> {}
+
+impl<T: Copy + ValidAsZeroBits> MappedPinned<T> {
+    fn new(gpu: &Gpu, count: usize, what: &str) -> Result<Self> {
+        let bytes = size_of::<T>() * count.max(1);
+        gpu.ctx.bind_to_thread().cuda(what)?;
+        let mut host: *mut c_void = std::ptr::null_mut();
+        // SAFETY: plain driver allocation into a local out-pointer.
+        unsafe { sys::cuMemHostAlloc(&mut host, bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP) }
+            .result()
+            .cuda(what)?;
+        let mut device_ptr: sys::CUdeviceptr = 0;
+        // SAFETY: `host` was just allocated with DEVICEMAP in this context.
+        let mapped = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut device_ptr, host, 0) }
+            .result()
+            .cuda(what);
+        if let Err(e) = mapped {
+            // SAFETY: frees the allocation made above, which nothing else references.
+            unsafe { sys::cuMemFreeHost(host) };
+            return Err(e);
+        }
+        // SAFETY: `host` holds `bytes` writable bytes; all-zero bits are a valid T.
+        unsafe { std::ptr::write_bytes(host as *mut u8, 0, bytes) };
+        Ok(Self {
+            host: host as *mut T,
+            device_ptr,
+            count: count.max(1),
+            ctx: gpu.ctx.clone(),
+        })
+    }
+
+    fn read(&self, i: usize) -> T {
+        assert!(i < self.count);
+        // SAFETY: in bounds; volatile because the device writes it behind our back.
+        unsafe { std::ptr::read_volatile(self.host.add(i)) }
+    }
+
+    fn write(&mut self, i: usize, v: T) {
+        assert!(i < self.count);
+        // SAFETY: in bounds; the caller guarantees no kernel reads slot i now.
+        unsafe { std::ptr::write_volatile(self.host.add(i), v) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl<T> Drop for MappedPinned<T> {
+    fn drop(&mut self) {
+        // Pending kernels may still read or write the memory.
+        let _ = self.ctx.synchronize();
+        let _ = self.ctx.bind_to_thread();
+        // SAFETY: allocated by cuMemHostAlloc in `new`, freed once.
+        unsafe { sys::cuMemFreeHost(self.host as *mut c_void) };
+    }
+}
+
 /// Host-readable mirror of the status words in mapped pinned memory, written
-/// by `frame_end` and read one iteration late (spec-raster 1.5). STUB (E7):
-/// needs `alloc_pinned_with_flags(CU_MEMHOSTALLOC_DEVICEMAP)` plus
-/// `cuMemHostGetDevicePointer` through `cudarc::driver::sys`.
+/// by `frame_end` and read one iteration late (spec-raster 1.5).
 pub struct PinnedStatus {
     pub device_ptr: u64,
+    words: MappedPinned<u32>,
 }
 
 impl PinnedStatus {
-    pub fn new(_gpu: &Gpu) -> Result<Self> {
-        Err(not_implemented("PinnedStatus::new", "trainer (E7)"))
+    pub fn new(gpu: &Gpu) -> Result<Self> {
+        let words = MappedPinned::new(gpu, STATUS_LEN, "alloc pinned status mirror")?;
+        Ok(Self {
+            device_ptr: words.device_ptr,
+            words,
+        })
     }
 
+    /// The status of the last finished iteration (no sync).
     pub fn read(&self) -> Result<Status> {
-        Err(not_implemented("PinnedStatus::read", "trainer (E7)"))
+        let w: Vec<u32> = (0..STATUS_LEN).map(|i| self.words.read(i)).collect();
+        Ok(Status::from_words(&w))
+    }
+
+    /// Clears the host copy (after the trainer handled an overflow).
+    pub fn clear(&mut self) {
+        for i in 0..STATUS_LEN {
+            self.words.write(i, 0);
+        }
     }
 }
 
 /// Mapped pinned ring of [`IterParams`] slots (spec-raster 1.3). The host
-/// never overwrites a slot before iteration t − RING_SLOTS + 1 has completed.
-/// STUB (E7).
+/// never overwrites a slot before iteration t − RING_SLOTS + 1 has completed:
+/// [`FrameRing::enqueued`] records an event per slot and [`FrameRing::push`]
+/// waits on it.
 pub struct FrameRing {
     pub slots: usize,
     /// Device pointer of slot 0 (mapped pinned memory).
     pub device_ptr: u64,
     /// Iterations pushed so far.
     pub pushed: u64,
+    mem: MappedPinned<IterParams>,
+    done: Vec<CudaEvent>,
 }
 
 impl FrameRing {
     pub const DEFAULT_SLOTS: usize = RING_SLOTS as usize;
 
-    pub fn new(_gpu: &Gpu, _slots: usize) -> Result<Self> {
-        Err(not_implemented("FrameRing::new", "trainer (E7)"))
+    pub fn new(gpu: &Gpu, slots: usize) -> Result<Self> {
+        let mem = MappedPinned::new(gpu, slots, "alloc pinned frame ring")?;
+        let done = (0..slots)
+            .map(|_| gpu.ctx.new_event(None).cuda("create ring event"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            slots,
+            device_ptr: mem.device_ptr,
+            pushed: 0,
+            mem,
+            done,
+        })
     }
 
-    /// Writes iteration `it`'s parameters; blocks only while the slot is still in flight.
-    pub fn push(&mut self, _it: &IterParams) -> Result<()> {
-        Err(not_implemented("FrameRing::push", "trainer (E7)"))
+    /// Writes the next iteration's parameters; blocks only while the slot is still in flight.
+    pub fn push(&mut self, it: &IterParams) -> Result<()> {
+        let slot = (self.pushed % self.slots as u64) as usize;
+        self.done[slot].synchronize().cuda("wait for ring slot")?;
+        self.mem.write(slot, *it);
+        self.pushed += 1;
+        Ok(())
+    }
+
+    /// Marks the last pushed slot as in flight until `s` reaches this point.
+    pub fn enqueued(&self, s: &CudaStream) -> Result<()> {
+        let slot = ((self.pushed + self.slots as u64 - 1) % self.slots as u64) as usize;
+        self.done[slot].record(s).cuda("record ring event")
     }
 }
 
 /// One training iteration as a captured CUDA graph (spec-raster 8, E7).
-/// Capture with `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL` and event tracking off
-/// (`unsafe { ctx.disable_event_tracking() }`), else cudarc records per-slice
-/// events into the graph. STUB.
+/// Captured with `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL` and cudarc's event
+/// tracking off for the capture (else it records per-slice events into the graph).
 pub struct IterationGraph {
     pub graph: Option<CudaGraph>,
     /// What the graph was captured for: any change re-captures.
@@ -345,16 +449,42 @@ pub struct GraphKey {
 }
 
 impl IterationGraph {
+    /// Records `record` on `s` into a graph. Nothing inside may sync, allocate
+    /// or copy from pageable memory.
     pub fn capture(
-        _s: &Arc<CudaStream>,
-        _key: GraphKey,
-        _record: impl FnOnce(&CudaStream) -> Result<()>,
+        s: &Arc<CudaStream>,
+        key: GraphKey,
+        record: impl FnOnce(&CudaStream) -> Result<()>,
     ) -> Result<Self> {
-        Err(not_implemented("IterationGraph::capture", "trainer (E7)"))
+        let ctx = s.context().clone();
+        let tracking = ctx.is_event_tracking();
+        // SAFETY: one stream does all of the trainer's work, so stream order
+        // alone keeps every buffer consistent while tracking is off.
+        unsafe { ctx.disable_event_tracking() };
+        let begun = s
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .cuda("begin graph capture");
+        let recorded = begun.and_then(|_| record(s));
+        let ended = s
+            .end_capture(sys::CUgraphInstantiate_flags(0))
+            .cuda("end graph capture");
+        if tracking {
+            // SAFETY: restores the context's previous mode.
+            unsafe { ctx.enable_event_tracking() };
+        }
+        recorded?;
+        let graph = ended?;
+        if let Some(g) = &graph {
+            g.upload().cuda("upload graph")?;
+        }
+        Ok(Self { graph, key })
     }
 
     pub fn replay(&self) -> Result<()> {
-        Err(not_implemented("IterationGraph::replay", "trainer (E7)"))
+        match &self.graph {
+            Some(g) => g.launch().cuda("launch iteration graph"),
+            None => Ok(()),
+        }
     }
 }
 
