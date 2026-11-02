@@ -50,6 +50,7 @@ fn kernel_source_has_every_entry_point() {
         "copy_rows",
         "ln_rows_f32",
         "to_cache",
+        "rows_to_wide",
     ] {
         assert!(src.contains(&format!("void {k}(")), "{k}");
     }
@@ -345,6 +346,7 @@ fn run(nn: &Nn, w: &FileWeights, trunk: &mut Trunk, p: &mut Prepared, tap: &mut 
             p.geom,
             &p.images.slice(..),
             [&mut v0, &mut v1, &mut v2, &mut v3],
+            None,
             &dense_schedule(),
             tap,
         )
