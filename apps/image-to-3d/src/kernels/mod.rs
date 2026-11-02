@@ -540,6 +540,14 @@ mod tests {
             let mut declared: Vec<&str> = text
                 .split("extern \"C\" __global__ void ")
                 .skip(1)
+                .map(|rest| {
+                    // `__launch_bounds__(...)` may sit between `void` and the name.
+                    match rest.strip_prefix("__launch_bounds__(") {
+                        Some(r) => r.split_once(')').map_or(r, |(_, after)| after),
+                        None => rest,
+                    }
+                    .trim_start()
+                })
                 .filter_map(|rest| rest.split('(').next())
                 .collect();
             declared.sort_unstable();
