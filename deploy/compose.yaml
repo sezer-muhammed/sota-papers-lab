@@ -14,8 +14,12 @@ services:
     environment:
       SPL_CONFIG: /etc/spl/local.toml
       SPL_AUTH_TOKEN: ${SPL_AUTH_TOKEN:-}
+      SPL_DATASETS: /data/datasets
+      SPL_MODELS_DIR: /models
     volumes:
       - ../data:/var/lib/spl
+      - ${SPL_DATASETS_HOST:-../data/datasets}:/data/datasets:ro
+      - ${SPL_MODELS_HOST:-./models}:/models:ro
     deploy:
       resources:
         reservations:
