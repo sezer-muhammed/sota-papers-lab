@@ -173,6 +173,29 @@ Out: `param_out`, `exp_avg_out`, `exp_avg_sq_out` from `torch.optim.Adam`
 kernel (Taming-3DGS): **no bias correction**, `p -= lr m / (sqrt(v) + eps)`,
 rows with `valid = false` untouched (moments too).
 
+### `relocation`: 3DGS-MCMC relocation (gsplat `compute_relocation`)
+
+| In | Shape, dtype | |
+|---|---|---|
+| `opacities`, `scales` | `[N]`, `[N,3]` f4 | activated |
+| `ratios` | `[N]` i4 | N_i = draws + 1, clamped to `[1, n_max]` |
+| `n_max` | `()` i4, default 51 | binomial table size (ours: 50) |
+| `min_opacity` | `()` f4, default 0.005 | clamp of the strategy |
+
+Out: `new_opacities`, `new_scales` (the kernel's float sums), and
+`new_opacities_clamped` (`clamp(o', min_opacity, 1 - 2^-23)`, what the MCMC
+strategy writes).
+
+### `multinomial`: sampling without replacement (`torch.multinomial`)
+
+| In | Shape, dtype | |
+|---|---|---|
+| `weights` | `[n]` f4 | unnormalized |
+| `k`, `trials`, `seed` | `()` i4 | k draws per trial, default 100000 trials |
+
+Out: `counts [n] i4`, how often each index was drawn over all trials (the
+inclusion frequencies FastGS's in-densify VCP relies on).
+
 ### `render`: the whole forward and backward (gsplat `rasterization`)
 
 | In | Shape, dtype | |
@@ -341,3 +364,52 @@ flush is within 5.4e-6 (params, f32 drift over 100 steps) and 6.2e-7 (moments)
 of Dense, while VisibleOnly is 0.21 away. `gpu_bf16_stochastic_rounding_tracks_f32`:
 over 10k steps of a constant gradient, the mean of v is 9.999549e-7 with
 bf16-SR moments, 9.999455e-7 with f32, 9.999548e-7 exact.
+
+## Densification (E6) against the oracle and the CPU mirrors
+
+`apps/image-to-3d/src/kernels/densify/gpu_tests.rs` (run with
+`scripts/gpu-test.sh <checkout> densify::gpu_tests::gpu_ --skip gpu_bench`).
+The cases are staged under `/out/image-to-3d/oracle-densify`; run
+`gs-oracle batch ~/spl-work/out/image-to-3d/oracle-densify` (from a checkout
+with these ops: `gs-ref --entry <checkout>/benchmarks/image-to-3d/py/oracle.py batch ...`)
+and re-run the tests to include the gsplat comparison.
+
+| Test | Reference | Tolerance | Measured (RTX 4070 SUPER, 2026-11-02) |
+|---|---|---|---|
+| `densify_plan`, ADC / FastGS / final prune, 40k Gaussians, 5 rule sets | `plan_cpu` (decisions in logit / log space, IEEE division) | bit exact (flags, out_count, priority, candidate count) | 0 mismatches |
+| Emission, 5k and 30k Gaussians, every array (params, last_visible, 6 gradient groups, f32 moments, 3 stats) | host model `emission_cpu` + split rule | bit exact; split-child means 2e-5 rel (device Box-Muller uses fast-math) | exact; means 6.4e-7 |
+| Capacity capping (tail 1.7k into 1.6k free) | `cap_tail_host` | bit exact | 54 dropped, store exact |
+| Radix sort, 1M random 32-bit keys with duplicates, 300k 30-bit, 77 | stable CPU sort | exact keys and values | exact, stable |
+| Morton re-sort, 200k Gaussians, every array | CPU codes (IEEE division), gather model | exact | 0 codes differ, every array permuted |
+| Gumbel-top-k VCP, top-5 of 20, 2e5 trials | sequential sampling (1e6 trials); `multinomial` op (1e6 trials) | chi-square < 36.19 (df 19, p = 0.01) | 22.2; vs torch 15.8 |
+| MCMC relocation, o in {0.006 .. 0.97}, N = 1..50 | `relocation` op (gsplat) | 1e-4 rel | 1.9e-6 |
+| same | f64 closed form | 1e-5 rel for N <= 2, 1e-3 all N (the f32 alternating sum cancels; gsplat's too) | 6.9e-6 (N 2), 8.4e-5 (N 8), 2.9e-4 (N 32) |
+| MCMC round, 20k with 2,244 dead | dead list, copies, zeroed moments, (o', s') vs f64 | exact / 1e-3 | exact; 7.2e-6 |
+| MCMC noise, 2^20 draws | covariance (k Sigma)^2 | 1% of the largest variance | 0.30% |
+| `vcd_mask`, `scores_add` (+ overflow guard) | CPU | exact | exact |
+
+
+### Densification performance (RTX 4070 SUPER, exclusive `gpu.lock`, GPU idle before: 0 %, 382 MiB)
+
+`gpu_bench_densify` (CUDA events, median of 10) against gsplat 1.5.3 `strategy.ops`
+(`py/bench_densify_gsplat.py`) and Faster-GS's model ops (`py/bench_densify_fastergs.py`,
+spl-bl-fastergs image). Same workloads: ADC step = 5 % clone, 5 % split, 10 % prune over
+parameters + Adam moments; MCMC = relocate 2 % dead + grow 5 %. Times in ms.
+
+| Op | 1M ours / gsplat / Faster-GS | 3M | 6M |
+|---|---|---|---|
+| ADC emission (178 words/G) | **6.87** / 17.6 / 11.4 | **25.4** / 60.2 / 34.6 | **52.8** / 170 / 106 |
+| Morton re-sort, from random order | 8.94 / - / **6.21** | 34.4 / - / **21.6** | 96.1 / - / **49.4** |
+| Morton re-sort, steady state (near-sorted) | 6.99 | 22.8 | 46.7 |
+| MCMC round | **2.33** / 5.81 / 5.84 | **7.92** / 17.3 / 18.0 | **17.6** / 32.6 / 48.4 |
+| MCMC noise | **0.035** / 1.52 / 0.114 | **0.366** / 5.00 / 0.450 | **0.722** / 10.2 / 0.826 |
+| densify_plan (incl. 1 sync) | 0.05 | 0.29 | 0.56 |
+| Radix sort 32-bit (k,v) | 0.109 | 0.255 | 1.03 |
+| VCP Gumbel-top-k (keys+sort+mark) | 0.41 | 1.07 | 2.19 |
+
+Before/after the Nsight Compute pass (unlocked, same contention both ways): the radix sort's
+single-block scan was 60 % of the sort; per-digit row scan made it 5-6x faster (1M: 0.632 -> 0.123
+ms, 3M: 1.92 -> 0.315 ms), Gumbel-top-k 2.2-3.7x. Slab moves run at ~89 % of peak memory
+throughput (ncu), ~420 GB/s measured; emission is bound by its 4 passes over every word.
+Morton is in-place (fixed capacity); Faster-GS's out-of-place gather does half the traffic but
+allocates a second copy of every tensor.

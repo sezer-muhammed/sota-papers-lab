@@ -278,6 +278,39 @@ def op_adam(x: Inputs) -> dict:
     return out
 
 
+@op("relocation")
+def op_relocation(x: Inputs) -> dict:
+    """gsplat's MCMC relocation kernel (compute_relocation) plus the strategy's clamp."""
+    from gsplat.relocation import compute_relocation
+
+    n_max = x.int("n_max", 51)
+    binoms = torch.zeros((n_max, n_max), device=DEV)
+    for n in range(n_max):
+        for k in range(n + 1):
+            binoms[n, k] = math.comb(n, k)
+    o, s = x.f32("opacities"), x.f32("scales")
+    new_o, new_s = compute_relocation(o, s, x.i32("ratios").clone(), binoms)
+    eps = torch.finfo(torch.float32).eps
+    clamped = torch.clamp(new_o, max=1.0 - eps, min=x.float("min_opacity", 0.005))
+    return {"new_opacities": new_o, "new_scales": new_s, "new_opacities_clamped": clamped}
+
+
+@op("multinomial")
+def op_multinomial(x: Inputs) -> dict:
+    """Inclusion counts of torch.multinomial(weights, k, replacement=False) over `trials` draws."""
+    w = x.f32("weights")
+    k, trials = x.int("k"), x.int("trials", 100000)
+    gen = torch.Generator(device=DEV).manual_seed(x.int("seed", 0))
+    counts = torch.zeros(w.shape[0], dtype=torch.int64, device=DEV)
+    done = 0
+    while done < trials:
+        b = min(10000, trials - done)
+        idx = torch.multinomial(w.expand(b, -1), k, replacement=False, generator=gen)
+        counts += torch.bincount(idx.flatten(), minlength=w.shape[0])
+        done += b
+    return {"counts": counts.to(torch.int32)}
+
+
 @op("render")
 def op_render(x: Inputs) -> dict:
     from gsplat.rendering import rasterization
