@@ -17,6 +17,7 @@ spl-gpu = { path = "platform/spl-gpu" }
 spl-data = { path = "platform/spl-data" }
 spl-db = { path = "platform/spl-db" }
 spl-host = { path = "platform/spl-host" }
+spl-nn = { path = "platform/spl-nn" }
 spl-catalog = { path = "catalog", default-features = false }
 
 # apps
