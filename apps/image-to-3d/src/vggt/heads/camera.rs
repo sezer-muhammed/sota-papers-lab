@@ -117,6 +117,12 @@ struct CamArgs {
 // SAFETY: matches `struct CamArgs` in cuda/vggt_heads.cu.
 unsafe impl spl_nn::cudarc::driver::DeviceRepr for CamArgs {}
 
+/// Head input: the bf16 layer cache or fp32 special tokens.
+enum Input<'a, 'b> {
+    Cache(&'a CudaView<'b, u16>),
+    F32(&'a CudaView<'b, f32>),
+}
+
 pub struct CameraHead {
     k: Arc<Kernels>,
     token_norm: Ln,
@@ -192,6 +198,24 @@ impl CameraHead {
         cams: &mut DeviceCams,
     ) -> Result<Vec<[f32; 9]>> {
         self.enqueue(nn, cache23, g, cams)?;
+        Self::download(nn, g, cams)
+    }
+
+    /// [`Self::run`] on fp32 special tokens `[N·17][2048]` (`[F_23 | G_23]`
+    /// rows 0..17 of every frame): no bf16 rounding of the head input, which
+    /// is most of the fov error of a bf16 layer cache.
+    pub fn run_f32(
+        &self,
+        nn: &Nn,
+        tokens: &CudaView<'_, f32>,
+        g: &Geometry,
+        cams: &mut DeviceCams,
+    ) -> Result<Vec<[f32; 9]>> {
+        self.enqueue_f32(nn, tokens, g, cams)?;
+        Self::download(nn, g, cams)
+    }
+
+    fn download(nn: &Nn, g: &Geometry, cams: &DeviceCams) -> Result<Vec<[f32; 9]>> {
         let pe = nn
             .stream
             .clone_dtoh(&cams.pose_enc)
@@ -213,18 +237,46 @@ impl CameraHead {
         g: &Geometry,
         cams: &mut DeviceCams,
     ) -> Result<()> {
+        if cache23.len() < g.frames * g.tokens() * DIM {
+            bail!(
+                "camera head: layer cache holds {} values, need {}",
+                cache23.len(),
+                g.frames * g.tokens() * DIM
+            );
+        }
+        self.enqueue_input(nn, Input::Cache(cache23), g, cams)
+    }
+
+    /// [`Self::run_f32`] without the download.
+    pub fn enqueue_f32(
+        &self,
+        nn: &Nn,
+        tokens: &CudaView<'_, f32>,
+        g: &Geometry,
+        cams: &mut DeviceCams,
+    ) -> Result<()> {
+        if tokens.len() < g.frames * SPECIAL * DIM {
+            bail!(
+                "camera head: special tokens hold {} values, need {}",
+                tokens.len(),
+                g.frames * SPECIAL * DIM
+            );
+        }
+        self.enqueue_input(nn, Input::F32(tokens), g, cams)
+    }
+
+    fn enqueue_input(
+        &self,
+        nn: &Nn,
+        input: Input<'_, '_>,
+        g: &Geometry,
+        cams: &mut DeviceCams,
+    ) -> Result<()> {
         let n = g.frames;
         if cams.frames < n {
             bail!(
                 "camera head: DeviceCams holds {} frames, need {n}",
                 cams.frames
-            );
-        }
-        if cache23.len() < n * g.tokens() * DIM {
-            bail!(
-                "camera head: layer cache holds {} values, need {}",
-                cache23.len(),
-                n * g.tokens() * DIM
             );
         }
         let mut guard = self
@@ -238,23 +290,30 @@ impl CameraHead {
         let k = &*self.k;
         let rows = n * SPECIAL;
 
-        // Gather the 17 special rows of every frame, token_norm, widen to the
-        // fp32 residual stream, then norm1 of block 0.
-        k.conv.add_table(
-            nn,
-            cache23,
-            None,
-            0.0,
-            &mut w.gathered,
-            n,
-            g.tokens(),
-            0,
-            SPECIAL,
-            DIM,
-        )?;
+        // token_norm (from the 17 special rows of every frame of the bf16
+        // cache, gathered, or from fp32 tokens), widen to the fp32 residual
+        // stream, then norm1 of block 0.
+        let rows_in = match input {
+            Input::Cache(cache23) => {
+                k.conv.add_table(
+                    nn,
+                    cache23,
+                    None,
+                    0.0,
+                    &mut w.gathered,
+                    n,
+                    g.tokens(),
+                    0,
+                    SPECIAL,
+                    DIM,
+                )?;
+                Rows::Bf16(&w.gathered)
+            }
+            Input::F32(t) => Rows::F32(t),
+        };
         k.norm.layer_norm(
             nn,
-            Rows::Bf16(&w.gathered),
+            rows_in,
             rows,
             DIM,
             &self.token_norm.params(),

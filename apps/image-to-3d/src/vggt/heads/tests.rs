@@ -684,3 +684,41 @@ fn profile_heads() {
         run_heads(&s, &cache, &g, 8);
     }
 }
+
+/// `CameraHead::run_f32` on the official fp32 special tokens of L_23.
+#[test]
+#[ignore]
+fn gpu_camera_f32_tokens() {
+    let Some(s) = setup() else { return };
+    let Some(z) = load_npz("heads_n2.npz") else {
+        return;
+    };
+    let n = shape(&z, "L23")[0];
+    let g = geometry(&z, n);
+    let l = f32s(&z, "L23");
+    let t = g.tokens();
+    let tok: Vec<f32> = (0..n)
+        .flat_map(|f| l[f * t * DIM..(f * t + SPECIAL) * DIM].to_vec())
+        .collect();
+    let d = s.nn.stream.clone_htod(&tok).unwrap();
+    let mut cams = DeviceCams::new(&s.nn, n).unwrap();
+    let pose = s
+        .camera
+        .run_f32(&s.nn, &d.slice(..), &g, &mut cams)
+        .unwrap()
+        .concat();
+    let pe = f32s(&z, "pose_enc");
+    report(
+        "pose_enc (f32 in)",
+        &pose,
+        &pe,
+        Some(&f32s(&z, "pose_enc_bf16in")),
+        1e-2,
+    );
+    let fov = (0..n)
+        .flat_map(|f| (7..9).map(move |j| f * 9 + j))
+        .map(|i| ((pose[i] - pe[i]) as f64).abs().to_degrees())
+        .fold(0.0, f64::max);
+    println!("fov err (f32 tokens) {fov:.4}°");
+    assert!(fov < 0.05);
+}
