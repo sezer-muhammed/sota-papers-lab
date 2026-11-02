@@ -21,6 +21,10 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use ts_rs::TS;
 
+mod uploads;
+
+pub use uploads::{UploadRequest, UploadSession};
+
 use crate::queue::WaitReason;
 use crate::{Config, Host};
 
@@ -102,6 +106,7 @@ struct AppState {
     auth_token: Option<Arc<str>>,
     max_upload_mb: u64,
     max_upload_bytes: u64,
+    uploads: Arc<uploads::Uploads>,
 }
 
 /// Artifacts are content-addressed, so a URL's bytes never change.
@@ -124,6 +129,7 @@ pub fn router(host: Arc<Host>, config: &Config) -> Router {
         auth_token: config.auth_token.as_deref().map(Arc::from),
         max_upload_mb: config.max_upload_mb,
         max_upload_bytes: config.max_upload_bytes(),
+        uploads: Arc::default(),
     };
     // Uploads stream to disk and enforce `max_upload_mb` themselves: the
     // `Body` extractor they use has no size limit of its own.
@@ -134,6 +140,7 @@ pub fn router(host: Arc<Host>, config: &Config) -> Router {
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/artifacts", post(upload_artifact))
         .route("/artifacts/{id}", get(get_artifact))
+        .merge(uploads::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     let api = Router::new()
         .route("/health", get(health))
