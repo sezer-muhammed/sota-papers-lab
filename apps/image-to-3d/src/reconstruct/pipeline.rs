@@ -99,7 +99,7 @@ pub struct PipelineConfig {
     /// centroid; 0 keeps the engine's units.
     pub world_spread: f32,
     /// Frames per engine pass; more are registered in chunks (12 GB fits
-    /// about 190 frames at 512×336).
+    /// about 200 frames at 512×336 when idle).
     pub engine_max_frames: u32,
     /// Keep the engine resident after posing (faster next run, less VRAM).
     pub keep_engine: bool,
@@ -139,7 +139,7 @@ impl PipelineConfig {
             depth_conf_drop: 0.3,
             snapshot_every_s: 8.0,
             world_spread: 0.0,
-            engine_max_frames: 180,
+            engine_max_frames: 200,
             keep_engine: false,
             overrides: PresetOverrides::default(),
         };
@@ -478,6 +478,51 @@ pub fn pose_frames(
     Ok((posed, load_s, t1.elapsed().as_secs_f64(), fwd))
 }
 
+/// Moves each camera of `test` with its nearest (by centre) camera of
+/// `before`: `T' = T · T_nn⁻¹ · T_nn'` with `T_nn'` the same camera in
+/// `after` (world-to-camera transforms; `before[k]` and `after[k]` are one
+/// camera). Keeps the engine's relative pose to the neighbour.
+pub fn carry_poses(test: &[View], before: &[View], after: &[View]) -> Vec<View> {
+    type M = [[f64; 3]; 3];
+    let mul = |a: &M, b: &M| -> M {
+        std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
+    };
+    let mv = |a: &M, v: &[f64; 3]| -> [f64; 3] {
+        std::array::from_fn(|i| (0..3).map(|k| a[i][k] * v[k]).sum())
+    };
+    let tr = |a: &M| -> M { std::array::from_fn(|i| std::array::from_fn(|j| a[j][i])) };
+    test.iter()
+        .map(|v| {
+            let c = v.center();
+            let nn = before
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let d = |x: &View| {
+                        let p = x.center();
+                        (0..3).map(|k| (p[k] - c[k]).powi(2)).sum::<f64>()
+                    };
+                    d(a).total_cmp(&d(b))
+                })
+                .map(|(k, _)| k);
+            let Some(k) = nn else {
+                return v.clone();
+            };
+            let (b, a) = (&before[k], &after[k]);
+            // M = T_b⁻¹ · T_a: R = R_bᵀ R_a, t = R_bᵀ (t_a − t_b).
+            let rbt = tr(&b.r_cw);
+            let rm = mul(&rbt, &a.r_cw);
+            let tm = mv(&rbt, &std::array::from_fn(|i| a.t_cw[i] - b.t_cw[i]));
+            // T' = T · M: R = R R_m, t = R t_m + t.
+            let mut out = v.clone();
+            out.r_cw = mul(&v.r_cw, &rm);
+            let rt = mv(&v.r_cw, &tm);
+            out.t_cw = std::array::from_fn(|i| rt[i] + v.t_cw[i]);
+            out
+        })
+        .collect()
+}
+
 /// Pose bootstrap: a short sparse-init run with joint pose refinement;
 /// returns the refined training views.
 #[allow(clippy::too_many_arguments)]
@@ -629,6 +674,8 @@ pub fn reconstruct_with(
     events(Event::Progress(0.16, "initializing".into()));
     let gpu = Gpu::open()?;
     let mut focal = focal;
+    // The engine's training cameras: held-out cameras are carried from them.
+    let engine_train = posed.views(&train, tw, th, focal);
     if cfg.bootstrap_iters > 0 {
         let t = Instant::now();
         let imgs: Vec<Rgb8Image> = train.iter().map(|&i| frames.trainer[i].clone()).collect();
@@ -740,12 +787,6 @@ pub fn reconstruct_with(
     };
     drop(posed);
     let mut joint = Joint::new(tr, joint_cfg, priors)?;
-    let test = if test_views.is_empty() {
-        None
-    } else {
-        Some(TestViews::new(&gpu, test_views, &test_imgs)?)
-    };
-
     let t_train = Instant::now();
     let mut last_progress = Instant::now();
     let mut last_snap = Instant::now();
@@ -809,10 +850,16 @@ pub fn reconstruct_with(
     let views = joint.refined_views()?;
     times.export_s = t_export.elapsed().as_secs_f64();
     times.total_s = started.elapsed().as_secs_f64();
-    let mut test = test;
-    if let Some(tv) = test.as_mut() {
+    // Held-out cameras follow their nearest training camera's refinement
+    // (training information only), then share the refined intrinsics.
+    let test = if test_views.is_empty() {
+        None
+    } else {
+        let carried = carry_poses(&test_views, &engine_train, &views);
+        let mut tv = TestViews::new(&gpu, carried, &test_imgs)?;
         tv.share_intrinsics(&gpu, &joint.tr.scene_gpu.cams)?;
-    }
+        Some(tv)
+    };
     let peak = joint.tr.summary.peak_vram_bytes;
     Ok(Reconstruction {
         iterations: joint.tr.t,
@@ -861,6 +908,56 @@ mod tests {
             d.sort_unstable();
             d.dedup();
             assert_eq!(d.len(), c.len(), "no duplicates");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn carried_cameras_keep_their_relative_pose() {
+        let rz = |d: f64| -> [[f64; 3]; 3] {
+            let (s, c) = d.to_radians().sin_cos();
+            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+        };
+        let view = |r, t| View {
+            name: String::new(),
+            camera: 0,
+            r_cw: r,
+            t_cw: t,
+            fx: 1.,
+            fy: 1.,
+            cx: 0.,
+            cy: 0.,
+            width: 1,
+            height: 1,
+            image_path: PathBuf::new(),
+        };
+        let before = vec![
+            view(rz(0.0), [0.0, 0.0, 0.0]),
+            view(rz(0.0), [10.0, 0.0, 0.0]),
+        ];
+        // The world moved: every camera got the same world transform G
+        // (T' = T·G); a test camera near camera 0 must get it too.
+        let g_r = rz(5.0);
+        let g_t = [0.3, -0.2, 0.1];
+        let apply = |v: &View| {
+            let mut o = v.clone();
+            for i in 0..3 {
+                for j in 0..3 {
+                    o.r_cw[i][j] = (0..3).map(|k| v.r_cw[i][k] * g_r[k][j]).sum();
+                }
+                o.t_cw[i] = (0..3).map(|k| v.r_cw[i][k] * g_t[k]).sum::<f64>() + v.t_cw[i];
+            }
+            o
+        };
+        let after: Vec<View> = before.iter().map(apply).collect();
+        let test = vec![view(rz(20.0), [0.5, 0.1, 0.0])];
+        let got = carry_poses(&test, &before, &after);
+        let want = apply(&test[0]);
+        for i in 0..3 {
+            assert!((got[0].t_cw[i] - want.t_cw[i]).abs() < 1e-12);
+            for j in 0..3 {
+                assert!((got[0].r_cw[i][j] - want.r_cw[i][j]).abs() < 1e-12);
+            }
         }
     }
 

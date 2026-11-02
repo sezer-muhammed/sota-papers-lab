@@ -73,7 +73,7 @@ snapshot_every_s: number,
 world_spread: number, 
 /**
  * Frames per engine pass; more are registered in chunks (12 GB fits
- * about 190 frames at 512×336).
+ * about 200 frames at 512×336 when idle).
  */
 engine_max_frames: number, 
 /**
