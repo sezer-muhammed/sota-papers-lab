@@ -1142,7 +1142,7 @@ fn gpu_small_kernels_match_cpu() {
     let em = ErrorMap {
         err: s.clone_htod(&err).unwrap(),
         minmax: s.clone_htod(&[lo, hi]).unwrap(),
-        sums: s.alloc_zeros::<f32>(2).unwrap(),
+        sums: s.alloc_zeros::<f64>(2).unwrap(),
     };
     let mut mask = s.alloc_zeros::<u8>(px).unwrap();
     vcd_mask(&gpu, &k, &em, 0.1, px as u32, &mut mask).unwrap();

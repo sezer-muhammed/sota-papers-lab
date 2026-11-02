@@ -1045,7 +1045,7 @@ impl Scoring {
             err: ErrorMap {
                 err: s.alloc_zeros::<f32>(max_px).cuda("alloc VCD error")?,
                 minmax: s.alloc_zeros::<f32>(2).cuda("alloc VCD min/max")?,
-                sums: s.alloc_zeros::<f32>(2).cuda("alloc VCD sums")?,
+                sums: s.alloc_zeros::<f64>(2).cuda("alloc VCD sums")?,
             },
             mask: s.alloc_zeros::<u8>(max_px).cuda("alloc VCD mask")?,
         })
@@ -1112,7 +1112,7 @@ impl FastGs {
                 .stream
                 .clone_dtoh(&sc.err.sums.slice(0..2))
                 .cuda("read view loss")?;
-            let e = 0.8 * sums[0] + 0.2 * (1.0 - sums[1]);
+            let e = (0.8 * sums[0] + 0.2 * (1.0 - sums[1])) as f32;
             vcd_mask(gpu, &w.k, &sc.err, self.cfg.loss_thresh, px, &mut sc.mask)?;
             cx.raster.count_masked(
                 gpu,
