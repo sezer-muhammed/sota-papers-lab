@@ -452,4 +452,18 @@ mod tests {
         let info = validate_glb(&data).unwrap();
         assert_eq!(info.version, 2);
     }
+
+    #[test]
+    fn glb_external_validator() {
+        let out_path = std::env::var("SPL_GLB_OUT").ok();
+        let Some(out) = out_path else {
+            return;
+        };
+        let mesh = cube_mesh();
+        let (uv_mesh, _) = generate_atlas(&mesh, 256, 2).unwrap();
+        let atlas = make_test_atlas(uv_mesh.atlas_width, uv_mesh.atlas_height);
+        let path = std::path::Path::new(&out);
+        let (size, ms) = write_glb_file(path, &uv_mesh, &atlas, TextureFormat::Png).unwrap();
+        eprintln!("GLB written: {size} bytes, {ms:.1} ms → {}", path.display());
+    }
 }
