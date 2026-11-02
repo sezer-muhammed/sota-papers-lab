@@ -22,6 +22,10 @@ gpu_wait_s: number,
  */
 glb?: ArtifactRef, 
 /**
+ * Why the requested mesh is missing; the splat outputs are still valid.
+ */
+mesh_error?: string, 
+/**
  * The front end that produced the poses.
  */
 engine: string, 

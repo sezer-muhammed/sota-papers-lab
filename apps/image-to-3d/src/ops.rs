@@ -157,6 +157,9 @@ pub struct TrainOutput {
     pub mesh: Option<ArtifactRef>,
     #[ts(optional)]
     pub mesh_summary: Option<MeshSummary>,
+    /// Why the requested mesh is missing; the splat outputs are still valid.
+    #[ts(optional)]
+    pub mesh_error: Option<String>,
 }
 
 pub struct Train;
@@ -212,6 +215,7 @@ impl Op for Train {
                 gpu_wait_s: 0.0,
                 mesh: None,
                 mesh_summary: None,
+                mesh_error: None,
             });
         }
 
@@ -308,6 +312,20 @@ impl Op for Train {
             coexist,
             mesh,
         } = job.await??;
+        let (mesh, mesh_error) = match mesh {
+            Some(Ok(m)) => (Some(m), None),
+            Some(Err(e)) => {
+                let msg = format!("{e:#}");
+                cx.log(format!("mesh failed, keeping the splat: {msg}"));
+                (None, Some(msg))
+            }
+            None => (None, None),
+        };
+        if let Some(m) = &mesh {
+            for n in &m.summary.notes {
+                cx.log(format!("mesh: {n}"));
+            }
+        }
         cx.metric("train_time", summary.train_s, "s");
         cx.metric("final_gaussians", summary.final_gaussians as f64, "");
         cx.metric(
@@ -330,6 +348,7 @@ impl Op for Train {
             gpu_wait_s: coexist.waited_s,
             mesh: None,
             mesh_summary: None,
+            mesh_error,
         };
         if let Some(m) = mesh {
             cx.metric("mesh_time", m.summary.total_s, "s");
@@ -381,7 +400,8 @@ struct Trained {
     summary: TrainSummary,
     eval: Option<ImageMetrics>,
     coexist: vram::Coexist,
-    mesh: Option<MeshResult>,
+    /// The mesh, or why it failed (never fails the run).
+    mesh: Option<Result<MeshResult>>,
 }
 
 /// Messages from the training thread.
@@ -414,10 +434,9 @@ fn train_blocking(
     };
     let (cloud, mut s) = trainer.finish()?;
     s.train_s = summary.train_s;
-    let mesh = match mesh_cfg {
-        Some(c) => Some(crate::mesh::pipeline::build(&gpu, &cloud, mesh_views, c)?),
-        None => None,
-    };
+    let mesh = mesh_cfg
+        .as_ref()
+        .map(|c| crate::mesh::pipeline::build(&gpu, &cloud, mesh_views, c));
     Ok(Trained {
         cloud,
         summary: s,

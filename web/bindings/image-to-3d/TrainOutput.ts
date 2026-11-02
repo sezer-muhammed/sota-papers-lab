@@ -18,4 +18,8 @@ gpu_memory: Array<string>,
 /**
  * Seconds spent waiting for GPU memory.
  */
-gpu_wait_s: number, mesh?: ArtifactRef, mesh_summary?: MeshSummary, };
+gpu_wait_s: number, mesh?: ArtifactRef, mesh_summary?: MeshSummary, 
+/**
+ * Why the requested mesh is missing; the splat outputs are still valid.
+ */
+mesh_error?: string, };

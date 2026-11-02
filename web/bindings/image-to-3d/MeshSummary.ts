@@ -3,4 +3,8 @@
 /**
  * What the mesher did and how long each stage took.
  */
-export type MeshSummary = { views_fused: number, voxel: number, blocks: number, raw_triangles: number, kept_triangles: number, triangles: number, vertices: number, atlas_size: number, glb_bytes: bigint, depth_ms: number, fuse_ms: number, extract_ms: number, clean_ms: number, simplify_ms: number, uv_ms: number, bake_ms: number, glb_ms: number, total_s: number, };
+export type MeshSummary = { views_fused: number, voxel: number, blocks: number, raw_triangles: number, kept_triangles: number, triangles: number, vertices: number, atlas_size: number, glb_bytes: bigint, depth_ms: number, fuse_ms: number, extract_ms: number, clean_ms: number, simplify_ms: number, uv_ms: number, bake_ms: number, glb_ms: number, total_s: number, 
+/**
+ * What the mesher changed to fit (clipped bounds, coarser voxel).
+ */
+notes: Array<string>, };

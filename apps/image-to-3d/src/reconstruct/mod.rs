@@ -113,6 +113,9 @@ pub struct ReconstructOutput {
     /// Textured GLB mesh, when `mesh` was requested.
     #[ts(optional)]
     pub glb: Option<ArtifactRef>,
+    /// Why the requested mesh is missing; the splat outputs are still valid.
+    #[ts(optional)]
+    pub mesh_error: Option<String>,
     /// The front end that produced the poses.
     pub engine: String,
     /// SPDX licence of the engine's weights.
@@ -181,9 +184,22 @@ impl Op for Reconstruct {
             let r = r.inspect_err(|_| crate::vram::release_quietly())?;
             let glb = if let Some(ref mc) = mesh_cfg {
                 send(Event::Progress(0.92, "meshing".into()));
-                let gpu = crate::gpu::Gpu::open()?;
-                let mesh = crate::mesh::pipeline::build(&gpu, &r.cloud, &r.views, mc)?;
-                Some(mesh.glb)
+                // A mesh failure never fails the run: the splat is the product.
+                let built = crate::gpu::Gpu::open()
+                    .and_then(|gpu| crate::mesh::pipeline::build(&gpu, &r.cloud, &r.views, mc));
+                match built {
+                    Ok(mesh) => {
+                        for n in &mesh.summary.notes {
+                            send(Event::Log(format!("mesh: {n}")));
+                        }
+                        Some(Ok(mesh.glb))
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        send(Event::Log(format!("mesh failed, keeping the splat: {msg}")));
+                        Some(Err(msg))
+                    }
+                }
             } else {
                 None
             };
@@ -246,6 +262,11 @@ impl Op for Reconstruct {
             .artifacts
             .put(colmap, ArtifactKind::Cameras, MEDIA_ZIP)
             .await?;
+        let (glb_bytes, mesh_error) = match glb_bytes {
+            Some(Ok(b)) => (Some(b), None),
+            Some(Err(e)) => (None, Some(e)),
+            None => (None, None),
+        };
         let glb = match glb_bytes {
             Some(bytes) => Some(
                 cx.artifacts
@@ -279,6 +300,7 @@ impl Op for Reconstruct {
             gpu_memory: coexist.notes,
             gpu_wait_s: coexist.waited_s,
             glb,
+            mesh_error,
             engine: engine_name,
             licence: engine_licence,
         })

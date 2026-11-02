@@ -147,6 +147,9 @@ pub struct MeshSummary {
     pub bake_ms: f64,
     pub glb_ms: f64,
     pub total_s: f64,
+    /// What the mesher changed to fit (clipped bounds, coarser voxel).
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// The mesher's results: the fused surface before decimation (for
@@ -208,6 +211,53 @@ pub fn auto_bounds(cloud: &GaussiansHost) -> [f32; 6] {
     }
     b
 }
+
+/// The fusion box: [`auto_bounds`], clipped to the region the cameras cover
+/// when the splat reaches far beyond them (unbounded outdoor scenes, where
+/// the background Gaussians would otherwise stretch the volume). Object
+/// captures (DTU: cameras on a cap around a small object) are unchanged.
+pub fn scene_bounds(cloud: &GaussiansHost, views: &[View]) -> ([f32; 6], bool) {
+    let b = auto_bounds(cloud);
+    if views.len() < 2 {
+        return (b, false);
+    }
+    let mut c = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for v in views {
+        let p = v.center();
+        for k in 0..3 {
+            c[k] = c[k].min(p[k] as f32);
+            c[3 + k] = c[3 + k].max(p[k] as f32);
+        }
+    }
+    let cam = (0..3).map(|k| c[3 + k] - c[k]).fold(0.0f32, f32::max);
+    let size = (0..3).map(|k| b[3 + k] - b[k]).fold(0.0f32, f32::max);
+    if !(cam > 0.0 && cam.is_finite()) || size <= CLIP_RATIO * cam {
+        return (b, false);
+    }
+    // Keep the camera box grown by its longest side on every face.
+    let mut out = b;
+    for k in 0..3 {
+        let mid = 0.5 * (c[k] + c[3 + k]);
+        out[k] = b[k].max(mid - 1.5 * cam);
+        out[3 + k] = b[3 + k].min(mid + 1.5 * cam);
+        if out[k] >= out[3 + k] {
+            return (b, false);
+        }
+    }
+    (out, true)
+}
+
+/// Splat boxes wider than this many camera extents are clipped.
+const CLIP_RATIO: f32 = 3.0;
+/// Voxel growth for the one retry after a TSDF pool overflow.
+const RETRY_COARSEN: f32 = 1.75;
 
 /// glTF requires unit normals: degenerate faces leave zero vectors.
 pub fn unit_normals(normals: &mut [[f32; 3]]) {
@@ -307,7 +357,18 @@ pub fn fuse_with(
     let kernels = GeomKernels::load(gpu, &variant)?;
     let mut buf = GeomBuffers::alloc(gpu, raster.frame.cap, false)?;
 
-    let b = cfg.bounds.unwrap_or_else(|| auto_bounds(cloud));
+    let b = match cfg.bounds {
+        Some(b) => b,
+        None => {
+            let (b, clipped) = scene_bounds(cloud, views);
+            if clipped {
+                summary.notes.push(format!(
+                    "bounds clipped to the camera-covered region {b:?} (the splat reaches far beyond the cameras)"
+                ));
+            }
+            b
+        }
+    };
     let lo = [b[0], b[1], b[2]];
     let size = (0..3).map(|k| b[3 + k] - b[k]).fold(0.0f32, f32::max);
     ensure!(size > 0.0 && size.is_finite(), "empty mesh bounds {b:?}");
@@ -414,7 +475,28 @@ pub fn build(
 ) -> Result<MeshResult> {
     let started = Instant::now();
     let mut summary = MeshSummary::default();
-    let vol = fuse(gpu, cloud, views, cfg, &mut summary)?;
+    let vol = match fuse(gpu, cloud, views, cfg, &mut summary) {
+        Err(e) if is_overflow(&e) => {
+            // Same box, coarser samples: blocks fall by about RETRY_COARSEN².
+            let mut retry = cfg.clone();
+            retry.voxel = Some(summary.voxel * RETRY_COARSEN);
+            let note = format!(
+                "{e:#}; retried with voxel {:.4} (was {:.4})",
+                summary.voxel * RETRY_COARSEN,
+                summary.voxel
+            );
+            let mut notes = std::mem::take(&mut summary.notes);
+            notes.push(note);
+            if retry.bounds.is_none() {
+                retry.bounds = Some(scene_bounds(cloud, views).0);
+            }
+            summary = MeshSummary::default();
+            let vol = fuse(gpu, cloud, views, &retry, &mut summary)?;
+            summary.notes = notes;
+            vol
+        }
+        r => r?,
+    };
     let t = Instant::now();
     let mut raw = vol.extract(ExtractOptions {
         min_weight: cfg.min_weight,
@@ -471,6 +553,10 @@ pub fn build(
     Ok(MeshResult { raw, glb, summary })
 }
 
+fn is_overflow(e: &spl_core::Error) -> bool {
+    format!("{e:#}").contains("TSDF overflow")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +582,41 @@ mod tests {
         }
         let b = auto_bounds(&c);
         assert!(b[0] < 0.02 && b[3] > 0.98, "{b:?}");
+    }
+
+    fn view_at(x: f64) -> View {
+        View {
+            name: String::new(),
+            camera: 1,
+            r_cw: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            t_cw: [-x, 0.0, 0.0],
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.5,
+            cy: 0.5,
+            width: 1,
+            height: 1,
+            image_path: Default::default(),
+        }
+    }
+
+    #[test]
+    fn bounds_clip_far_background_only() {
+        // Object at the origin, cameras within ±1: no clipping.
+        let mut c = GaussiansHost::zeros(1000);
+        for i in 0..1000 {
+            c.means[3 * i] = i as f32 / 999.0 - 0.5;
+            c.opacities[i] = 1.0;
+        }
+        let views = [view_at(-1.0), view_at(1.0)];
+        let (b, clipped) = scene_bounds(&c, &views);
+        assert!(!clipped && b == auto_bounds(&c));
+        // A background shell out to ±100: clipped to cameras ± 3.
+        for i in 0..1000 {
+            c.means[3 * i] = (i as f32 / 999.0 - 0.5) * 200.0;
+        }
+        let (b, clipped) = scene_bounds(&c, &views);
+        assert!(clipped && b[0] == -3.0 && b[3] == 3.0, "{b:?}");
     }
 
     #[test]
