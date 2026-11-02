@@ -5,6 +5,8 @@
 //!   dataset root, or an uploaded zip) → splat artifacts (.ply, .spz), camera
 //!   exports, metrics. `dry_run` loads and validates the dataset only.
 //! - `image_to_3d.render`: one view of a trained splat → PNG.
+//! - `image_to_3d.mesh` (in `mesh::op`): splat + cameras → textured GLB; the
+//!   train op's `mesh` option runs the same mesher after training.
 //!
 
 use std::path::{Component, Path, PathBuf};
@@ -29,6 +31,8 @@ use crate::io::scene::{LoadOptions, Scene, View, find_dataset_root, load_colmap_
 use crate::kernels::layout::{EPS2D_DEFAULT, FLAG_AA};
 use crate::kernels::raster::{FrameSource, GpuRaster, SplatRaster};
 use crate::kernels::{Capacity, RasterVariant, RenderMode};
+use crate::mesh::op::MEDIA_GLB;
+use crate::mesh::pipeline::{MeshConfig, MeshResult, MeshSummary};
 use crate::model::{Gaussians, GaussiansHost};
 use crate::presets::DensifyPreset;
 use crate::trainer::{TrainConfig, TrainProgress, TrainSummary, Trainer, planar_to_rgb8};
@@ -83,6 +87,11 @@ pub struct TrainInput {
     /// Only load and validate the dataset (no GPU work).
     #[serde(default)]
     pub dry_run: bool,
+    /// Also extract a textured mesh (GLB) from the trained splats and the
+    /// training views (use the Geometry preset for the best surface).
+    #[serde(default)]
+    #[ts(optional)]
+    pub mesh: Option<MeshConfig>,
 }
 
 /// What was loaded.
@@ -144,6 +153,10 @@ pub struct TrainOutput {
     pub gpu_memory: Vec<String>,
     /// Seconds spent waiting for GPU memory.
     pub gpu_wait_s: f64,
+    #[ts(optional)]
+    pub mesh: Option<ArtifactRef>,
+    #[ts(optional)]
+    pub mesh_summary: Option<MeshSummary>,
 }
 
 pub struct Train;
@@ -197,12 +210,20 @@ impl Op for Train {
                 colmap: None,
                 gpu_memory: Vec::new(),
                 gpu_wait_s: 0.0,
+                mesh: None,
+                mesh_summary: None,
             });
         }
 
         let mut cfg = input.train.clone();
         let cancel = cx.cancel.clone();
         let do_eval = input.eval;
+        let mesh_cfg = input.mesh.clone();
+        let mesh_views: Vec<View> = scene
+            .train
+            .iter()
+            .map(|&i| scene.views[i].clone())
+            .collect();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
         let views = scene.views.clone();
         let load = input.load.clone();
@@ -255,7 +276,7 @@ impl Op for Train {
             } else {
                 scene
             };
-            let r = train_blocking(scene, cfg, do_eval, &cancel, &tx);
+            let r = train_blocking(scene, cfg, do_eval, &mesh_cfg, &mesh_views, &cancel, &tx);
             vram::release_quietly();
             r.map(|t| Trained { coexist, ..t })
         });
@@ -285,6 +306,7 @@ impl Op for Train {
             summary,
             eval,
             coexist,
+            mesh,
         } = job.await??;
         cx.metric("train_time", summary.train_s, "s");
         cx.metric("final_gaussians", summary.final_gaussians as f64, "");
@@ -306,7 +328,19 @@ impl Op for Train {
             colmap: None,
             gpu_memory: coexist.notes,
             gpu_wait_s: coexist.waited_s,
+            mesh: None,
+            mesh_summary: None,
         };
+        if let Some(m) = mesh {
+            cx.metric("mesh_time", m.summary.total_s, "s");
+            cx.metric("mesh_triangles", m.summary.triangles as f64, "");
+            out.mesh = Some(
+                cx.artifacts
+                    .put(m.glb, ArtifactKind::Mesh, MEDIA_GLB)
+                    .await?,
+            );
+            out.mesh_summary = Some(m.summary);
+        }
         for fmt in &input.export {
             match fmt {
                 ExportFormat::Ply => {
@@ -347,6 +381,7 @@ struct Trained {
     summary: TrainSummary,
     eval: Option<ImageMetrics>,
     coexist: vram::Coexist,
+    mesh: Option<MeshResult>,
 }
 
 /// Messages from the training thread.
@@ -362,6 +397,8 @@ fn train_blocking(
     scene: Scene,
     cfg: TrainConfig,
     do_eval: bool,
+    mesh_cfg: &Option<crate::mesh::pipeline::MeshConfig>,
+    mesh_views: &[View],
     cancel: &spl_core::CancellationToken,
     tx: &tokio::sync::mpsc::UnboundedSender<Progress>,
 ) -> Result<Trained> {
@@ -377,11 +414,16 @@ fn train_blocking(
     };
     let (cloud, mut s) = trainer.finish()?;
     s.train_s = summary.train_s;
+    let mesh = match mesh_cfg {
+        Some(c) => Some(crate::mesh::pipeline::build(&gpu, &cloud, mesh_views, c)?),
+        None => None,
+    };
     Ok(Trained {
         cloud,
         summary: s,
         eval,
         coexist: vram::Coexist::default(),
+        mesh,
     })
 }
 
@@ -566,7 +608,16 @@ pub fn render_cloud(
 /// The dataset directory a train run reads: a validated name under the
 /// dataset root, or an uploaded zip extracted (once) under the data dir.
 async fn dataset_root(cx: &RunCx, input: &TrainInput) -> Result<PathBuf> {
-    match (&input.dataset, &input.zip) {
+    dataset_dir(cx, &input.dataset, &input.zip).await
+}
+
+/// [`dataset_root`] for any op that takes a `dataset` folder or a `zip` id.
+pub(crate) async fn dataset_dir(
+    cx: &RunCx,
+    dataset: &Option<String>,
+    zip: &Option<String>,
+) -> Result<PathBuf> {
+    match (dataset, zip) {
         (Some(name), None) => {
             let base = match std::env::var_os("SPL_DATASETS") {
                 Some(p) => PathBuf::from(p),

@@ -266,6 +266,9 @@ fn schedule_defaults_to_the_official_layers() {
     assert_eq!(reg, REGISTER_LAYERS);
     let mut p2 = s;
     p2.0[0] = InterAttn::Sage;
+    assert!(super::trunk_schedule(&p2).is_ok());
+    // Register layers are fixed by the checkpoint.
+    p2.0[2] = InterAttn::Sage;
     assert!(super::trunk_schedule(&p2).is_err());
     assert!(super::trunk_schedule(&s).is_ok());
 }

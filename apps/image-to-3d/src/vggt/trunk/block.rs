@@ -11,8 +11,8 @@
 //! erf GELU run in `spl_nn::norm::Norm::row_epilogue`.
 
 use spl_core::Result;
-use spl_nn::cudarc::driver::{CudaSlice, CudaView};
-use spl_nn::gemm::{Epilogue, GemmShape};
+use spl_nn::cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
+use spl_nn::gemm::{Epilogue, Fp8Scales, GemmShape, WeightScale};
 use spl_nn::norm::{Branch, LnParams, Quant, Rows, RowsMut};
 use spl_nn::qkv::{NormKind, QkNorm, QkvIn, QkvOut, Rope};
 use spl_nn::{Act, Nn};
@@ -254,6 +254,253 @@ pub(crate) fn forward(
         tok: None,
         chan: None,
         bias: None,
+        layer_scale: Some(&bw.ls2),
+    };
+    match next {
+        Some(ln) => {
+            let p = ln.params();
+            ops.norm.residual_layer_norm(
+                nn,
+                RowsMut::F32(&mut *x),
+                &branch,
+                rows,
+                DIM,
+                &p,
+                Some(&mut *s.xn),
+                Quant::None,
+            )
+        }
+        None => ops
+            .res
+            .add(nn, RowsMut::F32(&mut *x), &branch, rows, DIM, DIM),
+    }
+}
+
+/// FP8 E4M3 copies of a block's four linear weights and their
+/// per-output-channel scales (`<name>_scale` in the FP8 file).
+pub struct Fp8Weights<'a> {
+    pub qkv: (CudaView<'a, u8>, CudaView<'a, f32>),
+    pub proj: (CudaView<'a, u8>, CudaView<'a, f32>),
+    pub fc1: (CudaView<'a, u8>, CudaView<'a, f32>),
+    pub fc2: (CudaView<'a, u8>, CudaView<'a, f32>),
+}
+
+impl<'a> Fp8Weights<'a> {
+    pub fn load(w: &'a dyn TrunkWeights, prefix: &str) -> Result<Self> {
+        let f = |s: &str| w.fp8(&format!("{prefix}.{s}.weight"));
+        Ok(Self {
+            qkv: f("attn.qkv")?,
+            proj: f("attn.proj")?,
+            fc1: f("mlp.fc1")?,
+            fc2: f("mlp.fc2")?,
+        })
+    }
+}
+
+/// FP8 activation buffers: `x8` holds `rows · 4096` bytes; `tok` two
+/// per-token scale vectors of `rows` each (one is read while the other is
+/// written).
+pub(crate) struct Fp8Scratch<'b, 'c> {
+    pub x8: &'b mut CudaViewMut<'c, u8>,
+    pub tok: [&'b mut CudaSlice<f32>; 2],
+}
+
+/// [`forward`] with the four GEMMs in FP8 E4M3 (per-token activation
+/// scales, per-channel weight scales applied by the consumer kernels, as
+/// cuBLASLt on Ada cannot take an FP8 alpha vector). Same contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_fp8(
+    nn: &Nn,
+    ops: &Ops,
+    bw: &BlockWeights<'_>,
+    f8: &Fp8Weights<'_>,
+    x: &mut CudaSlice<f32>,
+    s: &mut Scratch<'_>,
+    q8: &mut Fp8Scratch<'_, '_>,
+    call: &Call<'_>,
+    attn: &dyn InterAttention,
+    next: Option<&LnWeights<'_>>,
+) -> Result<()> {
+    let rows = call.n_seq * call.seq_len;
+    let deferred = Fp8Scales {
+        weight: WeightScale::Deferred,
+        act: None,
+    };
+    let [t0, t1] = &mut q8.tok;
+    // LN1 → FP8 (tok0).
+    if call.xn_ready {
+        ops.norm.row_epilogue(
+            nn,
+            &mut *s.xn,
+            rows,
+            DIM,
+            DIM,
+            None,
+            None,
+            None,
+            Act::None,
+            false,
+            Quant::PerToken {
+                q: &mut *q8.x8,
+                scales: &mut **t0,
+            },
+        )?;
+    } else {
+        let p = bw.norm1.params();
+        ops.norm.layer_norm(
+            nn,
+            Rows::F32(&*x),
+            rows,
+            DIM,
+            &p,
+            None,
+            Quant::PerToken {
+                q: &mut *q8.x8,
+                scales: &mut **t0,
+            },
+        )?;
+    }
+    ops.gemm.linear_fp8(
+        nn,
+        &*q8.x8,
+        &f8.qkv.0,
+        &deferred,
+        None,
+        Epilogue::None,
+        &mut *s.big,
+        GemmShape::packed(rows, 3 * DIM, DIM),
+    )?;
+    let qk = bw.qk_norm.as_ref().map(|[qw, qb, kw, kb]| QkNorm {
+        kind: NormKind::LayerNorm,
+        q_weight: qw,
+        q_bias: Some(qb),
+        k_weight: kw,
+        k_bias: Some(kb),
+        eps: LN_EPS,
+    });
+    ops.qkv.run(
+        nn,
+        &QkvIn {
+            y: &*s.big,
+            ld: 3 * DIM,
+            tok: Some(&**t0),
+            chan: Some(&f8.qkv.1),
+            bias: bw.qkv_b.as_ref().map(|b| b as _),
+        },
+        rows,
+        HEADS,
+        qk.as_ref(),
+        call.rope.as_ref(),
+        QkvOut {
+            q: &mut *s.q,
+            k: &mut *s.k,
+            v: &mut *s.v,
+            v_format: attn.v_format(),
+        },
+    )?;
+    attn.forward(
+        nn,
+        &ops.fa,
+        &*s.q,
+        &*s.k,
+        &*s.v,
+        &mut *s.o,
+        call.n_seq,
+        call.seq_len,
+    )?;
+    // Attention output → FP8 (tok1) → proj.
+    ops.norm.row_epilogue(
+        nn,
+        &mut *s.o,
+        rows,
+        DIM,
+        DIM,
+        None,
+        None,
+        None,
+        Act::None,
+        false,
+        Quant::PerToken {
+            q: &mut *q8.x8,
+            scales: &mut **t1,
+        },
+    )?;
+    ops.gemm.linear_fp8(
+        nn,
+        &*q8.x8,
+        &f8.proj.0,
+        &deferred,
+        None,
+        Epilogue::None,
+        &mut *s.y,
+        GemmShape::packed(rows, DIM, DIM),
+    )?;
+    // x += ls1 ⊙ proj, LN2 → FP8 (tok0).
+    {
+        let branch = Branch {
+            y: &*s.y,
+            tok: Some(&**t1),
+            chan: Some(&f8.proj.1),
+            bias: Some(&bw.proj_b),
+            layer_scale: Some(&bw.ls1),
+        };
+        let p = bw.norm2.params();
+        ops.norm.residual_layer_norm(
+            nn,
+            RowsMut::F32(&mut *x),
+            &branch,
+            rows,
+            DIM,
+            &p,
+            None,
+            Quant::PerToken {
+                q: &mut *q8.x8,
+                scales: &mut **t0,
+            },
+        )?;
+    }
+    ops.gemm.linear_fp8(
+        nn,
+        &*q8.x8,
+        &f8.fc1.0,
+        &deferred,
+        None,
+        Epilogue::None,
+        &mut *s.big,
+        GemmShape::packed(rows, HIDDEN, DIM),
+    )?;
+    // Scales, bias, erf GELU → FP8 (tok1) → fc2.
+    ops.norm.row_epilogue(
+        nn,
+        &mut *s.big,
+        rows,
+        HIDDEN,
+        HIDDEN,
+        Some(&**t0),
+        Some(&f8.fc1.1),
+        Some(&bw.fc1_b),
+        Act::GeluErf,
+        false,
+        Quant::PerToken {
+            q: &mut *q8.x8,
+            scales: &mut **t1,
+        },
+    )?;
+    ops.gemm.linear_fp8(
+        nn,
+        &*q8.x8,
+        &f8.fc2.0,
+        &deferred,
+        None,
+        Epilogue::None,
+        &mut *s.y,
+        GemmShape::packed(rows, DIM, HIDDEN),
+    )?;
+    let branch = Branch {
+        y: &*s.y,
+        tok: Some(&**t1),
+        chan: Some(&f8.fc2.1),
+        bias: Some(&bw.fc2_b),
         layer_scale: Some(&bw.ls2),
     };
     match next {

@@ -8,6 +8,8 @@ import {
   STAGE_LABEL,
   pickFiles,
   stageStates,
+  type EngineSchedule,
+  type LicenceProfile,
   type LiveNumbers,
   type Mode,
   type Picked,
@@ -23,11 +25,33 @@ type Input = "media" | "colmap";
 const PRESETS: { value: Preset; label: string }[] = [
   { value: "fast", label: "Fast" },
   { value: "quality", label: "Quality" },
+  { value: "big", label: "Big" },
 ];
 
 const PRESET_NOTE: Record<Preset, string> = {
   fast: "Fewer iterations and Gaussians: a preview in about a minute.",
   quality: "The full schedule: best quality, a few minutes on this GPU.",
+  big: "Maximum Gaussians and iterations: highest fidelity, longest training.",
+};
+
+const PROFILES: { value: LicenceProfile; label: string }[] = [
+  { value: "research", label: "Research" },
+  { value: "commercial", label: "Commercial" },
+];
+
+const PROFILE_NOTE: Record<LicenceProfile, string> = {
+  research: "VGGT-Ω pose engine (FAIR-NC licence, research only).",
+  commercial: "DA3-BASE pose engine (Apache-2.0, commercial use OK).",
+};
+
+const SCHEDULES: { value: EngineSchedule; label: string }[] = [
+  { value: "dense", label: "Dense" },
+  { value: "ours+sage", label: "Fast" },
+];
+
+const SCHEDULE_NOTE: Record<EngineSchedule, string> = {
+  dense: "Full dense attention: best accuracy, more VRAM.",
+  "ours+sage": "Sparse + SAGE attention: faster, lower VRAM.",
 };
 
 const MODES: { value: Mode; label: string }[] = [
@@ -81,9 +105,11 @@ export function NewScenePanel({
   const zip = useRef<HTMLInputElement>(null);
   const splat = useRef<HTMLInputElement>(null);
 
+  const isObject = options.mode === "object";
+
   const take = (files: File[]) => {
     if (busy) return;
-    const picked = pickFiles(files);
+    const picked = pickFiles(files, isObject);
     if (picked.kind === "none") return setNote(picked.reason);
     const big = (picked.kind === "photos" ? picked.files : [picked.file]).find(
       (f) => maxUploadBytes && f.size > maxUploadBytes,
@@ -131,8 +157,9 @@ export function NewScenePanel({
           >
             <IconTile icon={Images} />
             <p className={text.caption}>
-              Drop 20 to 200 photos (JPEG, PNG, WebP) walking around the scene, or one phone video (MP4, MOV). No
-              poses needed.
+              {isObject
+                ? "Drop 1 to 4 photos of an object (JPEG, PNG, WebP). Background will be removed; a PBR mesh (.glb) is generated."
+                : "Drop 20 to 200 photos (JPEG, PNG, WebP) walking around the scene, or one phone video (MP4, MOV). No poses needed."}
             </p>
             <Button variant="primary" icon={Upload} disabled={busy} onClick={() => media.current?.click()}>
               Choose photos or video
@@ -240,28 +267,56 @@ export function NewScenePanel({
                 />
                 <p className={text.caption}>{MODE_NOTE[options.mode]}</p>
               </div>
-              <label className="flex flex-col gap-2">
-                <span className="flex items-baseline justify-between text-[14px] font-medium text-[var(--ds-gray-1000)]">
-                  Max images <span className="font-mono text-[13px] font-normal">{options.maxImages}</span>
-                </span>
-                <RangeInput
-                  min={10}
-                  max={400}
-                  step={10}
-                  value={options.maxImages}
+              {!isObject && (
+                <label className="flex flex-col gap-2">
+                  <span className="flex items-baseline justify-between text-[14px] font-medium text-[var(--ds-gray-1000)]">
+                    Max images <span className="font-mono text-[13px] font-normal">{options.maxImages}</span>
+                  </span>
+                  <RangeInput
+                    min={10}
+                    max={400}
+                    step={10}
+                    value={options.maxImages}
+                    disabled={busy}
+                    aria-label="Max images"
+                    onValueChange={(maxImages) => setOptions({ ...options, maxImages })}
+                  />
+                  <span className={text.caption}>Frames taken from a video, or photos kept from a larger set.</span>
+                </label>
+              )}
+              {!isObject && (
+                <Switch
+                  label="Mesh"
+                  description="Also bake a textured .glb mesh (slower)."
+                  checked={options.mesh}
                   disabled={busy}
-                  aria-label="Max images"
-                  onValueChange={(maxImages) => setOptions({ ...options, maxImages })}
+                  onCheckedChange={(mesh) => setOptions({ ...options, mesh })}
                 />
-                <span className={text.caption}>Frames taken from a video, or photos kept from a larger set.</span>
-              </label>
-              <Switch
-                label="Mesh"
-                description="Also bake a textured .glb mesh (slower)."
-                checked={options.mesh}
-                disabled={busy}
-                onCheckedChange={(mesh) => setOptions({ ...options, mesh })}
-              />
+              )}
+              <div className="space-y-2">
+                <p className="text-[14px] font-medium text-[var(--ds-gray-1000)]">Licence</p>
+                <SegmentedControl<LicenceProfile>
+                  label="Licence profile"
+                  value={options.profile}
+                  disabled={busy}
+                  onChange={(profile) => setOptions({ ...options, profile })}
+                  options={PROFILES}
+                />
+                <p className={text.caption}>{PROFILE_NOTE[options.profile]}</p>
+              </div>
+              {options.profile === "research" && (
+                <div className="space-y-2">
+                  <p className="text-[14px] font-medium text-[var(--ds-gray-1000)]">Attention</p>
+                  <SegmentedControl<EngineSchedule>
+                    label="Engine schedule"
+                    value={options.engineSchedule}
+                    disabled={busy}
+                    onChange={(engineSchedule) => setOptions({ ...options, engineSchedule })}
+                    options={SCHEDULES}
+                  />
+                  <p className={text.caption}>{SCHEDULE_NOTE[options.engineSchedule]}</p>
+                </div>
+              )}
             </>
           ) : (
             <>
@@ -377,6 +432,8 @@ export function ReconstructResult({ out }: { out: ReconstructOutput }) {
   if (out.eval?.psnr !== undefined) rows.push(["PSNR", `${out.eval.psnr.toFixed(2)} dB`]);
   if (out.eval?.ssim !== undefined) rows.push(["SSIM", out.eval.ssim.toFixed(4)]);
   if (out.eval?.lpips !== undefined) rows.push(["LPIPS", out.eval.lpips.toFixed(3)]);
+  if (out.engine) rows.push(["engine", out.engine]);
+  if (out.licence) rows.push(["licence", out.licence]);
   const all: [string, string, ArtifactRef | undefined][] = [
     ["SPZ", "scene.spz", out.spz],
     ["PLY", "scene.ply", out.ply],

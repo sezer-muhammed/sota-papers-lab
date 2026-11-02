@@ -10,9 +10,14 @@
 //! cameras in slot `cameras`. GPU-exclusive: the engine takes most of the
 //! card.
 //!
-//! The engine is loaded per run and dropped when it ends (its memory goes
-//! back to the driver); frames per pass follow the free memory, and the run
-//! waits when other processes leave too little ([`crate::vram`]).
+//! `profile` picks the front end ([`crate::engine`]): `research` (default)
+//! runs VGGT-Ω, `commercial` runs DA3-BASE (Apache-2.0) on ONNX Runtime and
+//! loads nothing non-commercial. The output records the engine, its weights
+//! licence and hash.
+//!
+//! The engine is loaded once per process and reused by later runs; frames per
+//! pass follow the free memory, and the run waits when other processes leave
+//! too little ([`crate::vram`]).
 //! Weights: `$SPL_VGGT_WEIGHTS`, else
 //! `<data dir>/models/vggt-omega/vggt_omega_1b_512.safetensors` (converted
 //! by `scripts/convert_vggt.py`). The VGGT-Ω weights are under the FAIR
@@ -20,6 +25,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::ensure;
 use schemars::JsonSchema;
@@ -28,9 +34,10 @@ use spl_core::media;
 use spl_core::{ArtifactKind, ArtifactRef, Context, DataDir, GpuUse, Op, Result, RunCx, anyhow};
 use ts_rs::TS;
 
+use crate::engine::{Engine, EngineOut, LicenceProfile};
 use crate::io::images::Rgb8Image;
-use crate::reconstruct::pipeline::{EngineOpts, Event, Frames, pose_frames};
-use crate::vggt::{DenseHost, Prepared, ResizeMode, VggtCameras, VggtEngine};
+use crate::reconstruct::pipeline::Event;
+use crate::vggt::{DenseHost, Prepared, ResizeMode, VggtCameras, VggtConfig, VggtEngine};
 
 fn default_max_frames() -> u32 {
     64
@@ -75,6 +82,10 @@ pub struct PoseInput {
     pub conf_percentile: f32,
     #[serde(default = "default_max_points")]
     pub max_points: u32,
+    /// Licence profile: `research` (VGGT-Ω, non-commercial research use
+    /// only) or `commercial` (DA3-BASE, Apache-2.0).
+    #[serde(default)]
+    pub profile: LicenceProfile,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, TS)]
@@ -106,14 +117,20 @@ pub struct PoseOutput {
     pub gpu_memory: Vec<String>,
     /// Seconds spent waiting for GPU memory.
     pub gpu_wait_s: f64,
+    /// The front end that ran (`vggt-omega-1b-512`, `da3-base`).
+    pub engine: String,
+    /// Licence of its weights (SPDX id or name).
+    pub licence: String,
+    /// SHA-256 of the source weights, when the engine records it.
+    #[ts(optional)]
+    pub weights_sha256: Option<String>,
 }
 
 pub struct Pose;
 
 impl Op for Pose {
     const ID: &'static str = "image_to_3d.pose";
-    const SUMMARY: &'static str =
-        "Cameras and a coloured point cloud from photos or a video (native VGGT-Omega)";
+    const SUMMARY: &'static str = "Cameras and a coloured point cloud from photos or a video (VGGT-Omega, or DA3-BASE in the commercial profile)";
     const GPU: GpuUse = GpuUse::Exclusive;
 
     type Input = PoseInput;
@@ -130,23 +147,40 @@ impl Op for Pose {
             frames.len()
         ));
 
-        let weights = weights_path(cx)?;
         let cancel = cx.cancel.clone();
-        let mut opts = EngineOpts::new(false, frames.len());
-        opts.resize = input.resize;
-        opts.span = (0.05, 0.9);
+        let resize = input.resize;
+        let (weights, da3_dir) = match input.profile {
+            LicenceProfile::Research => (weights_path(cx)?, None),
+            LicenceProfile::Commercial => (PathBuf::new(), Some(crate::engine::da3_dir(cx)?)),
+        };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let job = tokio::task::spawn_blocking(move || -> Result<_> {
-            let frames = Frames {
-                names: names.clone(),
-                engine: frames,
-                trainer: Vec::new(),
+            let mut progress = |stage: &str, f: f32| {
+                let _ = tx.send(Event::Progress(f as f64, stage.to_string()));
             };
-            let mut send = |e: Event| {
-                let _ = tx.send(e);
+            if let Some(dir) = da3_dir {
+                unload_engine();
+                return crate::engine::infer_commercial(&dir, &frames, &cancel, &mut progress);
+            }
+            crate::engine::unload_commercial();
+            let mut slot = engine_slot()
+                .lock()
+                .map_err(|_| anyhow!("engine lock poisoned"))?;
+            let t = std::time::Instant::now();
+            let engine = match slot.take() {
+                Some((p, e)) if p == weights => slot.insert((p, e)),
+                _ => {
+                    let nn = Arc::new(spl_nn::Nn::open()?);
+                    let e = VggtEngine::load(nn, &weights, VggtConfig::default())
+                        .with_context(|| format!("load VGGT-Omega from {}", weights.display()))?;
+                    slot.insert((weights.clone(), e))
+                }
             };
-            let r = pose_frames(&weights, &frames, &opts, &cancel, &mut send)?;
-            Ok((names, r))
+            let load_s = t.elapsed().as_secs_f64();
+            let engine = &mut engine.1;
+            engine.cfg.resize = resize;
+            let out = engine.infer(&frames, &cancel, &mut progress)?;
+            Ok((out, load_s, engine.info()))
         });
         let forward = async {
             while let Some(e) = rx.recv().await {
@@ -159,17 +193,22 @@ impl Op for Pose {
             }
         };
         let (res, ()) = tokio::join!(job, forward);
-        let (names, r) = res??;
-        let (prepared, cams, dense, times, load_s) = (
-            r.posed.prepared,
-            r.posed.cams,
-            r.posed.dense,
-            r.times,
-            r.load_s,
-        );
-        let coexist = r.mem;
+        let (out, load_s, info) = res??;
+        let EngineOut {
+            prepared,
+            cameras: cams,
+            dense,
+            times,
+        } = out;
+        let coexist = crate::vram::Coexist::default();
+        cx.log(format!(
+            "engine {} (weights licence {}; sha256 {})",
+            info.engine,
+            info.licence,
+            info.weights_sha256.as_deref().unwrap_or("not recorded")
+        ));
         cx.metric("frames", cams.pose_enc.len() as f64, "");
-        cx.metric("forward_time", times.total_ms as f64, "ms");
+        cx.metric("forward_time", times.forward_ms as f64, "ms");
         cx.metric("trunk_time", times.trunk_ms as f64, "ms");
 
         cx.progress(0.9, "writing outputs");
@@ -217,15 +256,25 @@ impl Op for Pose {
             times: PoseTimes {
                 decode_s,
                 load_s,
-                forward_ms: times.total_ms,
+                forward_ms: times.forward_ms,
                 trunk_ms: times.trunk_ms,
-                heads_ms: times.camera_ms + times.dense_ms,
+                heads_ms: times.dense_ms,
                 wall_s: started.elapsed().as_secs_f64(),
             },
             gpu_memory: coexist.notes,
             gpu_wait_s: coexist.waited_s,
+            engine: info.engine,
+            licence: info.licence,
+            weights_sha256: info.weights_sha256,
         })
     }
+}
+
+type EngineSlot = Mutex<Option<(PathBuf, VggtEngine)>>;
+
+fn engine_slot() -> &'static EngineSlot {
+    static SLOT: OnceLock<EngineSlot> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
 }
 
 fn weights_path(cx: &RunCx) -> Result<PathBuf> {

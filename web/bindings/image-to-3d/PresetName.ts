@@ -3,4 +3,4 @@
 /**
  * The presets of spec-train 6.2.
  */
-export type PresetName = "faster_gs" | "fastgs" | "fastgs_big" | "mcmc" | "quality" | "fast";
+export type PresetName = "faster_gs" | "fastgs" | "fastgs_big" | "mcmc" | "quality" | "big" | "fast" | "geometry";

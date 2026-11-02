@@ -8,7 +8,8 @@
 //!
 //! Ops ([`ops`]): `image_to_3d.train` (COLMAP-posed dataset → splats) and
 //! `image_to_3d.render` (one view of a trained splat); [`pose`]:
-//! `image_to_3d.pose` (photos or video → cameras and points, native VGGT-Ω).
+//! `image_to_3d.pose` (photos or video → cameras and points, native VGGT-Ω);
+//! `image_to_3d.mesh` (splat + cameras → textured GLB, [`mesh::op`]).
 //!
 //! Module owners (one per file; the header of each file names it):
 //! - preprocess (E1): `kernels/{mod,layout,preprocess,selftest}.rs`,
@@ -18,21 +19,25 @@
 //! - loss (E4): `kernels/loss.rs`, `eval.rs`, `export/*`, `cuda/{loss,metrics}.cu`
 //! - optimizer (E5): `kernels/adam.rs`, `reference.rs`, `cuda/adam.{cuh,cu}`
 //! - densify (E6): `kernels/densify.rs`, `model.rs`, `cuda/{densify,compact,mcmc}.cu`
-//! - trainer (E7): `gpu.rs`, `frame.rs`, `rng.rs`, `presets.rs`,
+//! - trainer (E7): `gpu.rs`, `frame.rs`, `rng.rs`, `presets.rs`, `dash.rs`,
 //!   `trainer.rs`, `ops.rs`, `refine.rs`, `io/*`, `testkit/*`
 //! - ingest (A0): `ingest/*`, `cuda/ingest.cu`
 //! - reconstruct (mvp-pipeline): `reconstruct/*`, `cuda/reconstruct.cu`
 //! - shared-GPU memory plans (gpu-coexist): `vram.rs`
 
 pub mod bench;
+pub mod dash;
+pub mod engine;
 pub mod eval;
 pub mod export;
 pub mod frame;
+pub mod generate;
 pub mod gpu;
 pub mod ingest;
 pub mod init;
 pub mod io;
 pub mod kernels;
+pub mod mesh;
 pub mod model;
 pub mod ops;
 pub mod pose;
@@ -55,5 +60,7 @@ pub fn register(registry: &mut Registry) {
         .op(ops::Render)
         .op(pose::Pose)
         .op(reconstruct::Reconstruct)
-        .op(bench::Bench);
+        .op(generate::Generate)
+        .op(bench::Bench)
+        .op(mesh::op::MeshOp);
 }

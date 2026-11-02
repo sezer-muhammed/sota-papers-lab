@@ -16,4 +16,16 @@ gpu_memory: Array<string>,
 /**
  * Seconds spent waiting for GPU memory.
  */
-gpu_wait_s: number, };
+gpu_wait_s: number, 
+/**
+ * Textured GLB mesh, when `mesh` was requested.
+ */
+glb?: ArtifactRef, 
+/**
+ * The front end that produced the poses.
+ */
+engine: string, 
+/**
+ * SPDX licence of the engine's weights.
+ */
+licence: string, };

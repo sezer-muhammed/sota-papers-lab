@@ -8,7 +8,7 @@ import type { SplatSource } from "./viewer";
 
 export const TRAIN_OP = "image_to_3d.train";
 
-export type Preset = "fast" | "quality";
+export type Preset = "fast" | "quality" | "big";
 
 export type TrainOptions = {
   preset: Preset;

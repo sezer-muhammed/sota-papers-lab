@@ -3,4 +3,4 @@
 /**
  * User-facing speed/quality trade-off.
  */
-export type ReconPreset = "fast" | "quality";
+export type ReconPreset = "fast" | "quality" | "big";

@@ -15,4 +15,16 @@ gpu_memory: Array<string>,
 /**
  * Seconds spent waiting for GPU memory.
  */
-gpu_wait_s: number, };
+gpu_wait_s: number, 
+/**
+ * The front end that ran (`vggt-omega-1b-512`, `da3-base`).
+ */
+engine: string, 
+/**
+ * Licence of its weights (SPDX id or name).
+ */
+licence: string, 
+/**
+ * SHA-256 of the source weights, when the engine records it.
+ */
+weights_sha256?: string, };

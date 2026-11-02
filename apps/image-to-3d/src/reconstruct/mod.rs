@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use spl_core::{ArtifactKind, ArtifactRef, Context, DataDir, GpuUse, Op, Result, RunCx, anyhow};
 use ts_rs::TS;
 
+use crate::engine::LicenceProfile;
 use crate::export::ply::write_inria_ply;
 use crate::export::{MEDIA_JSON, MEDIA_PLY, MEDIA_SPZ, MEDIA_ZIP};
 use crate::ingest::{IngestConfig, IngestResult, ingest_images, ingest_video};
@@ -80,6 +81,12 @@ pub struct ReconstructInput {
     #[serde(default)]
     #[ts(optional)]
     pub config: Option<PipelineConfig>,
+    /// `research` (default, VGGT-Ω) or `commercial` (DA3-BASE, Apache-2.0).
+    #[serde(default)]
+    pub profile: LicenceProfile,
+    /// Build a mesh (.glb) from the trained splat; `false` by default.
+    #[serde(default)]
+    pub mesh: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema, TS)]
@@ -103,6 +110,13 @@ pub struct ReconstructOutput {
     pub gpu_memory: Vec<String>,
     /// Seconds spent waiting for GPU memory.
     pub gpu_wait_s: f64,
+    /// Textured GLB mesh, when `mesh` was requested.
+    #[ts(optional)]
+    pub glb: Option<ArtifactRef>,
+    /// The front end that produced the poses.
+    pub engine: String,
+    /// SPDX licence of the engine's weights.
+    pub licence: String,
 }
 
 pub struct Reconstruct;
@@ -125,9 +139,12 @@ impl Op for Reconstruct {
             .unwrap_or_else(|| PipelineConfig::preset(input.preset));
         let video = input.video.is_some();
         if input.config.is_none() && video {
-            // Phone video: auto exposure and white balance drift.
             cfg.ppisp = true;
         }
+        if input.mesh && cfg.mesh.is_none() {
+            cfg.mesh = Some(crate::mesh::pipeline::MeshConfig::default());
+        }
+        let profile = input.profile;
         cx.progress(0.0, "reading input");
         let ingest_cfg = IngestConfig {
             trainer_long_side: input.long_side,
@@ -144,17 +161,32 @@ impl Op for Reconstruct {
         cx.metric("ingest_time", ingest_s, "s");
         let frames = to_frames(ingested);
         let n_frames = frames.names.len() as u32;
-        let weights = weights_path(cx)?;
+        let (engine_name, engine_licence) = match profile {
+            LicenceProfile::Research => ("vggt-omega-1b-512".to_string(), "FAIR-NC".to_string()),
+            LicenceProfile::Commercial => ("da3-base".to_string(), "Apache-2.0".to_string()),
+        };
+        let weights = if profile == LicenceProfile::Research {
+            weights_path(cx)?
+        } else {
+            std::path::PathBuf::new()
+        };
         let cancel = cx.cancel.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let mesh_cfg = cfg.mesh.clone();
         let job = tokio::task::spawn_blocking(move || -> Result<_> {
             let mut send = |e: Event| {
                 let _ = tx.send(e);
             };
             let r = reconstruct(&weights, frames, &cfg, 0, &cancel, &mut send);
-            // The engine is gone already; the trainer goes with `r`. Hand
-            // the pool's blocks back so the idle server holds no memory.
             let r = r.inspect_err(|_| crate::vram::release_quietly())?;
+            let glb = if let Some(ref mc) = mesh_cfg {
+                send(Event::Progress(0.92, "meshing".into()));
+                let gpu = crate::gpu::Gpu::open()?;
+                let mesh = crate::mesh::pipeline::build(&gpu, &r.cloud, &r.views, mc)?;
+                Some(mesh.glb)
+            } else {
+                None
+            };
             let mut ply = Vec::new();
             write_inria_ply(&r.cloud, &mut ply)?;
             let cameras = pipeline::cameras_json(&r.views)?;
@@ -175,6 +207,7 @@ impl Op for Reconstruct {
                 r.iterations,
                 r.cloud.len(),
                 coexist,
+                glb,
             ))
         });
         let relay = async {
@@ -185,7 +218,8 @@ impl Op for Reconstruct {
             }
         };
         let (res, ()) = tokio::join!(job, relay);
-        let (spz, ply, cameras, transforms, colmap, times, iterations, n, coexist) = res??;
+        let (spz, ply, cameras, transforms, colmap, times, iterations, n, coexist, glb_bytes) =
+            res??;
         cx.progress(0.98, "storing exports");
         let spz = cx
             .artifacts
@@ -212,6 +246,14 @@ impl Op for Reconstruct {
             .artifacts
             .put(colmap, ArtifactKind::Cameras, MEDIA_ZIP)
             .await?;
+        let glb = match glb_bytes {
+            Some(bytes) => Some(
+                cx.artifacts
+                    .put(bytes, ArtifactKind::Mesh, spl_core::media::GLB)
+                    .await?,
+            ),
+            None => None,
+        };
         let wall_s = started.elapsed().as_secs_f64();
         cx.metric("frames", n_frames as f64, "");
         cx.metric("gaussians", n as f64, "");
@@ -236,6 +278,9 @@ impl Op for Reconstruct {
             wall_s,
             gpu_memory: coexist.notes,
             gpu_wait_s: coexist.waited_s,
+            glb,
+            engine: engine_name,
+            licence: engine_licence,
         })
     }
 }

@@ -88,7 +88,48 @@ fn vggt_layout(frames: usize) -> FrameLayout {
         special: 17,
         grid_h: 21,
         grid_w: 32,
+        dense_frames: 0,
     }
+}
+
+#[test]
+fn dense_first_frame_keeps_its_keys() {
+    let layout = FrameLayout {
+        dense_frames: 1,
+        ..vggt_layout(3)
+    };
+    let plan = Plan::new(
+        Shape {
+            batch: 1,
+            heads: 1,
+            tokens: 3 * 689,
+        },
+        KvMerge::Pool { stride: 4, layout },
+    )
+    .unwrap();
+    // 689 dense + 2 · (17 + 6 · 8) pooled.
+    assert_eq!(plan.tk, 689 + 2 * 65);
+    for j in 0..689 {
+        assert_eq!(reference::members(&plan, j), vec![j]);
+    }
+    for j in 689..689 + 17 {
+        assert_eq!(reference::members(&plan, j), vec![j]);
+    }
+    // The first pooled cell of frame 1.
+    assert_eq!(
+        reference::members(&plan, 689 + 17),
+        vec![
+            706, 707, 708, 709, 738, 739, 740, 741, 770, 771, 772, 773, 802, 803, 804, 805
+        ]
+    );
+    let mut seen = vec![false; 3 * 689];
+    for j in 0..plan.tk {
+        for t in reference::members(&plan, j) {
+            assert!(!seen[t], "token {t} pooled twice");
+            seen[t] = true;
+        }
+    }
+    assert!(seen.iter().all(|&s| s));
 }
 
 #[test]
@@ -157,6 +198,7 @@ fn merged_attention_equals_dense_on_uniform_cells() {
         special: 3,
         grid_h: 5,
         grid_w: 7,
+        dense_frames: 0,
     };
     let shape = Shape {
         batch: 1,
@@ -557,6 +599,8 @@ fn small_layout() -> FrameLayout {
         special: 5,
         grid_h: 7,
         grid_w: 10,
+        // The reference frame stays dense, as in the VGGT-Ω schedule.
+        dense_frames: 1,
     }
 }
 
@@ -797,6 +841,7 @@ fn gpu_bench() {
                     special: get("special"),
                     grid_h: get("grid_h"),
                     grid_w: get("grid_w"),
+                    dense_frames: 0,
                 },
                 get("heads"),
                 get("head_dim"),
