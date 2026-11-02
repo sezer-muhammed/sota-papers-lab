@@ -28,6 +28,7 @@ pub mod io;
 pub mod kernels;
 pub mod model;
 pub mod ops;
+pub mod ppisp;
 pub mod presets;
 pub mod reference;
 pub mod refine;
