@@ -24,6 +24,9 @@ use spl_core::{Context, Result, anyhow, bail};
 use spl_nn::Nn;
 use spl_nn::cudarc::driver::{CudaSlice, CudaView};
 
+/// Index prefix of tensors from an FP8 file (`format = spl-vggt-1-fp8`).
+const FP8_PREFIX: &str = "fp8:";
+
 /// Device offsets are multiples of this (the converter's alignment).
 pub const ALIGN: usize = 256;
 
@@ -197,10 +200,21 @@ impl Weights {
             let h = parse_header(&map, map.len())
                 .with_context(|| format!("parse {}", path.display()))?;
             let base = total;
+            // FP8 files reuse the BF16 names; keep them apart.
+            let prefix = if h
+                .metadata
+                .get("format")
+                .is_some_and(|f| f.ends_with("-fp8"))
+            {
+                FP8_PREFIX
+            } else {
+                ""
+            };
             for (name, info) in h.tensors {
                 if name.starts_with("__pad") {
                     continue;
                 }
+                let name = format!("{prefix}{name}");
                 let device = (info.end <= h.device_bytes).then(|| base + info.start);
                 if let Some(off) = device {
                     ensure!(off % ALIGN == 0, "{name}: device offset {off} not aligned");
@@ -298,11 +312,12 @@ impl Weights {
         self.view(name, Dtype::F32)
     }
 
-    /// An FP8 E4M3 weight and its per-output-channel scales (`<name>_scale`).
+    /// The FP8 E4M3 copy of a weight (from the FP8 file) and its
+    /// per-output-channel scales (`<name>_scale`).
     pub fn fp8(&self, name: &str) -> Result<(CudaView<'_, u8>, CudaView<'_, f32>)> {
         Ok((
-            self.view(name, Dtype::F8E4M3)?,
-            self.f32(&format!("{name}_scale"))?,
+            self.view(&format!("{FP8_PREFIX}{name}"), Dtype::F8E4M3)?,
+            self.f32(&format!("{FP8_PREFIX}{name}_scale"))?,
         ))
     }
 
