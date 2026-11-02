@@ -33,6 +33,7 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-02 | Native VGGT-Ω after integration, bf16, 2 / 10 / 50 frames | 52.8 ms / 287 ms / 2.24 s | official PyTorch VGGT-Ω bf16 (same idle card): 91.2 ms / 482 ms / 3.62 s | 1.73x / 1.68x / 1.61x | ETH3D AUC@3/@30 28.15/86.22 vs official 30.37/86.30; Sintel 22.22/66.44 vs 20.74/66.00; depth AbsRel equal (0.0119 vs 0.0118) | verified (GPU lock held, idle card) | integrate-vggt, f7c85e6 |
 | 2026-11-02 | Native VGGT-Ω memory: frames that fit on a 12 GB card | 100 frames in 6.44 s (7.1 GB), 200 frames in 20.8 s (11.1 GB) | official PyTorch: out of memory at 100 and 200 frames (8.7 GB peak at 50) | runs where the official code cannot | as above | verified | integrate-vggt, f7c85e6 |
 | 2026-11-02 | Camera poses from photos alone vs COLMAP (Mip-NeRF 360 garden, 100 frames) | ATE 1.58% of the trajectory radius, mean rotation error 0.94°, in seconds | COLMAP (reference poses) | — | — | verified | integrate-vggt, f7c85e6 |
+| 2026-11-02 | Commercial-licence front end: DA3-BASE (Apache-2.0) on ONNX Runtime, 3 / 10 frames at 504x336 | 31.6 / 151 ms | official DA3 PyTorch bf16: 52.7 / 168 ms | 1.67x / 1.11x | matches official fp32 (depth 6e-5); pose quality far below VGGT-Ω (ETH3D AUC@30 23.3 vs 86.2; official DA3 itself 15.3), so not marketable for quality | preliminary (card contended) | commercial, 8beab78 |
 
 ### End-to-end training (COLMAP poses, Quality preset, Mip-NeRF 360 protocol, metrics with the Inria evaluation)
 
