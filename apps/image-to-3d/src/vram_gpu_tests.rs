@@ -252,6 +252,9 @@ fn gpu_coexist_engine() {
     let h2 = hog.clone();
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(8));
+        // cudarc 0.19 frees without binding the context: bind it first,
+        // or the free fails silently on a fresh thread.
+        spl_gpu::context(0).unwrap().bind_to_thread().unwrap();
         h2.lock().unwrap().take();
     });
     let t = Instant::now();
@@ -316,4 +319,36 @@ fn gpu_coexist_reconstruct() {
         (f1 as f64 - f0 as f64) / 1e6
     );
     idle("end of reconstruct test", 0);
+}
+
+/// Memory dropped on another thread is free again for the next poll.
+#[test]
+#[ignore = "GPU: run on the GPU host"]
+fn gpu_coexist_cross_thread_free() {
+    let f0 = crate::vram::free_now().unwrap();
+    let mut hog = Hog::default();
+    hog.leave(f0.saturating_sub(2_000_000_000).max(1_000_000_000));
+    let held = crate::vram::pool_reserved().unwrap();
+    let f1 = crate::vram::free_now().unwrap();
+    let h = Arc::new(Mutex::new(Some(hog)));
+    let h2 = h.clone();
+    std::thread::spawn(move || {
+        // cudarc 0.19 frees without binding the context: bind it first,
+        // or the free fails silently on a fresh thread.
+        spl_gpu::context(0).unwrap().bind_to_thread().unwrap();
+        h2.lock().unwrap().take();
+    })
+    .join()
+    .unwrap();
+    let f2 = crate::vram::free_now().unwrap();
+    let after = crate::vram::pool_reserved().unwrap();
+    eprintln!(
+        "free {:.2} → {:.2} (hog) → {:.2} GB; pool {:.0} → {:.0} MB",
+        f0 as f64 / GB,
+        f1 as f64 / GB,
+        f2 as f64 / GB,
+        held as f64 / 1e6,
+        after as f64 / 1e6
+    );
+    assert!(after < 64 << 20, "dropped hog still in the pool");
 }
