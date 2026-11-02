@@ -151,8 +151,8 @@ pub struct VggtEngine {
     pub weights: Weights,
     pub cfg: VggtConfig,
     trunk: trunk::Trunk,
-    camera: heads::CameraHead,
-    dense: heads::DenseHead,
+    camera: heads::camera::CameraHead,
+    dense: heads::dense::DenseHead,
     normalize: spl_nn::cudarc::driver::CudaFunction,
     workspaces: HashMap<Geometry, Workspace>,
     cams: HashMap<usize, heads::DeviceCams>,
@@ -174,8 +174,9 @@ impl VggtEngine {
             bail!("text-alignment weights are not supported; convert without them");
         }
         let trunk = trunk::Trunk::new(&nn, &w)?;
-        let camera = heads::CameraHead::new(&nn, &w)?;
-        let dense = heads::DenseHead::new(&nn, &w)?;
+        let kernels = heads::Kernels::new(&nn)?;
+        let camera = heads::camera::CameraHead::new(&nn, kernels.clone(), &w)?;
+        let dense = heads::dense::DenseHead::new(&nn, kernels, &w)?;
         let m = nn.module("vggt_runtime", RUNTIME_CU)?;
         let normalize = m
             .load_function("vggt_normalize")
@@ -215,10 +216,10 @@ impl VggtEngine {
             .get(&geom)
             .map_or(0, |w| w.plan.device_bytes);
         let margin = 256 << 20;
-        let trunk = trunk::Trunk::scratch_bytes(&geom);
+        let trunk = trunk::Trunk::scratch_bytes(&trunk_geom(&geom));
         let chunk = geom.with_frames(self.cfg.dense_chunk.min(geom.frames));
-        let head =
-            heads::DenseHead::scratch_bytes(&chunk) + heads::CameraHead::scratch_bytes(&geom);
+        let head = heads::dense::DenseHead::scratch_bytes(&chunk)
+            + heads::camera::CameraHead::scratch_bytes(&geom);
         Plan::new(
             geom,
             self.cfg.dense_chunk,
@@ -286,13 +287,9 @@ impl VggtEngine {
         let mut graphed = false;
         {
             let ws = self.workspaces.get_mut(&g).expect("workspace");
-            let trunk = &self.trunk;
+            let trunk = &mut self.trunk;
             let w = &self.weights;
-            let tg = trunk::TrunkGeom {
-                frames: g.frames,
-                grid_h: g.grid_h,
-                grid_w: g.grid_w,
-            };
+            let tg = trunk_geom(&g);
             let Workspace { images, cache, .. } = &mut *ws;
             let images = images.slice(..);
             let [mut c0, mut c1, mut c2, mut c3] = workspace::cache_mut(cache)?;
@@ -304,7 +301,7 @@ impl VggtEngine {
                     &images,
                     [&mut c0, &mut c1, &mut c2, &mut c3],
                     &sched,
-                    &mut |_| {},
+                    &mut trunk::NoTap,
                 )
             };
             if use_graph {
@@ -328,7 +325,7 @@ impl VggtEngine {
             }
         };
         let ws = self.workspaces.get_mut(&g).expect("workspace");
-        let pose_enc = self.camera.run(&nn, ws.level(3)?, &g, cams)?;
+        let pose_enc = self.camera.run(&nn, &ws.level(3)?, &g, cams)?;
         record(&nn, &ev[3])?;
 
         progress("dense head", 0.8);
@@ -500,6 +497,14 @@ fn trunk_schedule(s: &AttnSchedule) -> Result<[trunk::InterKind; 24]> {
         };
     }
     Ok(out)
+}
+
+fn trunk_geom(g: &Geometry) -> trunk::TrunkGeom {
+    trunk::TrunkGeom {
+        frames: g.frames,
+        grid_h: g.grid_h,
+        grid_w: g.grid_w,
+    }
 }
 
 fn sched_key(s: &AttnSchedule) -> u64 {

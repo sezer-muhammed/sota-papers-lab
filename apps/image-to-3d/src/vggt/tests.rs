@@ -140,7 +140,7 @@ fn target_sizes_match_load_fn() {
 
 #[test]
 fn aspect_crop_limits() {
-    assert_eq!(aspect_crop(1000, 100), (250, 0, 200, 100));
+    assert_eq!(aspect_crop(1000, 100), (400, 0, 200, 100));
     assert_eq!(aspect_crop(100, 1000), (0, 400, 100, 200));
     assert_eq!(aspect_crop(640, 480), (0, 0, 640, 480));
 }
@@ -166,20 +166,39 @@ fn resize_keeps_constant_images_and_identity() {
     assert!(out.iter().all(|&v| v == 200));
 }
 
-/// Values from PIL 11 (`Image.resize((4, 1), BICUBIC)` of a 9×1 ramp
-/// `[0, 30, ..., 240]`, RGB with equal channels): a downscale with
-/// antialiasing support 4.5.
+/// Bit-exact against PIL 11 (`Image.resize(..., BICUBIC)` in the
+/// spl-vggt-ref image): a 9×1 ramp down to 4×1 (antialiased support) and a
+/// 5×3 pattern up to 11×7.
 #[test]
-fn resize_matches_pil_downscale() {
+fn resize_matches_pil_exactly() {
     let src: Vec<u8> = (0..9).flat_map(|i| [(i * 30) as u8; 3]).collect();
     let out = preprocess::resize_bicubic(&src, 9, 1, 4, 1);
     let got: Vec<u8> = out.chunks(3).map(|c| c[0]).collect();
-    // Computed with the reference formula in f64 (see pil_coeffs):
-    // centres 1.125, 3.375, 5.625, 7.875 on a linear ramp → ≈ 30·(c − 0.5).
-    let want = [24u8, 86, 154, 214];
-    for (g, w) in got.iter().zip(want) {
-        assert!((*g as i32 - w as i32).abs() <= 2, "{got:?} vs {want:?}");
-    }
+    assert_eq!(got, [20, 85, 155, 220]);
+    let src: Vec<u8> = (0..15usize)
+        .flat_map(|i| {
+            [
+                (i * 53 % 256) as u8,
+                (i * 91 % 256) as u8,
+                (i * 17 % 256) as u8,
+            ]
+        })
+        .collect();
+    let want: [u8; 231] = [
+        0, 0, 0, 5, 0, 0, 29, 49, 2, 57, 106, 11, 81, 167, 18, 105, 187, 26, 129, 103, 34, 153, 4,
+        41, 181, 26, 50, 205, 96, 58, 216, 124, 62, 0, 21, 7, 7, 26, 9, 31, 54, 17, 59, 92, 26, 83,
+        149, 33, 107, 177, 41, 131, 117, 49, 155, 42, 56, 183, 49, 65, 207, 91, 73, 218, 107, 77,
+        2, 125, 41, 10, 105, 44, 34, 63, 52, 62, 50, 61, 86, 103, 68, 110, 154, 76, 134, 156, 84,
+        158, 136, 91, 186, 106, 100, 210, 71, 108, 221, 57, 112, 4, 214, 83, 15, 177, 87, 39, 87,
+        95, 67, 33, 104, 91, 69, 111, 115, 125, 119, 139, 181, 127, 163, 217, 134, 191, 163, 143,
+        215, 73, 151, 226, 36, 155, 8, 193, 126, 20, 179, 130, 44, 144, 138, 72, 114, 147, 96, 94,
+        154, 120, 96, 162, 144, 147, 170, 168, 200, 177, 196, 187, 186, 220, 145, 194, 231, 127,
+        198, 12, 143, 161, 23, 159, 165, 47, 201, 173, 75, 208, 182, 99, 133, 189, 123, 73, 197,
+        147, 101, 205, 171, 158, 212, 199, 196, 221, 223, 224, 229, 234, 234, 233, 14, 126, 176,
+        25, 154, 180, 49, 224, 188, 77, 246, 197, 101, 147, 204, 125, 63, 212, 149, 83, 220, 173,
+        144, 227, 201, 201, 236, 225, 255, 244, 236, 255, 248,
+    ];
+    assert_eq!(preprocess::resize_bicubic(&src, 5, 3, 11, 7), want);
 }
 
 #[test]
@@ -260,7 +279,7 @@ fn plan_chunks_and_offload() {
     assert!(!p.offload);
     // 300 frames: the cache alone is 4 × 300 × 689 × 2048 × 2 B ≈ 3.4 GB.
     let big = Geometry::new(300, 336, 512);
-    let tight = Plan::new(big, 8, 4_400 << 20, 600 << 20, 400 << 20).unwrap();
+    let tight = Plan::new(big, 8, 5_000 << 20, 600 << 20, 400 << 20).unwrap();
     assert!(tight.offload);
     assert!(Plan::new(big, 8, 2 << 30, 600 << 20, 400 << 20).is_err());
 }
