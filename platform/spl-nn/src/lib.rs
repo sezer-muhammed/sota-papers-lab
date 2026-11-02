@@ -24,10 +24,7 @@ pub mod host;
 pub mod norm;
 pub mod qkv;
 pub mod residual;
-// SAGE: `pub mod sage;` goes here. The quantised global attention
-// (`src/sage/**`, `cuda/sage*.cu`: INT8 QKᵀ, FP8 PV, smoothing and KV
-// merging) is built in parallel by another engineer; it compiles its kernels
-// through [`Nn::module`] with [`COMMON_CUH`] like the modules above.
+pub mod sage;
 
 #[cfg(test)]
 mod testkit;
