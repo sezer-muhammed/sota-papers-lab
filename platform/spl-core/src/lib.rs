@@ -7,13 +7,14 @@
 mod artifact;
 mod context;
 mod event;
+pub mod media;
 mod op;
 mod registry;
 
 pub use artifact::{ArtifactKind, ArtifactRef, ArtifactStore};
 pub use context::{DataDir, Resources, RunCx};
 pub use event::{EventSink, RunEvent};
-pub use op::{BoxFuture, DynOp, Op, OpDescriptor};
+pub use op::{BoxFuture, DynOp, GpuUse, Op, OpDescriptor};
 pub use registry::Registry;
 
 pub use anyhow::{Context, Error, Result, anyhow, bail};

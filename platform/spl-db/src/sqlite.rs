@@ -2,14 +2,15 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use spl_core::{Context, Result};
+use spl_core::{ArtifactKind, ArtifactRef, Context, Result};
 use sqlx::Row;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
 };
 
 use crate::{
-    ArtifactRecord, Backend, MetricRecord, NewRun, RunArtifact, RunRecord, RunStatus, SQLITE, Store,
+    Announcement, ArtifactRecord, Backend, MetricRecord, NewRun, RunArtifact, RunRecord, RunStatus,
+    SQLITE, Store,
 };
 
 /// Single-file database for one machine (local Linux box or one cloud VM).
@@ -274,6 +275,91 @@ impl Store for SqliteStore {
         .collect()
     }
 
+    async fn forget_artifact(&self, run_id: &str, artifact_id: &str) -> Result<bool> {
+        // Write first, so the transaction holds the write lock from its
+        // first statement and nothing can link the artifact in between.
+        let mut tx = self.pool.begin().await?;
+        let unlinked = sqlx::query(
+            "DELETE FROM spl_run_artifacts WHERE run_id = ?1 AND artifact_id = ?2
+               AND NOT EXISTS (SELECT 1 FROM spl_run_artifacts WHERE artifact_id = ?2 AND run_id <> ?1)
+               AND NOT EXISTS (SELECT 1 FROM spl_run_announcements WHERE artifact_id = ?2)",
+        )
+        .bind(run_id)
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        if unlinked.rows_affected() == 0 {
+            return Ok(false);
+        }
+        let deleted = sqlx::query(
+            "DELETE FROM spl_artifacts WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM spl_run_artifacts WHERE artifact_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM spl_run_announcements WHERE artifact_id = ?1)",
+        )
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        if deleted.rows_affected() == 0 {
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn announce(&self, run_id: &str, a: &Announcement) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO spl_run_announcements
+               (run_id, slot_name, artifact_id, revision, info_json, announced_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (run_id, slot_name) DO UPDATE SET
+               artifact_id = excluded.artifact_id,
+               revision = excluded.revision,
+               info_json = excluded.info_json,
+               announced_at_ms = excluded.announced_at_ms",
+        )
+        .bind(run_id)
+        .bind(&a.slot)
+        .bind(&a.artifact.id)
+        .bind(i64::from(a.revision))
+        .bind(json_text(a.info.as_ref()))
+        .bind(a.announced_at_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_announcements(&self, run_id: &str) -> Result<Vec<Announcement>> {
+        sqlx::query(
+            "SELECT a.slot_name, a.artifact_id, a.revision, a.info_json, a.announced_at_ms,
+                    f.kind, f.media_type, f.size_bytes
+             FROM spl_run_announcements a JOIN spl_artifacts f ON f.id = a.artifact_id
+             WHERE a.run_id = ? ORDER BY a.slot_name",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| -> Result<Announcement> {
+            let kind: String = row.try_get("kind")?;
+            let size: i64 = row.try_get("size_bytes")?;
+            let revision: i64 = row.try_get("revision")?;
+            Ok(Announcement {
+                slot: row.try_get("slot_name")?,
+                artifact: ArtifactRef {
+                    id: row.try_get("artifact_id")?,
+                    // A kind a newer build recorded reads as a plain blob.
+                    kind: ArtifactKind::parse(&kind).unwrap_or(ArtifactKind::Blob),
+                    media_type: row.try_get("media_type")?,
+                    size_bytes: u64::try_from(size).unwrap_or_default(),
+                },
+                revision: u32::try_from(revision).unwrap_or(u32::MAX),
+                info: parse_json(row.try_get("info_json")?)?,
+                announced_at_ms: row.try_get("announced_at_ms")?,
+            })
+        })
+        .collect()
+    }
+
     async fn add_metrics(&self, metrics: &[MetricRecord]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for m in metrics {
@@ -447,6 +533,122 @@ mod tests {
         assert!(store.list_run_artifacts("other").await?.is_empty());
         let meta = store.get_artifact("a1").await?.and_then(|a| a.meta);
         assert_eq!(meta, Some(serde_json::json!({ "filename": "a.txt" })));
+        Ok(())
+    }
+
+    fn artifact(id: &str, kind: &str) -> ArtifactRecord {
+        ArtifactRecord {
+            id: id.into(),
+            kind: kind.into(),
+            media_type: "application/x-spz".into(),
+            size_bytes: 7,
+            uri: format!("file:///{id}"),
+            meta: None,
+            created_at_ms: 1,
+        }
+    }
+
+    fn announcement(slot: &str, id: &str, revision: u32) -> Announcement {
+        Announcement {
+            slot: slot.into(),
+            artifact: ArtifactRef {
+                id: id.into(),
+                kind: ArtifactKind::Blob,
+                media_type: "ignored: the record's is listed".into(),
+                size_bytes: 0,
+            },
+            revision,
+            info: Some(serde_json::json!({ "iteration": revision * 500 })),
+            announced_at_ms: i64::from(revision),
+        }
+    }
+
+    #[tokio::test]
+    async fn announcements_keep_the_latest_per_slot() -> Result<()> {
+        let store = crate::connect("sqlite::memory:").await?;
+        store.create_run(&new_run("r1")).await?;
+        store.create_run(&new_run("r2")).await?;
+        for id in ["s1", "s2", "pts"] {
+            store.put_artifact(&artifact(id, "splat")).await?;
+        }
+        store
+            .put_artifact(&artifact("odd", "from-the-future"))
+            .await?;
+        store
+            .announce("r1", &announcement("splat", "s1", 1))
+            .await?;
+        store
+            .announce("r1", &announcement("points", "pts", 1))
+            .await?;
+        store
+            .announce("r1", &announcement("splat", "s2", 2))
+            .await?;
+        store
+            .announce("r2", &announcement("splat", "odd", 1))
+            .await?;
+
+        let listed = store.list_announcements("r1").await?;
+        let slots: Vec<_> = listed
+            .iter()
+            .map(|a| (a.slot.as_str(), a.artifact.id.as_str(), a.revision))
+            .collect();
+        assert_eq!(slots, [("points", "pts", 1), ("splat", "s2", 2)]);
+        assert_eq!(listed[1].artifact.kind, ArtifactKind::Splat);
+        assert_eq!(listed[1].artifact.media_type, "application/x-spz");
+        assert_eq!(listed[1].artifact.size_bytes, 7);
+        assert_eq!(
+            listed[1].info,
+            Some(serde_json::json!({ "iteration": 1000 }))
+        );
+        assert_eq!(listed[1].announced_at_ms, 2);
+        let other = store.list_announcements("r2").await?;
+        assert_eq!(other[0].artifact.kind, ArtifactKind::Blob);
+        assert!(store.list_announcements("none").await?.is_empty());
+
+        let missing = announcement("splat", "never-recorded", 3);
+        assert!(store.announce("r1", &missing).await.is_err(), "foreign key");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_artifacts_nothing_else_references_are_forgotten() -> Result<()> {
+        let store = crate::connect("sqlite::memory:").await?;
+        for run in ["r1", "r2"] {
+            store.create_run(&new_run(run)).await?;
+        }
+        for id in ["mine", "shared", "shown", "upload"] {
+            store.put_artifact(&artifact(id, "splat")).await?;
+        }
+        store.link_artifact("r1", "mine", "output", "out-0").await?;
+        store
+            .link_artifact("r1", "shared", "output", "out-1")
+            .await?;
+        store
+            .link_artifact("r2", "shared", "input", "splat")
+            .await?;
+        store
+            .link_artifact("r1", "shown", "output", "out-2")
+            .await?;
+        store
+            .announce("r2", &announcement("splat", "shown", 1))
+            .await?;
+
+        assert!(store.forget_artifact("r1", "mine").await?);
+        assert!(store.get_artifact("mine").await?.is_none());
+        assert!(!store.forget_artifact("r1", "mine").await?, "already gone");
+        assert!(!store.forget_artifact("r1", "shared").await?, "r2 reads it");
+        assert!(!store.forget_artifact("r1", "shown").await?, "r2 shows it");
+        assert!(!store.forget_artifact("r1", "upload").await?, "not r1's");
+        for id in ["shared", "shown", "upload"] {
+            assert!(store.get_artifact(id).await?.is_some(), "{id}");
+        }
+        let slots: Vec<_> = store
+            .list_run_artifacts("r1")
+            .await?
+            .into_iter()
+            .map(|l| l.slot_name)
+            .collect();
+        assert_eq!(slots, ["out-1", "out-2"]);
         Ok(())
     }
 }
