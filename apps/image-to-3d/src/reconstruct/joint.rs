@@ -789,14 +789,31 @@ impl Joint {
         lr_rot: f32,
         lr_trans: f32,
     ) -> Result<()> {
+        self.refine_test_poses_at(tv, 1, iters, lr_rot, lr_trans)
+    }
+
+    /// [`Self::refine_test_poses`] rendering at `1/scale` resolution (the
+    /// target is resampled to match): coarse stages widen the basin.
+    pub fn refine_test_poses_at(
+        &mut self,
+        tv: &mut TestViews,
+        scale: u32,
+        iters: u32,
+        lr_rot: f32,
+        lr_trans: f32,
+    ) -> Result<()> {
         let gpu = self.tr.gpu.clone();
         let extent = self.tr.scene.extent;
+        let scale = scale.max(1);
         for i in 0..tv.views.len() {
             let e = tv.images.entries[i];
             let v = &tv.views[i];
             let mut params =
                 self.params_for(i, v.width, v.height, Some((e.offset, e.width, e.height)));
             params.frame.flags |= FLAG_CAM_GRAD;
+            params.frame.render_w = v.width / scale;
+            params.frame.render_h = v.height / scale;
+            params.res_scale = scale;
             for it in 0..iters {
                 // Exponential decay to 1 % over the run.
                 let decay = 0.01f32.powf(it as f32 / iters.max(1) as f32);
@@ -1014,7 +1031,18 @@ impl TestViews {
             .stream
             .clone_dtoh(&self.cams.intr)
             .cuda("download test intrinsics")?;
-        let shared: Vec<_> = mine.iter().map(|_| intr[0]).collect();
+        // One shared camera: its entry; per-image intrinsics: the median focal.
+        let mut k = intr[0];
+        if intr.len() > 1 {
+            let med = |f: fn(&crate::frame::Intr) -> f32| {
+                let mut v: Vec<f32> = intr.iter().map(f).collect();
+                v.sort_by(f32::total_cmp);
+                v[v.len() / 2]
+            };
+            k.fx = med(|k| k.fx);
+            k.fy = med(|k| k.fy);
+        }
+        let shared: Vec<_> = mine.iter().map(|_| k).collect();
         gpu.stream
             .memcpy_htod(&shared, &mut self.cams.intr)
             .cuda("upload test intrinsics")?;
