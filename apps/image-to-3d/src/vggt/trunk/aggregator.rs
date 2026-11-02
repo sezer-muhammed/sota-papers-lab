@@ -113,6 +113,15 @@ pub(crate) fn run(
             ops.k
                 .to_cache(nn, &*x, &mut *cache[k], rows, 2 * DIM, DIM)?;
         }
+        // The G_23 half of the camera tokens (the F_23 half is written
+        // after the frame block above).
+        if i == DEPTH - 1
+            && let Some(c) = cam_tokens.as_deref_mut()
+        {
+            let tm = RowMap::new(t, 0);
+            ops.k
+                .rows_to_wide(nn, &*x, c, n, SPECIAL, tm, 2 * DIM, DIM)?;
+        }
         if tap.wants(Tap::Inter(i)) {
             tap.take(nn, Tap::Inter(i), x, g)?;
         }

@@ -235,13 +235,29 @@ class Predictor:
         return depth.astype(np.float32), pad_extrinsics(poses), crop
 
 
+class SavedPredictor:
+    """Predictions of the native engine (`gpu_dump_eval_predictions`):
+    `<dir>/<scene>/{depth,extrinsics}.npy`."""
+
+    def __init__(self, root: str):
+        self.root = Path(root).expanduser().resolve()
+
+    def predict_scene(self, scene: str, image_paths: list[str]):
+        d = self.root / scene
+        depth = np.load(d / "depth.npy").astype(np.float32)
+        poses = np.load(d / "extrinsics.npy").astype(np.float64)
+        return depth, pad_extrinsics(poses), _source_crop(image_paths)
+
+
 # ---------- main ----------
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset", choices=("eth3d", "sintel"), required=True)
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--predictions", default=None,
+                        help="Score saved predictions (<dir>/<scene>/{depth,extrinsics}.npy) instead of running the model")
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-scenes", type=int, default=None)
@@ -258,13 +274,21 @@ def main() -> int:
         frame_map = dict(list(frame_map.items())[:args.max_scenes])
 
     dataset = Dataset(args.data_root)
-    predictor = Predictor(args.checkpoint, args.device)
+    if args.predictions:
+        predictor = SavedPredictor(args.predictions)
+    elif args.checkpoint:
+        predictor = Predictor(args.checkpoint, args.device)
+    else:
+        parser.error("give --checkpoint or --predictions")
     rotations, translations = [], []
     per_scene = {}
 
     for scene, indices in frame_map.items():
         image_paths, target_depth, gt_extrinsics, frame_names = dataset.load(scene, indices)
-        predicted_depth, predicted_extrinsics, crop = predictor.predict(image_paths)
+        if args.predictions:
+            predicted_depth, predicted_extrinsics, crop = predictor.predict_scene(scene, image_paths)
+        else:
+            predicted_depth, predicted_extrinsics, crop = predictor.predict(image_paths)
         target_depth_cropped = crop_depth(target_depth, crop)
         predicted_depth = resize_depth(predicted_depth, target_depth_cropped.shape[-2:])
         depth = depth_metrics(predicted_depth, target_depth_cropped)
@@ -291,12 +315,13 @@ def main() -> int:
     }
 
     output = {
-        "checkpoint": Path(args.checkpoint).name,
+        "checkpoint": Path(args.checkpoint).name if args.checkpoint else None,
+        "predictions": args.predictions,
         "dataset": args.dataset,
         "elapsed_seconds": round(time.time() - started, 1),
         "environment": {
             "cuda": torch.version.cuda,
-            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() and not args.predictions else None,
             "numpy": np.__version__,
             "python": platform.python_version(),
             "torch": torch.__version__,

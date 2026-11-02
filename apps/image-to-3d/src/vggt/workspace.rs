@@ -224,6 +224,9 @@ pub struct Workspace {
     pub conf: CudaSlice<u16>,
     /// World points f32 `[N][H][W][3]`.
     pub world: CudaSlice<f32>,
+    /// f32 `[N · 17][2048]` = `[F_23 | G_23]` of the special tokens: the
+    /// camera head's input without the bf16 rounding of the cache.
+    pub cam_tokens: CudaSlice<f32>,
     pub plan: Plan,
 }
 
@@ -286,6 +289,9 @@ impl Workspace {
             world: s
                 .alloc_zeros(g.frames * g.pixels() * 3)
                 .map_err(alloc_err("world"))?,
+            cam_tokens: s
+                .alloc_zeros(g.frames * crate::vggt::trunk::SPECIAL * CACHE_DIM)
+                .map_err(alloc_err("camera tokens"))?,
             plan,
         })
     }

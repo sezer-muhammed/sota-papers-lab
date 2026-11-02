@@ -2162,6 +2162,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spl-core",
+ "spl-data",
  "spl-gpu",
  "spl-nn",
  "tempfile",

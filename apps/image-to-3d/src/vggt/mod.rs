@@ -21,6 +21,8 @@ pub mod weights;
 pub mod workspace;
 
 #[cfg(test)]
+mod integration;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
@@ -300,8 +302,14 @@ impl VggtEngine {
             let trunk = &mut self.trunk;
             let w = &self.weights;
             let tg = trunk_geom(&g);
-            let Workspace { images, cache, .. } = &mut *ws;
+            let Workspace {
+                images,
+                cache,
+                cam_tokens,
+                ..
+            } = &mut *ws;
             let images = images.slice(..);
+            let mut cam_tokens = cam_tokens.slice_mut(..);
             let [mut c0, mut c1, mut c2, mut c3] = workspace::cache_mut(cache)?;
             let mut body = |nn: &Nn| -> Result<()> {
                 trunk.run(
@@ -310,7 +318,7 @@ impl VggtEngine {
                     tg,
                     &images,
                     [&mut c0, &mut c1, &mut c2, &mut c3],
-                    None,
+                    Some(&mut cam_tokens),
                     &sched,
                     &mut trunk::NoTap,
                 )
@@ -336,7 +344,11 @@ impl VggtEngine {
             }
         };
         let ws = self.workspaces.get_mut(&g).expect("workspace");
-        let pose_enc = self.camera.run(&nn, &ws.level(3)?, &g, cams)?;
+        // The camera head reads the fp32 special tokens: on the bf16 cache
+        // its fov drifts to about 2x the official bf16-vs-fp32 distance.
+        let pose_enc = self
+            .camera
+            .run_f32(&nn, &ws.cam_tokens.slice(..), &g, cams)?;
         record(&nn, &ev[3])?;
 
         progress("dense head", 0.8);

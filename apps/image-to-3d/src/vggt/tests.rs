@@ -15,7 +15,7 @@ use crate::pose;
 // ---------------------------------------------------------------- helpers
 
 /// A little `.npy` reader: f32 / f16 / f64, little-endian, C order.
-fn npy(path: &Path) -> (Vec<usize>, Vec<f32>) {
+pub(super) fn npy(path: &Path) -> (Vec<usize>, Vec<f32>) {
     let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(&b[..6], b"\x93NUMPY");
     let (hl, start) = if b[6] == 1 {
@@ -61,7 +61,7 @@ fn npy(path: &Path) -> (Vec<usize>, Vec<f32>) {
 }
 
 /// RMS of `a − b` relative to the RMS of `b`, and max |a − b|.
-fn rel(a: &[f32], b: &[f32]) -> (f64, f64) {
+pub(super) fn rel(a: &[f32], b: &[f32]) -> (f64, f64) {
     assert_eq!(a.len(), b.len());
     let (mut se, mut sb, mut mx) = (0.0f64, 0.0f64, 0.0f64);
     for (&x, &y) in a.iter().zip(b) {
@@ -73,17 +73,17 @@ fn rel(a: &[f32], b: &[f32]) -> (f64, f64) {
     ((se / sb.max(1e-30)).sqrt(), mx)
 }
 
-fn env_path(var: &str, default: &str) -> PathBuf {
+pub(super) fn env_path(var: &str, default: &str) -> PathBuf {
     std::env::var_os(var)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(default))
 }
 
-fn oracle_dir() -> PathBuf {
+pub(super) fn oracle_dir() -> PathBuf {
     env_path("SPL_VGGT_ORACLE", "/oracle")
 }
 
-fn weights_file() -> PathBuf {
+pub(super) fn weights_file() -> PathBuf {
     env_path(
         "SPL_VGGT_WEIGHTS",
         "/models/vggt-omega/vggt_omega_1b_512.safetensors",
@@ -402,7 +402,7 @@ fn host_preprocess_matches_oracle() {
     assert!((off as f64) < 1e-3 * diff.len() as f64);
 }
 
-fn engine() -> VggtEngine {
+pub(super) fn engine() -> VggtEngine {
     let nn = Arc::new(Nn::open().expect("CUDA"));
     VggtEngine::load(nn, &weights_file(), VggtConfig::default()).expect("load engine")
 }
@@ -477,7 +477,7 @@ fn gpu_normalize_matches_torch_formula() {
 
 /// Worst rotation angle, translation-direction angle and FoV difference
 /// (degrees) between two `[N][9]` pose encodings.
-fn cam_gates(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+pub(super) fn cam_gates(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
     let n = |q: &[f64]| q.iter().map(|v| v * v).sum::<f64>().sqrt();
     let (mut rot, mut tdir, mut fov) = (0.0f64, 0.0f64, 0.0f64);
     for (a, b) in a.chunks(9).zip(b.chunks(9)) {
@@ -634,7 +634,7 @@ impl Parity {
 #[ignore]
 fn gpu_parity_with_oracle() {
     let mut e = engine();
-    for set in ["t1", "t2", "g8", "t32"] {
+    for set in ["t1", "t2", "g8", "b10", "t32", "k50"] {
         if oracle_dir().join(set).is_dir() {
             (Parity { set }).run(&mut e);
         }
@@ -650,7 +650,7 @@ fn gpu_parity_with_oracle() {
 fn gpu_parity_camera_gates() {
     let mut e = engine();
     let mut failed = Vec::new();
-    for set in ["t1", "t2", "g8", "t32"] {
+    for set in ["t1", "t2", "g8", "b10", "t32", "k50"] {
         if oracle_dir().join(set).is_dir() && !(Parity { set }).run(&mut e) {
             failed.push(set);
         }
@@ -664,7 +664,7 @@ fn gpu_parity_camera_gates() {
 fn gpu_bench_engine() {
     let mut e = engine();
     let only = std::env::var("SPL_VGGT_BENCH_SETS").unwrap_or_default();
-    for set in ["t1", "t2", "g8", "t32"] {
+    for set in ["t1", "t2", "g8", "b10", "t32", "k50"] {
         if !oracle_dir().join(set).is_dir()
             || !(only.is_empty() || only.split(',').any(|s| s == set))
         {

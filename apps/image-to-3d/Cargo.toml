@@ -25,5 +25,8 @@ tracing.workspace = true
 ts-rs.workspace = true
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
+[dev-dependencies]
+spl-data.workspace = true
+
 [lints]
 workspace = true

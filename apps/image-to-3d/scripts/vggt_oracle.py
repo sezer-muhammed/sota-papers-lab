@@ -19,6 +19,7 @@ non-commercial licence); the dumps stay on the GPU host.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import time
 from pathlib import Path
@@ -118,7 +119,10 @@ def main() -> int:
         model = load(a.checkpoint, autocast=precision == "bf16")
         for s in a.set:
             run_set(model, s[0], s[1:], Path(a.out) / s[0] / precision, a.layers, a.time and precision == "bf16")
+        # The forward patch makes a reference cycle: collect it, or the
+        # bf16 model stays on the device while the fp32 one loads.
         del model
+        gc.collect()
         torch.cuda.empty_cache()
     return 0
 
