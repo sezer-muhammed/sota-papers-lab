@@ -4,8 +4,10 @@
 mod api;
 mod config;
 mod host;
+mod queue;
 mod recording;
 
 pub use api::{Health, RunDetail, RunProgress, RunRequest, router};
 pub use config::Config;
-pub use host::{Host, LiveRun};
+pub use host::{Host, LiveRun, StagedFile};
+pub use queue::WaitReason;
