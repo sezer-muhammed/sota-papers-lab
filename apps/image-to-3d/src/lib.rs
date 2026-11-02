@@ -21,6 +21,7 @@
 //! - trainer (E7): `gpu.rs`, `frame.rs`, `rng.rs`, `presets.rs`,
 //!   `trainer.rs`, `ops.rs`, `refine.rs`, `io/*`, `testkit/*`
 //! - ingest (A0): `ingest/*`, `cuda/ingest.cu`
+//! - reconstruct (mvp-pipeline): `reconstruct/*`, `cuda/reconstruct.cu`
 
 pub mod eval;
 pub mod export;
@@ -35,6 +36,7 @@ pub mod ops;
 pub mod pose;
 pub mod ppisp;
 pub mod presets;
+pub mod reconstruct;
 pub mod reference;
 pub mod refine;
 pub mod rng;
@@ -45,5 +47,9 @@ pub mod vggt;
 use spl_core::Registry;
 
 pub fn register(registry: &mut Registry) {
-    registry.op(ops::Train).op(ops::Render).op(pose::Pose);
+    registry
+        .op(ops::Train)
+        .op(ops::Render)
+        .op(pose::Pose)
+        .op(reconstruct::Reconstruct);
 }
