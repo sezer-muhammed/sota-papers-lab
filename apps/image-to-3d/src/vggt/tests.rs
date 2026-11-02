@@ -643,8 +643,10 @@ fn gpu_parity_with_oracle() {
 
 /// Spec §8 camera gates (rotation < 0.1°, translation direction < 0.1°,
 /// fov < 0.05°, or within 1.5× the official bf16-vs-fp32 distance). Open
-/// issue (heads): the camera head's bf16 GEMMs put fov at about 2× the
-/// official noise.
+/// issue (trunk): the camera head reads fp32 special tokens and meets the
+/// fov gate on the official tokens (0.047°), but the trunk's late-layer
+/// special tokens carry 1.5× the official noise, which puts rotation and
+/// fov at 1.2-2× (`tools/vggt/INTEGRATION.md`).
 #[test]
 #[ignore]
 fn gpu_parity_camera_gates() {
