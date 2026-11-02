@@ -21,6 +21,37 @@ use super::workspace::Geometry;
 
 pub type GraphKey = (Geometry, u64);
 
+/// Turns off cudarc's per-slice event tracking for the allocations and
+/// launches made while it lives, and restores the previous setting on drop.
+/// Tracked slices make every launch wait on an event recorded by the last
+/// use, and a capture cannot wait on work recorded before it, so everything
+/// a graph touches must be untracked. The engine uses one stream, so the
+/// tracking (which orders work across streams) is not needed. Holders must
+/// be the only GPU user of the process meanwhile (the pose op is
+/// GPU-exclusive), since the flag is per context.
+pub struct Untracked<'a> {
+    ctx: &'a spl_nn::cudarc::driver::CudaContext,
+    was: bool,
+}
+
+impl<'a> Untracked<'a> {
+    pub fn new(ctx: &'a spl_nn::cudarc::driver::CudaContext) -> Self {
+        let was = ctx.is_event_tracking();
+        // SAFETY: see the type's documentation: single-stream use.
+        unsafe { ctx.disable_event_tracking() };
+        Self { ctx, was }
+    }
+}
+
+impl Drop for Untracked<'_> {
+    fn drop(&mut self) {
+        if self.was {
+            // SAFETY: restores the setting found in `new`.
+            unsafe { self.ctx.enable_event_tracking() };
+        }
+    }
+}
+
 enum State {
     Warm,
     Graph(Exec),
@@ -77,6 +108,9 @@ impl GraphCache {
                         Ok(true)
                     }
                     Err(e) => {
+                        // A failed capture leaves its error in cudarc's
+                        // context state; clear it so the eager run works.
+                        let _ = nn.ctx.check_err();
                         tracing::warn!("CUDA graph capture failed, running eagerly: {e:#}");
                         self.graphs.insert(key, State::Eager);
                         body(nn).map(|_| false)

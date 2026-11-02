@@ -165,6 +165,8 @@ const RUNTIME_CU: &str = include_str!("../../cuda/vggt_runtime.cu");
 impl VggtEngine {
     /// Maps and uploads the weights and builds every component.
     pub fn load(nn: Arc<Nn>, weights: &std::path::Path, cfg: VggtConfig) -> Result<Self> {
+        let ctx = nn.ctx.clone();
+        let _untracked = graph::Untracked::new(&ctx);
         let mut paths = vec![weights.to_path_buf()];
         if cfg.fp8 {
             paths.push(weights::fp8_companion(weights));
@@ -210,11 +212,9 @@ impl VggtEngine {
     pub fn plan(&self, geom: Geometry) -> Result<Plan> {
         let (free, _total) = spl_nn::cudarc::driver::result::mem_get_info()
             .map_err(|e| anyhow!("cuMemGetInfo: {e:?}"))?;
-        // Keep the current workspace of this geometry in the budget.
-        let held = self
-            .workspaces
-            .get(&geom)
-            .map_or(0, |w| w.plan.device_bytes);
+        // Workspaces are replaced by the new one (one geometry at a time),
+        // so their memory counts as free.
+        let held: usize = self.workspaces.values().map(|w| w.plan.device_bytes).sum();
         let margin = 256 << 20;
         let trunk = trunk::Trunk::scratch_bytes(&trunk_geom(&geom));
         let chunk = geom.with_frames(self.cfg.dense_chunk.min(geom.frames));
@@ -246,7 +246,9 @@ impl VggtEngine {
     fn event(&self) -> Result<CudaEvent> {
         self.nn
             .ctx
-            .new_event(None)
+            .new_event(Some(
+                spl_nn::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+            ))
             .map_err(|e| anyhow!("create CUDA event: {e:?}"))
     }
 
@@ -267,6 +269,7 @@ impl VggtEngine {
             bail!("prepared pixels do not match {g:?}");
         }
         let nn = self.nn.clone();
+        let _untracked = graph::Untracked::new(&nn.ctx);
         let ev: Vec<CudaEvent> = (0..5).map(|_| self.event()).collect::<Result<_>>()?;
         progress("upload", 0.0);
         record(&nn, &ev[0])?;

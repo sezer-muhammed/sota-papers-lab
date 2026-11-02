@@ -510,8 +510,19 @@ impl Parity {
         let p = prepared_from_oracle(self.set);
         let g = p.geom;
         let cancel = CancellationToken::new();
+        // Run 1 is eager, run 2 captures the trunk, run 3 replays the graph
+        // (for N within `graph_max_frames`): all must agree bit for bit.
+        let first = e.run(&p, &cancel, &mut |_, _| {}).unwrap();
+        let first_depth = e.download(&g).unwrap().depth;
+        e.run(&p, &cancel, &mut |_, _| {}).unwrap();
         let cams = e.run(&p, &cancel, &mut |_, _| {}).unwrap();
         let dense = e.download(&g).unwrap();
+        println!("{} graph replay: {}", self.set, e.times.graph);
+        assert_eq!(
+            first.pose_enc, cams.pose_enc,
+            "graph replay changed pose_enc"
+        );
+        assert!(first_depth == dense.depth, "graph replay changed depth");
         let o = oracle_dir().join(self.set);
         let ld = |prec: &str, n: &str| npy(&o.join(prec).join(n)).1;
         let pe: Vec<f32> = cams.pose_enc.iter().flatten().copied().collect();
