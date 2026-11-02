@@ -665,3 +665,22 @@ fn bench_heads() {
     }
     println!("nvidia-smi after: {}", smi());
 }
+
+/// One warm-up and one profiled pass (camera N = 8 + one dense chunk of 8 at
+/// 512×336) for Nsight Compute's per-kernel durations:
+/// `ncu --metrics gpu__time_duration.sum --csv <bin> --ignored profile_heads`.
+#[test]
+#[ignore]
+fn profile_heads() {
+    let Some(s) = setup() else { return };
+    let nn = &s.nn;
+    let g = Geometry::new(8, 336, 512);
+    let rows = g.frames * g.tokens() * DIM;
+    let vals: Vec<u16> = (0..rows)
+        .map(|i| host::bf16(((i * 2654435761) % 1000) as f32 / 300.0 - 1.6))
+        .collect();
+    let cache: [CudaSlice<u16>; 4] = std::array::from_fn(|_| nn.stream.clone_htod(&vals).unwrap());
+    for _ in 0..2 {
+        run_heads(&s, &cache, &g, 8);
+    }
+}

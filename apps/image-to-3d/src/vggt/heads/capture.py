@@ -140,12 +140,56 @@ def save_heads(state, path):
 
 
 
+def bench(model, out: Path):
+    """PyTorch baseline of the heads alone (official fp32 heads, autocast
+    off, PyTorch defaults: cuDNN TF32 convolutions, fp32 matmul): median of
+    10 CUDA-event timings with random layer caches, 512×336 and 512×384."""
+    import json
+    import subprocess
+
+    ch, dh = model.camera_head.cuda(), model.dense_head.cuda()
+    smi = lambda: subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,clocks.sm,clocks.mem,power.draw",
+                                  "--format=csv,noheader"], capture_output=True, text=True).stdout.strip()
+    res = {"nvidia_smi_before": smi(), "runs": []}
+    for h, w in [(384, 512), (336, 512)]:
+        for n in [8, 32]:
+            t = 17 + (h // 16) * (w // 16)
+            layers = [None] * 24
+            for i in LAYERS:
+                layers[i] = torch.randn(1, n, t, 2048, device="cuda")
+            images = torch.zeros(1, n, 3, h, w, device="cuda")
+
+            def time(fn):
+                for _ in range(3):
+                    fn()
+                torch.cuda.synchronize()
+                ts = []
+                for _ in range(10):
+                    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    a.record(); fn(); b.record(); torch.cuda.synchronize()
+                    ts.append(a.elapsed_time(b))
+                return sorted(ts)[len(ts) // 2]
+
+            with torch.inference_mode(), torch.autocast(device_type="cuda", enabled=False):
+                cam = time(lambda: ch(layers, patch_token_start=17))
+                dense = time(lambda: dh(layers, images=images, patch_token_start=17))
+            r = {"h": h, "w": w, "n": n, "camera_ms": cam, "dense_ms": dense, "total_ms": cam + dense,
+                 "peak_mb": torch.cuda.max_memory_allocated() / 2**20}
+            print(r, flush=True)
+            res["runs"].append(r)
+            del layers, images
+            torch.cuda.empty_cache()
+    res["nvidia_smi_after"] = smi()
+    (out / "torch_heads_bench.json").write_text(json.dumps(res, indent=1))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--images", required=True)
+    ap.add_argument("--images", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--weights", default=None)
+    ap.add_argument("--bench", action="store_true", help="time the official heads only (GPU)")
     ap.add_argument("--device", default="cuda", help="cuda or cpu (aggregator in CPU bf16 autocast)")
     args = ap.parse_args()
     global DEV
@@ -157,6 +201,9 @@ def main() -> int:
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     model = VGGTOmega()
     model.load_state_dict(state, strict=True)
+    if args.bench:
+        bench(model.eval(), Path(args.out))
+        return 0
     model = model.eval().to(DEV)
 
     if args.weights:
