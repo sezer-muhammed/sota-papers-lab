@@ -112,12 +112,34 @@ pub(super) struct CpuSpan {
     py1: i32,
 }
 
+/// binning.cu's `span::ln`: ln of a normal x > 0 from IEEE operations only.
+pub(super) fn span_ln(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let mut e = ((bits >> 23) & 0xff) as i32 - 127;
+    let mut m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+    if m > f32::from_bits(0x3fb5_04f3) {
+        m *= 0.5;
+        e += 1;
+    }
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    let mut p = t2.mul_add(f32::from_bits(0x3de3_8e39), f32::from_bits(0x3e12_4925));
+    p = t2.mul_add(p, f32::from_bits(0x3e4c_cccd));
+    p = t2.mul_add(p, f32::from_bits(0x3eaa_aaab));
+    p = t2.mul_add(p, 1.0);
+    (e as f32).mul_add(f32::from_bits(0x3f31_7218), (2.0 * t) * p)
+}
+
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub(super) fn span_setup(r: &SplatRec, w: u32, h: u32) -> Option<CpuSpan> {
+    let x = 255.0 * r.o;
+    if !(x > f32::MIN_POSITIVE) || !(x < 3.4e38) {
+        return None;
+    }
     let a = r.ca * (-2.0 * LN_2);
     let b = r.cb * -LN_2;
     let c = r.cc * (-2.0 * LN_2);
-    let k = r.pthr * (2.0 * LN_2);
+    let k = 2.0 * span_ln(x);
     let kb = k.mul_add(1.0 + KBIN_REL, KBIN_ABS);
     let det = a.mul_add(c, -(b * b));
     if !(det > 0.0 && kb > 0.0 && a > 0.0 && c > 0.0) {
@@ -188,13 +210,12 @@ pub(super) fn cpu_tiles(r: &SplatRec, w: u32, h: u32, tile_h: u32) -> Vec<u32> {
     out
 }
 
-/// Tiles holding a pixel centre with q(c − m) ≤ k (k = 2 ln(255 o) from the
-/// stored pthr), by brute force in f64: what any correct binning must cover.
+/// Tiles holding a pixel centre with q(c − m) ≤ k (k = 2 ln(255 o)), by brute force in f64: what any correct binning must cover.
 fn brute_force_tiles(r: &SplatRec, w: u32, h: u32, tile_h: u32) -> BTreeSet<u32> {
     let a = r.ca as f64 / (-0.5 * LOG2E as f64);
     let b = r.cb as f64 / -(LOG2E as f64);
     let c = r.cc as f64 / (-0.5 * LOG2E as f64);
-    let k = 2.0 * std::f64::consts::LN_2 * r.pthr as f64;
+    let k = 2.0 * (255.0 * r.o as f64).ln();
     let det = a * c - b * b;
     let mut out = BTreeSet::new();
     if !(k > 0.0 && det > 0.0) {
@@ -1060,8 +1081,8 @@ fn gpu_bin_tiles_matches_cpu_reference() {
     }
 }
 
-/// I over capacity: OVF_INSTANCES with the true total, nothing after scan_tiles
-/// writes (tile buffers untouched, no chains), and the same sorter then bins
+/// I over capacity: OVF_INSTANCES with the true total, nothing after scan_emit
+/// writes (tile sort target untouched, no chains), and the same sorter then bins
 /// the frame correctly at a grown capacity (the replay of spec-raster 1.5).
 #[test]
 #[ignore]
@@ -1093,16 +1114,16 @@ fn gpu_instance_overflow_is_a_no_op_then_replays() {
     assert_eq!(st[ST_OVERFLOW], OVF_INSTANCES);
     assert_eq!(st[ST_N_INST], need, "true total reported");
     assert_eq!(st[ST_N_CHAINS], 0, "bin_scan must not run");
-    for b in &f.tile_key {
-        assert!(
-            gpu.stream
-                .clone_dtoh(b)
-                .unwrap()
-                .iter()
-                .all(|&x| x == 0xBEEF),
-            "emit or the tile sort wrote"
-        );
-    }
+    // scan_emit writes the partitions that fit into tile_key[0] (in bounds);
+    // the tile sort must not run, so its ping-pong target stays untouched.
+    assert!(
+        gpu.stream
+            .clone_dtoh(&f.tile_key[1])
+            .unwrap()
+            .iter()
+            .all(|&x| x == 0xBEEF),
+        "the tile sort wrote"
+    );
     // Host: grow to 1.25x the need and replay; the sorter state is consistent.
     let (f2, _k) = bin_frame(&gpu, &mut sorter, v, &recs, w, h, need + need / 4);
     compare_bin(

@@ -4,15 +4,18 @@
 //! Buffer contract:
 //! - `sort_depth`: (depth_key[0], depth_val[0]) → `depth_*[f.depth_sorted]`,
 //!   stable, count from `status[ST_N_VIS]`.
-//! - `bin_tiles`: scan_tiles → `inst_off`, `status[ST_N_INST]` (overflow
-//!   check); emit → `tile_key[0]`, `inst_v[0]`; tile_hist; bin_scan →
+//! - `bin_tiles`: scan_emit → `inst_off`, `tile_key[0]`, `inst_v[0]`,
+//!   `status[ST_N_INST]` (true total; overflow check); tile_hist; bin_scan →
 //!   `tile_start`, `chain_off`, `tile_digit_offsets`, `status[ST_N_CHAINS]`,
 //!   `status[ST_N_TILES_HIT]`; two u16 passes → `tile_key/inst_v[f.tile_sorted]`.
 //!   Tile t occupies `[tile_start[t], tile_start[t + 1])` afterwards; no
-//!   range-extraction pass.
-//! - `count_tiles`: `n_tiles[v]` from `rec[v]` with the span rule emit uses
-//!   (the reference count; preprocess_fwd computes the same with the same
-//!   device function once it moves to `splat_common.cuh`).
+//!   range-extraction pass. scan_emit is spec-raster 3.1's scan_tiles + emit
+//!   fused: it gathers each record once in depth order and counts its tiles
+//!   itself, so binning does not read `n_tiles` (preprocess may still write it
+//!   for its own culling) and count == emit holds by construction.
+//! - `scan_tiles` + `emit`: the two-kernel form, from `n_tiles`;
+//!   `count_tiles`: `n_tiles[v]` from `rec[v]` with the same span rule. For
+//!   tests, A/B timing and callers that already have counts.
 //!
 //! Everything only enqueues: no host sync, no allocation, counts read from the
 //! device, no memsets (the sorter's scratch resets itself, see `radix.cu`), so
@@ -60,7 +63,14 @@ pub const BINNING_SOURCE: KernelSource = KernelSource {
             text: include_str!("../../cuda/binning.cu"),
         },
     ],
-    kernels: &["count_tiles", "scan_tiles", "emit", "tile_hist", "bin_scan"],
+    kernels: &[
+        "count_tiles",
+        "scan_tiles",
+        "emit",
+        "scan_emit",
+        "tile_hist",
+        "bin_scan",
+    ],
 };
 
 /// Depth keys are the float bits of z > 0 (monotone). spec-raster 2's
@@ -192,6 +202,7 @@ pub struct BinningKernels {
     pub count_tiles: CudaFunction,
     pub scan_tiles: CudaFunction,
     pub emit: CudaFunction,
+    pub scan_emit: CudaFunction,
     pub tile_hist: CudaFunction,
     pub bin_scan: CudaFunction,
 }
@@ -203,6 +214,7 @@ impl BinningKernels {
             count_tiles: b.get("count_tiles")?,
             scan_tiles: b.get("scan_tiles")?,
             emit: b.get("emit")?,
+            scan_emit: b.get("scan_emit")?,
             tile_hist: b.get("tile_hist")?,
             bin_scan: b.get("bin_scan")?,
         })
@@ -262,7 +274,8 @@ pub struct RadixSorter {
     pub digit_hist: CudaSlice<u32>,
     /// `[4][RADIX_BINS]` exclusive digit offsets of the current u32 sort.
     pub digit_offsets: CudaSlice<u32>,
-    /// scan_tiles look-back words, one per `SCAN_PART` items.
+    /// scan_tiles / scan_emit look-back words, one per `BIN_THREADS` items
+    /// (scan_emit's partition; scan_tiles uses the first 1/16).
     pub scan_lookback: CudaSlice<u64>,
     sms: u32,
 }
@@ -296,7 +309,7 @@ impl RadixSorter {
                 .alloc_zeros::<u32>(4 * RADIX_BINS as usize)
                 .cuda("alloc digit offsets")?,
             scan_lookback: s
-                .alloc_zeros::<u64>(max_items.div_ceil(SCAN_PART).max(1) as usize)
+                .alloc_zeros::<u64>(max_items.div_ceil(BIN_THREADS).max(1) as usize)
                 .cuda("alloc scan look-back")?,
             sms: gpu.multiprocessors(),
         })
@@ -552,15 +565,14 @@ pub fn count_tiles(k: &SplatKernels, s: &CudaStream, f: &mut FrameBuffers) -> Re
         .cuda("count_tiles")
 }
 
-/// scan_tiles → emit → tile_hist → bin_scan → 2 × onesweep_u16.
+/// scan_emit → tile_hist → bin_scan → 2 × onesweep_u16.
 pub fn bin_tiles(
     k: &SplatKernels,
     s: &CudaStream,
     sorter: &mut RadixSorter,
     f: &mut FrameBuffers,
 ) -> Result<()> {
-    scan_tiles(k, s, sorter, f)?;
-    emit(k, s, f)?;
+    scan_emit(k, s, sorter, f)?;
     tile_hist(k, s, sorter, f)?;
     bin_scan(k, s, f)?;
     sort_tiles(k, s, sorter, f)
@@ -612,6 +624,40 @@ pub fn emit(k: &SplatKernels, s: &CudaStream, f: &mut FrameBuffers) -> Result<()
     unsafe { b.launch(cfg1d(grid(f.cap.visible, BIN_THREADS), BIN_THREADS)) }
         .map(drop)
         .cuda("emit")
+}
+
+/// scan_tiles + emit fused: counts each record's tiles in depth order, writes
+/// inst_off, status[ST_N_INST] (true total, OVF_INSTANCES) and the instances.
+pub fn scan_emit(
+    k: &SplatKernels,
+    s: &CudaStream,
+    sorter: &mut RadixSorter,
+    f: &mut FrameBuffers,
+) -> Result<()> {
+    let i_cap = f.cap.instances;
+    let mut sc_state = sorter.state.slice_mut(OS_STATE..OS_STATE + SC_STATE);
+    let [tk0, _] = &mut f.tile_key;
+    let [iv0, _] = &mut f.inst_v;
+    let mut b = s.launch_builder(&k.binning.scan_emit);
+    b.arg(&f.iter.cam)
+        .arg(&f.depth_val[f.depth_sorted])
+        .arg(&f.rec)
+        .arg(&i_cap)
+        .arg(&mut f.inst_off)
+        .arg(tk0)
+        .arg(iv0)
+        .arg(&mut sorter.scan_lookback)
+        .arg(&mut sc_state)
+        .arg(&mut f.iter.status);
+    // SAFETY: scan_emit(const FrameCam*, const u32* sorted_v, const SplatRec*
+    // rec, u32 i_cap, u32* inst_off, u16* tile_key, u32* inst_v, u64*
+    // lookback, u32* state, u32* status): per-v buffers hold V_cap, inst_off
+    // V_cap + 1, instance buffers I_cap (a partition ending past i_cap writes
+    // none), lookback one word per BIN_THREADS of the grid (the sorter covers
+    // max(V_cap, I_cap)), state SC_STATE words.
+    unsafe { b.launch(cfg1d(grid(f.cap.visible, BIN_THREADS), BIN_THREADS)) }
+        .map(drop)
+        .cuda("scan_emit")
 }
 
 /// Full tile histogram of the emitted keys into tile_hist.

@@ -167,14 +167,45 @@ pub(super) fn garden_workload(
     }
 }
 
-/// The workloads of the report: V 0.6-4M, I 10-60M.
+/// CPU only: V and I of the garden workload over a grid of N and scale (to
+/// choose `workloads`).
+#[test]
+#[ignore]
+fn garden_workload_calibration() {
+    let Some(scene) = garden() else {
+        eprintln!("skipped: no mipnerf360/garden");
+        return;
+    };
+    println!(
+        "garden extent {:.3}, {} points",
+        scene.extent,
+        scene.points.xyz.len()
+    );
+    for n in [1_000_000, 3_000_000, 6_000_000] {
+        for scale in [2.0, 3.0, 4.0, 6.0, 8.0, 12.0] {
+            let wl = garden_workload(&scene, n, scale, 0, 1);
+            println!(
+                "N {n:>8} scale {scale:>4}: V {:>8} I {:>9} ({:.2} per visible)",
+                wl.recs.len(),
+                wl.instances,
+                wl.instances as f64 / wl.recs.len().max(1) as f64
+            );
+        }
+    }
+}
+
+/// The workloads of the report (scales from `garden_workload_calibration`):
+/// early training (N 1M, ~4 tiles per visible), mid (3M, ~5), late training at
+/// the spec's model (6M, ~4.6: V 3.3M, I ~15M), the same from another view,
+/// and two large-splat cases that push I to ~30M and ~60M.
 pub(super) fn workloads(scene: &Scene) -> Vec<Workload> {
     [
-        (1_000_000, 1.0, 0),
-        (3_000_000, 1.0, 0),
-        (6_000_000, 1.0, 0),
-        (6_000_000, 1.6, 0),
-        (3_000_000, 1.0, 40),
+        (1_000_000, 4.0, 0),
+        (3_000_000, 8.0, 0),
+        (6_000_000, 10.0, 0),
+        (6_000_000, 10.0, 40),
+        (6_000_000, 18.0, 0),
+        (6_000_000, 30.0, 0),
     ]
     .into_iter()
     .map(|(n, s, v)| garden_workload(scene, n, s, v, 1))
@@ -507,7 +538,7 @@ fn gpu_bench_radix_configs() {
     let gpu = gpu();
     let s = gpu.stream.clone();
     let k = SplatKernels::load(&gpu, RasterVariant::default()).unwrap();
-    let wl = garden_workload(&scene, 6_000_000, 1.0, 0, 1);
+    let wl = garden_workload(&scene, 6_000_000, 10.0, 0, 1);
     let mut f = frame_for(&gpu, &wl);
     upload_frame(&gpu, &mut f, &frame_cam(wl.w, wl.h, 16), &wl.recs);
     let mut base = RadixSorter::new(&gpu, (wl.instances as u32).max(wl.recs.len() as u32)).unwrap();
@@ -582,4 +613,34 @@ fn gpu_bench_radix_configs() {
         serde_json::to_string_pretty(&results).unwrap(),
     )
     .unwrap();
+}
+
+/// One pass of the late-training workload (N 6M, scale 10, view 0) through
+/// count_tiles, sort_depth and bin_tiles, for Nsight Compute
+/// (`SPL_SORT_PROFILE_SCALE` overrides the scale).
+#[test]
+#[ignore]
+fn gpu_profile_pipeline_once() {
+    let Some(scene) = garden() else {
+        eprintln!("skipped: no mipnerf360/garden");
+        return;
+    };
+    let scale = std::env::var("SPL_SORT_PROFILE_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10.0);
+    let gpu = gpu();
+    let s = gpu.stream.clone();
+    let k = SplatKernels::load(&gpu, RasterVariant::default()).unwrap();
+    let wl = garden_workload(&scene, 6_000_000, scale, 0, 1);
+    let mut f = frame_for(&gpu, &wl);
+    let items = (wl.instances as u32).max(wl.recs.len() as u32);
+    let mut sorter = RadixSorter::new(&gpu, items).unwrap();
+    upload_frame(&gpu, &mut f, &frame_cam(wl.w, wl.h, 16), &wl.recs);
+    count_tiles(&k, &s, &mut f).unwrap();
+    sort_depth(&k, &s, &mut sorter, &mut f).unwrap();
+    bin_tiles(&k, &s, &mut sorter, &mut f).unwrap();
+    gpu.sync().unwrap();
+    let st = s.clone_dtoh(&f.iter.status).unwrap();
+    println!("{}: V {} I {}", wl.name, st[ST_N_VIS], st[ST_N_INST]);
 }
