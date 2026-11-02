@@ -13,8 +13,8 @@ ENV PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ATTN_BACKEND=sdpa \
     SPARSE_ATTN_BACKEND=sdpa \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    HF_HUB_OFFLINE=1
+    PYTORCH_ALLOC_CONF=expandable_segments:True \
+    TRANSFORMERS_CACHE=/tmp/hf_cache
 
 # Extension wheels built on the host (FlexGEMM, CuMesh, o-voxel, nvdiffrast).
 COPY wheels/ /tmp/wheels/

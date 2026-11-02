@@ -45,81 +45,41 @@ if profile == "full":
     DECODERS.append("ckpts/tex_dec_next_dc_f16c32_fp16")
 
 def fetch_and_convert(name, to_bf16=False):
-    local = out / name
-    safetensors = local / "model.safetensors"
-    config_json = local / "config.json"
-    if safetensors.exists():
+    # Files on HF are flat: {name}.safetensors and {name}.json (no subdirectory).
+    st_file = out / f"{name}.safetensors"
+    json_file = out / f"{name}.json"
+    if st_file.exists():
         print(f"[skip] {name} already exists")
         return
 
-    local.mkdir(parents=True, exist_ok=True)
+    st_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Download safetensors.
-    print(f"[dl] {name}/model.safetensors ...")
-    src = hf_hub_download(REPO, f"{name}/model.safetensors",
+    print(f"[dl] {name}.safetensors ...")
+    src = hf_hub_download(REPO, f"{name}.safetensors",
                           local_dir=str(out), local_dir_use_symlinks=False)
 
-    # Download config.json if it exists.
     try:
-        hf_hub_download(REPO, f"{name}/config.json",
+        hf_hub_download(REPO, f"{name}.json",
                         local_dir=str(out), local_dir_use_symlinks=False)
     except Exception:
         pass
 
     if to_bf16:
-        print(f"[convert] {name} fp32 -> bf16 ...")
+        print(f"[convert] {name} -> bf16 ...")
         sd = load_file(src)
         bf = {k: v.to(torch.bfloat16) if v.is_floating_point() else v for k, v in sd.items()}
-        tmp = str(safetensors) + ".tmp"
+        tmp = str(st_file) + ".tmp"
         save_file(bf, tmp)
-        os.replace(tmp, str(safetensors))
-        # Verify size roughly halved.
         orig = os.path.getsize(src)
-        conv = os.path.getsize(str(safetensors))
+        os.replace(tmp, str(st_file))
+        conv = os.path.getsize(str(st_file))
         print(f"  {orig/1e9:.2f} GB -> {conv/1e9:.2f} GB")
-        if src != str(safetensors):
-            os.remove(src)
         del sd, bf
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
     else:
         print(f"[keep] {name} (fp16)")
 
-# DINOv3 weights.
-DINO_REPO = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
-DINO_FILE = "dinov3_vitl16_pretrain_lvd1689m.pth"
-def fetch_dino():
-    dino_dir = out / "dinov3"
-    dino_path = dino_dir / DINO_FILE
-    if dino_path.exists():
-        print("[skip] DINOv3 already exists")
-        return
-    dino_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[dl] DINOv3 ViT-L/16 from {DINO_REPO} ...")
-    src = hf_hub_download(DINO_REPO, DINO_FILE,
-                          local_dir=str(dino_dir), local_dir_use_symlinks=False)
-    # Convert to bf16.
-    print("[convert] DINOv3 fp32 -> bf16 ...")
-    sd = torch.load(src, map_location="cpu", weights_only=True)
-    bf = {k: v.to(torch.bfloat16) if v.is_floating_point() else v for k, v in sd.items()}
-    tmp = str(dino_path) + ".tmp"
-    torch.save(bf, tmp)
-    os.replace(tmp, str(dino_path))
-    if src != str(dino_path):
-        os.remove(src)
-    del sd, bf
-    print(f"  DINOv3 saved to {dino_path}")
-
-# NAF weights.
-def fetch_naf():
-    naf_dir = out / "naf"
-    naf_path = naf_dir / "naf_release.pth"
-    if naf_path.exists():
-        print("[skip] NAF already exists")
-        return
-    naf_dir.mkdir(parents=True, exist_ok=True)
-    print("[dl] NAF weights ...")
-    hf_hub_download("valeoai/NAF", "naf_release.pth",
-                    local_dir=str(naf_dir), local_dir_use_symlinks=False)
+# DINOv3 and NAF weights are auto-downloaded via transformers and
+# torch.hub on first pipeline run (no HF_HUB_OFFLINE in the container).
 
 # Pipeline config (strip rembg_model — we supply our own alpha masks).
 def fetch_pipeline():
@@ -143,8 +103,6 @@ for name in MV_DITS:
     fetch_and_convert(name, to_bf16=True)
 for name in DECODERS:
     fetch_and_convert(name, to_bf16=False)
-fetch_dino()
-fetch_naf()
 fetch_pipeline()
 print("=== Done ===")
 PYEOF
