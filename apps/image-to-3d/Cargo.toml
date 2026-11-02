@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 flate2 = "1"
+memmap2 = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 mozjpeg = { version = "0.10", default-features = false, features = ["parallel"] }
 rayon = "1"
@@ -17,6 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 spl-core.workspace = true
 spl-gpu.workspace = true
+spl-nn.workspace = true
 tempfile = "3"
 tokio.workspace = true
 tracing.workspace = true
