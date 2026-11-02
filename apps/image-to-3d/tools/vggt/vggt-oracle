@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Usage: vggt-oracle <images...> --out result.npz [--dump-layers 0,4,11,17,23] [--dtype fp32|bf16]
+#
+# Runs the official VGGT-Ω model inside the spl-vggt-ref container and saves
+# preprocessed inputs, selected intermediate activations, and final outputs.
+set -euo pipefail
+
+WORK=${SPL_WORK:-$HOME/spl-work}
+IMAGE=spl-vggt-ref
+CKPT=$WORK/models/vggt-omega/vggt_omega_1b_512.pt
+SCRIPT_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
+
+# Collect arguments, separating image paths from flags
+images=()
+flags=()
+parsing_images=true
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --out|--checkpoint|--dump-layers|--dtype|--device)
+      parsing_images=false
+      flags+=("$1" "$2")
+      shift 2
+      ;;
+    --*)
+      parsing_images=false
+      flags+=("$1")
+      shift
+      ;;
+    *)
+      if $parsing_images; then
+        images+=("$(realpath "$1")")
+      else
+        flags+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Determine mount paths
+mounts=()
+seen_dirs=()
+for img in "${images[@]}"; do
+  dir=$(dirname "$img")
+  already=false
+  for s in "${seen_dirs[@]:-}"; do
+    [[ "$dir" == "$s" ]] && already=true && break
+  done
+  if ! $already; then
+    mounts+=(-v "$dir:$dir:ro")
+    seen_dirs+=("$dir")
+  fi
+done
+
+# Ensure output directory is mounted
+for i in "${!flags[@]}"; do
+  if [[ "${flags[$i]}" == "--out" ]]; then
+    out_path="${flags[$((i + 1))]}"
+    out_dir=$(dirname "$(realpath -m "$out_path")")
+    mkdir -p "$out_dir"
+    mounts+=(-v "$out_dir:$out_dir")
+    flags[$((i + 1))]=$(realpath -m "$out_path")
+    break
+  fi
+done
+
+# Add checkpoint flag if not specified
+has_ckpt=false
+for f in "${flags[@]}"; do
+  [[ "$f" == "--checkpoint" ]] && has_ckpt=true && break
+done
+if ! $has_ckpt; then
+  flags+=(--checkpoint "$CKPT")
+fi
+
+exec docker run --rm --gpus all \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp \
+  -v "$WORK:$WORK:ro" \
+  -v "$SCRIPT_DIR:/workspace:ro" \
+  "${mounts[@]}" \
+  -w /workspace \
+  "$IMAGE" python -I /workspace/oracle.py "${images[@]}" "${flags[@]}"
