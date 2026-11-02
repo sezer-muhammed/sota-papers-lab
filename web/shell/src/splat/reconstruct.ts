@@ -9,6 +9,7 @@
 import type { ArtifactRef } from "@spl/sdk";
 
 export const RECONSTRUCT_OP = "image_to_3d.reconstruct";
+export const GENERATE_OP = "image_to_3d.generate";
 
 export type Mode = "auto" | "scene" | "object";
 export type Preset = "fast" | "quality";
@@ -59,6 +60,25 @@ export function reconstructInput(
   };
 }
 
+/* ---- Object generation (Pixal3D-mv sidecar) ---- */
+
+export type GenerateInput = {
+  images: string[];
+  resolution?: number;
+  max_tokens?: number;
+};
+
+export type GenerateOutput = {
+  glb?: ArtifactRef;
+  frames?: number;
+  times?: { pose_s?: number; canon_s?: number; sidecar_s?: number; total_s?: number };
+  peak_vram_mb?: number;
+};
+
+export function generateInput(imageIds: string[]): GenerateInput {
+  return { images: imageIds, resolution: 1024 };
+}
+
 /* ---- Files the drop zone takes ---- */
 
 const PHOTO = /\.(jpe?g|png|webp)$/i;
@@ -93,16 +113,23 @@ export function mediaTypeOf(f: Named): string {
 }
 
 /** Sorts a drop into photos or one video. Photos win over a video in a
-    mixed drop; other files are listed as skipped. */
-export function pickFiles<F extends File>(files: F[]): Picked {
+    mixed drop; other files are listed as skipped.
+    `objectMode` lowers the minimum to 1 photo and caps at 4. */
+export function pickFiles<F extends File>(files: F[], objectMode = false): Picked {
   const photos = files.filter(isPhoto);
   const videos = files.filter(isVideo);
   const other = files.filter((f) => !isPhoto(f) && !isVideo(f)).map((f) => f.name);
   if (photos.length) {
     const skipped = [...other, ...videos.map((f) => f.name)];
-    if (photos.length < 2) return { kind: "none", reason: "Add at least 2 photos of the scene (20 to 200 work best)." };
+    const minPhotos = objectMode ? 1 : 2;
+    if (photos.length < minPhotos)
+      return { kind: "none", reason: objectMode
+        ? "Drop 1 to 4 photos of the object."
+        : "Add at least 2 photos of the scene (20 to 200 work best)." };
     photos.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-    return { kind: "photos", files: photos, skipped };
+    const kept = objectMode ? photos.slice(0, 4) : photos;
+    const extra = objectMode && photos.length > 4 ? photos.slice(4).map((f) => f.name) : [];
+    return { kind: "photos", files: kept, skipped: [...skipped, ...extra] };
   }
   if (videos.length) return { kind: "video", file: videos[0]!, skipped: [...other, ...videos.slice(1).map((f) => f.name)] };
   return {

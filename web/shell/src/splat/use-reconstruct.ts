@@ -4,7 +4,9 @@ import { client, describeError, fetchArtifact } from "../api";
 import { parseCameras, type Frustum } from "./cameras";
 import { fileFingerprint, localResumeStore, uploadChunked } from "./chunked";
 import {
+  GENERATE_OP,
   RECONSTRUCT_OP,
+  generateInput,
   matchPhotos,
   mediaTypeOf,
   reconstructInput,
@@ -67,7 +69,11 @@ export function useReconstruct(runId: string | undefined) {
       });
 
     const onAnnounce = (a: Announcement) => {
-      if (a.slot === "splat" || a.slot === "snapshot") {
+      if (a.slot === "mesh") {
+        // Generate op announces the GLB mesh.
+        gotSplat = true;
+        setSnapshot({ revision: a.revision, info: a.info });
+      } else if (a.slot === "splat" || a.slot === "snapshot") {
         gotSplat = true;
         setSnapshot({ revision: a.revision, info: a.info });
         loadSplat(a.artifact.id, formatOf(a.artifact), true).catch(() => undefined);
@@ -134,8 +140,12 @@ export function useReconstruct(runId: string | undefined) {
         }
       };
       await Promise.all(Array.from({ length: Math.min(FILES_PARALLEL, files.length) }, worker));
-      const input = reconstructInput(picked.kind === "photos" ? { images: ids } : { video: ids[0] }, options);
-      const run = await client.startRun(RECONSTRUCT_OP, input);
+      const isObject = options.mode === "object" && picked.kind === "photos";
+      const opId = isObject ? GENERATE_OP : RECONSTRUCT_OP;
+      const input = isObject
+        ? generateInput(ids)
+        : reconstructInput(picked.kind === "photos" ? { images: ids } : { video: ids[0] }, options);
+      const run = await client.startRun(opId, input);
       if (picked.kind === "photos") localPhotos.set(run.id, picked.files);
       window.location.hash = `#/3d/${encodeURIComponent(run.id)}`;
     } catch (e) {
@@ -161,7 +171,7 @@ export function useReconstruct(runId: string | undefined) {
   // Photos for thumbnails and the wipe: the files picked in this tab, else
   // the run's photo artifacts, matched to cameras by name or order.
   const input = detail?.run.input as Partial<ReconstructInput> | undefined;
-  const remoteImages = detail?.run.op_id === RECONSTRUCT_OP && Array.isArray(input?.images) ? input.images : undefined;
+  const remoteImages = (detail?.run.op_id === RECONSTRUCT_OP || detail?.run.op_id === GENERATE_OP) && Array.isArray(input?.images) ? input.images : undefined;
   const remoteKey = remoteImages?.join(",");
   const photoFor = useMemo<PhotoFor | undefined>(() => {
     const files = runId ? localPhotos.get(runId) : undefined;
