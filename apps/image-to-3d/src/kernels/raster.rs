@@ -191,6 +191,10 @@ pub fn raster_fwd(
         RenderMode::Infer => (MODE_INFER, None),
         RenderMode::Count { mask } => (MODE_COUNT, Some(mask)),
     };
+    if mode_id == MODE_TRAIN {
+        // Warps raise their tile's maximum with atomicMax (no block barrier).
+        zero_async(s, &mut f.tile_max_nc)?;
+    }
     if mode_id == MODE_COUNT {
         let count = out
             .count
@@ -239,7 +243,9 @@ pub fn raster_fwd(
 
 /// Chained per-Gaussian backward (spec-raster 5.2) into `g2d`. It accumulates
 /// (preprocess_fwd zeroes the rows of the frame's visible set) and resets its
-/// own chain counter first.
+/// own chain counter first. It consumes the checkpoints: each chain's slot
+/// carries the pixel state between its buckets, so a second `raster_bwd`
+/// needs a new `raster_fwd(Train)` first.
 pub fn raster_bwd(
     k: &SplatKernels,
     s: &CudaStream,
@@ -266,7 +272,7 @@ pub fn raster_bwd(
         .arg(&f.tile_start)
         .arg(&f.chain_off)
         .arg(&f.tile_max_nc)
-        .arg(&f.ckpt)
+        .arg(&mut f.ckpt)
         .arg(&c_cap)
         .arg(&out.rgb)
         .arg(&out.trans)

@@ -19,7 +19,7 @@ use super::scene::{PixelGradsHost, Scene2d, TileLists, record, stage};
 use super::*;
 use crate::kernels::layout::TILE_W;
 use crate::testkit::npz::Npz;
-use crate::testkit::timing::{Stats, bench, gpu_snapshot};
+use crate::testkit::timing::{GpuTimer, Stats, bench, gpu_snapshot};
 
 fn bench_dir() -> PathBuf {
     std::env::var_os("SPL_RASTER_BENCH")
@@ -85,6 +85,76 @@ fn load(path: &std::path::Path) -> View {
     }
 }
 
+/// One forward and one backward per variant on the first dump (or the one
+/// `SPL_RASTER_BENCH_ONLY` names), for Nsight Compute: it replays each launch
+/// itself, so no timing loop. Variants: `SPL_RASTER_PROFILE_K` (default 4),
+/// `SPL_RASTER_PROFILE_TILE_H` (16).
+#[test]
+#[ignore]
+fn gpu_raster_profile() {
+    let dir = bench_dir();
+    let only = std::env::var("SPL_RASTER_BENCH_ONLY").unwrap_or_default();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default();
+    files.retain(|p| {
+        p.extension().is_some_and(|e| e == "npz") && p.to_string_lossy().contains(only.as_str())
+    });
+    files.sort();
+    let Some(path) = files.first() else {
+        eprintln!("skipped: no scene dumps in {}", dir.display());
+        return;
+    };
+    let env = |k: &str, d: u8| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
+    let v = RasterVariant {
+        chain_k: env("SPL_RASTER_PROFILE_K", 4),
+        tile_h: env("SPL_RASTER_PROFILE_TILE_H", 16),
+        ..Default::default()
+    };
+    let view = load(path);
+    let lists = TileLists::exact(&view.scene, v.tile_h as u32);
+    let np = (view.scene.width * view.scene.height) as usize;
+    let mut pg = PixelGradsHost::random(1, np, 0, false);
+    for x in &mut pg.d_rgb {
+        *x *= 2e-6;
+    }
+    let gpu = Gpu::open().unwrap();
+    let k = SplatKernels::load(&gpu, v).unwrap();
+    let mut st = stage(&gpu, &v, &view.scene, &lists, &pg, 0).unwrap();
+    raster_fwd(&k, &gpu.stream, &mut st.f, RenderMode::Train, &mut st.out).unwrap();
+    raster_bwd(&k, &gpu.stream, &mut st.f, &st.out, &st.pg, &mut st.g2d).unwrap();
+    gpu.sync().unwrap();
+    println!(
+        "profiled {} with {v:?}: V {}, I {}, chains {}, bwd grid {} blocks, regs fwd {} bwd {}",
+        view.name,
+        view.scene.recs.len(),
+        lists.instances(),
+        st.n_chains,
+        k.raster.bwd_blocks,
+        k.raster.fwd.num_regs().unwrap(),
+        k.raster.bwd.num_regs().unwrap()
+    );
+}
+
+/// What the backward has to do, from the forward's n_contrib.
+#[derive(Clone, Copy, Debug, Serialize)]
+struct BwdWork {
+    /// Buckets with at least one active pixel.
+    buckets: u64,
+    /// Σ over those buckets of (active pixels + 31): diagonal-pipeline steps.
+    steps: u64,
+    /// Share of the steps spent filling and draining the pipeline.
+    ramp_frac: f64,
+    /// (lane, step) pairs whose Gaussian is before the pixel's last
+    /// contributor, over 32 × steps (upper bound on useful lanes).
+    lane_util: f64,
+}
+
 #[derive(Serialize)]
 struct Row {
     view: String,
@@ -97,6 +167,7 @@ struct Row {
     /// the lists the forward actually walks before terminating.
     walked_frac: f64,
     ckpt_mb: f64,
+    bwd_work: BwdWork,
     fwd: Stats,
     bwd: Stats,
     gsplat_fwd_ms: f64,
@@ -181,18 +252,50 @@ fn gpu_raster_bench() {
                 raster_fwd(&k, &s, &mut st.f, RenderMode::Train, &mut st.out)
             })
             .unwrap();
-            let bwd = bench(&gpu, 3, 20, || {
-                raster_bwd(&k, &s, &mut st.f, &st.out, &st.pg, &mut st.g2d)
-            })
-            .unwrap();
+            // raster_bwd consumes the checkpoints: an untimed forward before each.
+            let timer = GpuTimer::new(&gpu).unwrap();
+            let mut samples = Vec::new();
+            for rep in 0..23 {
+                raster_fwd(&k, &s, &mut st.f, RenderMode::Train, &mut st.out).unwrap();
+                timer.start(&s).unwrap();
+                raster_bwd(&k, &s, &mut st.f, &st.out, &st.pg, &mut st.g2d).unwrap();
+                let ms = timer.stop_ms(&s).unwrap() as f64;
+                if rep >= 3 {
+                    samples.push(ms);
+                }
+            }
+            let bwd = Stats::from_samples(&samples);
             let nc = super::scene::host(&gpu, &st.out.n_contrib).unwrap();
             let (mut walked, mut listed) = (0u64, 0u64);
+            let mut tile_nc: Vec<Vec<u32>> = vec![Vec::new(); lists.n_tiles() as usize];
             for (pix, &n) in nc[..np].iter().enumerate() {
                 let (x, y) = (pix as u32 % view.scene.width, pix as u32 / view.scene.width);
                 let t = (y / lists.tile_h * lists.grid_w + x / TILE_W) as usize;
                 walked += n as u64;
                 listed += (lists.tile_start[t + 1] - lists.tile_start[t]) as u64;
+                tile_nc[t].push(n);
             }
+            // Backward work: buckets with an active pixel, diagonal-pipeline
+            // steps Σ (n_active + 31), and the share of steps in the ramps.
+            let (mut buckets, mut steps, mut pairs) = (0u64, 0u64, 0u64);
+            for ncs in &tile_nc {
+                let max = ncs.iter().copied().max().unwrap_or(0);
+                for b in 0..max.div_ceil(32) {
+                    let active = ncs.iter().filter(|&&n| n > 32 * b).count() as u64;
+                    buckets += 1;
+                    steps += active + 31;
+                    pairs += ncs
+                        .iter()
+                        .map(|&n| n.saturating_sub(32 * b).min(32) as u64)
+                        .sum::<u64>();
+                }
+            }
+            let bwd_work = BwdWork {
+                buckets,
+                steps,
+                ramp_frac: (31 * buckets) as f64 / steps.max(1) as f64,
+                lane_util: pairs as f64 / (32 * steps).max(1) as f64,
+            };
             let row = Row {
                 view: view.name.clone(),
                 lists: lname,
@@ -209,6 +312,7 @@ fn gpu_raster_bench() {
                 walked_frac: walked as f64 / listed.max(1) as f64,
                 ckpt_mb: st.n_chains as f64 * v.tile_pixels() as f64 * ckpt_words(&v) as f64 * 4.0
                     / 1e6,
+                bwd_work,
                 fwd,
                 bwd,
                 gsplat_fwd_ms: view.gs_fwd_ms,
@@ -227,6 +331,14 @@ fn gpu_raster_bench() {
                 row.bwd.median_ms,
                 row.bwd.p10_ms,
                 row.bwd.p90_ms
+            );
+            println!(
+                "          bwd buckets {} steps {} ramp {:.1}% lanes busy ≤ {:.1}%  ckpt {:.0} MB",
+                bwd_work.buckets,
+                bwd_work.steps,
+                100.0 * bwd_work.ramp_frac,
+                100.0 * bwd_work.lane_util,
+                row.ckpt_mb
             );
             rows.push(row);
         }
