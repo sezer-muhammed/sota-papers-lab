@@ -6,4 +6,13 @@ export type PoseOutput = { frames: number,
 /**
  * Model resolution (pixels of the preprocessed frames).
  */
-width: number, height: number, cameras: ArtifactRef, colmap: ArtifactRef, points: ArtifactRef, point_count: number, times: PoseTimes, };
+width: number, height: number, cameras: ArtifactRef, colmap: ArtifactRef, points: ArtifactRef, point_count: number, times: PoseTimes, 
+/**
+ * What the run gave up because other processes held GPU memory
+ * (fewer frames per engine pass); empty on the quality path.
+ */
+gpu_memory: Array<string>, 
+/**
+ * Seconds spent waiting for GPU memory.
+ */
+gpu_wait_s: number, };

@@ -166,6 +166,7 @@ fn run_one(
                 eprintln!("[{:7.1}s] {msg}", t0.elapsed().as_secs_f64());
             }
         }
+        Event::Waiting(_, msg, _) => eprintln!("[{:7.1}s] {msg}", t0.elapsed().as_secs_f64()),
         Event::Log(msg) => eprintln!("[{:7.1}s] {msg}", t0.elapsed().as_secs_f64()),
         Event::Cameras(_) => {}
         Event::Points(_, n) => {

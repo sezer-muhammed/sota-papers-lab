@@ -10,7 +10,9 @@
 //! cameras in slot `cameras`. GPU-exclusive: the engine takes most of the
 //! card.
 //!
-//! The engine is loaded once per process and reused by later runs.
+//! The engine is loaded per run and dropped when it ends (its memory goes
+//! back to the driver); frames per pass follow the free memory, and the run
+//! waits when other processes leave too little ([`crate::vram`]).
 //! Weights: `$SPL_VGGT_WEIGHTS`, else
 //! `<data dir>/models/vggt-omega/vggt_omega_1b_512.safetensors` (converted
 //! by `scripts/convert_vggt.py`). The VGGT-Ω weights are under the FAIR
@@ -18,7 +20,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::ensure;
 use schemars::JsonSchema;
@@ -28,7 +29,8 @@ use spl_core::{ArtifactKind, ArtifactRef, Context, DataDir, GpuUse, Op, Result, 
 use ts_rs::TS;
 
 use crate::io::images::Rgb8Image;
-use crate::vggt::{DenseHost, Prepared, ResizeMode, VggtCameras, VggtConfig, VggtEngine};
+use crate::reconstruct::pipeline::{EngineOpts, Event, Frames, pose_frames};
+use crate::vggt::{DenseHost, Prepared, ResizeMode, VggtCameras, VggtEngine};
 
 fn default_max_frames() -> u32 {
     64
@@ -99,6 +101,11 @@ pub struct PoseOutput {
     pub points: ArtifactRef,
     pub point_count: u32,
     pub times: PoseTimes,
+    /// What the run gave up because other processes held GPU memory
+    /// (fewer frames per engine pass); empty on the quality path.
+    pub gpu_memory: Vec<String>,
+    /// Seconds spent waiting for GPU memory.
+    pub gpu_wait_s: f64,
 }
 
 pub struct Pose;
@@ -125,40 +132,42 @@ impl Op for Pose {
 
         let weights = weights_path(cx)?;
         let cancel = cx.cancel.clone();
-        let resize = input.resize;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, f32)>();
+        let mut opts = EngineOpts::new(false, frames.len());
+        opts.resize = input.resize;
+        opts.span = (0.05, 0.9);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let job = tokio::task::spawn_blocking(move || -> Result<_> {
-            let mut slot = engine_slot()
-                .lock()
-                .map_err(|_| anyhow!("engine lock poisoned"))?;
-            let t = std::time::Instant::now();
-            let engine = match slot.take() {
-                Some((p, e)) if p == weights => slot.insert((p, e)),
-                _ => {
-                    let nn = Arc::new(spl_nn::Nn::open()?);
-                    let e = VggtEngine::load(nn, &weights, VggtConfig::default())
-                        .with_context(|| format!("load VGGT-Omega from {}", weights.display()))?;
-                    slot.insert((weights.clone(), e))
-                }
+            let frames = Frames {
+                names: names.clone(),
+                engine: frames,
+                trainer: Vec::new(),
             };
-            let load_s = t.elapsed().as_secs_f64();
-            let engine = &mut engine.1;
-            engine.cfg.resize = resize;
-            let prepared = engine.preprocess(&frames)?;
-            let mut progress = |stage: &str, f: f32| {
-                let _ = tx.send((stage.to_string(), f));
+            let mut send = |e: Event| {
+                let _ = tx.send(e);
             };
-            let cams = engine.run(&prepared, &cancel, &mut progress)?;
-            let dense = engine.download(&prepared.geom)?;
-            Ok((prepared, cams, dense, engine.times.clone(), load_s))
+            let r = pose_frames(&weights, &frames, &opts, &cancel, &mut send)?;
+            Ok((names, r))
         });
         let forward = async {
-            while let Some((stage, f)) = rx.recv().await {
-                cx.progress(0.05 + 0.85 * f as f64, stage);
+            while let Some(e) = rx.recv().await {
+                match e {
+                    Event::Progress(f, msg) => cx.progress(f, msg),
+                    Event::Waiting(f, msg, data) => cx.progress_with(f, msg, data),
+                    Event::Log(msg) => cx.log(msg),
+                    _ => {}
+                }
             }
         };
         let (res, ()) = tokio::join!(job, forward);
-        let (prepared, cams, dense, times, load_s) = res??;
+        let (names, r) = res??;
+        let (prepared, cams, dense, times, load_s) = (
+            r.posed.prepared,
+            r.posed.cams,
+            r.posed.dense,
+            r.times,
+            r.load_s,
+        );
+        let coexist = r.mem;
         cx.metric("frames", cams.pose_enc.len() as f64, "");
         cx.metric("forward_time", times.total_ms as f64, "ms");
         cx.metric("trunk_time", times.trunk_ms as f64, "ms");
@@ -213,16 +222,10 @@ impl Op for Pose {
                 heads_ms: times.camera_ms + times.dense_ms,
                 wall_s: started.elapsed().as_secs_f64(),
             },
+            gpu_memory: coexist.notes,
+            gpu_wait_s: coexist.waited_s,
         })
     }
-}
-
-type EngineSlot = Mutex<Option<(PathBuf, VggtEngine)>>;
-
-/// The process-wide engine: weights stay on the device between runs.
-fn engine_slot() -> &'static EngineSlot {
-    static SLOT: OnceLock<EngineSlot> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
 }
 
 fn weights_path(cx: &RunCx) -> Result<PathBuf> {
@@ -653,9 +656,7 @@ fn colmap_text_zip(names: &[String], c: &VggtCameras, pts: &[Point]) -> Result<V
     Ok(z.finish()?.into_inner())
 }
 
-/// Throws away the cached engine (tests, or to free the GPU).
+/// Throws away a resident engine (tests, or to free the GPU).
 pub fn unload_engine() {
-    if let Ok(mut s) = engine_slot().lock() {
-        *s = None;
-    }
+    crate::reconstruct::pipeline::unload_engine();
 }

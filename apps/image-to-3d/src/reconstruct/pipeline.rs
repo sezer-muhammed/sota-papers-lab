@@ -6,7 +6,9 @@
 //!
 //! GPU memory: the engine is dropped before the trainer allocates (the
 //! trainer sizes its fixed capacity from free VRAM), unless the caller keeps
-//! it ([`PipelineConfig::keep_engine`]).
+//! it ([`PipelineConfig::keep_engine`]). On a shared card each stage plans
+//! for the free memory and waits for it when even its smallest plan does
+//! not fit ([`crate::vram`]).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -33,7 +35,8 @@ use crate::model::GaussiansHost;
 use crate::ppisp::PpispConfig;
 use crate::presets::{DensifyPreset, PresetName, PresetOverrides};
 use crate::trainer::{TrainConfig, Trainer, ViewOrder};
-use crate::vggt::{VggtConfig, VggtEngine};
+use crate::vggt::{ResizeMode, VggtConfig, VggtEngine};
+use crate::vram::{self, Coexist, Shortfall, WaitPolicy, WaitState};
 
 /// User-facing speed/quality trade-off.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -190,6 +193,8 @@ pub enum Event {
     Cameras(Vec<u8>),
     /// INRIA PLY of the engine's point cloud.
     Points(Vec<u8>, u32),
+    /// Waiting for GPU memory: fraction, message, progress data.
+    Waiting(f64, String, serde_json::Value),
     /// SPZ snapshot at iteration `t` with `n` Gaussians.
     Snapshot {
         spz: Vec<u8>,
@@ -226,6 +231,8 @@ pub struct Reconstruction {
     pub iterations: u32,
     pub eager_steps: u32,
     pub peak_vram_bytes: u64,
+    /// What the run gave up for other processes on the GPU.
+    pub coexist: Coexist,
     /// Kept alive for evaluation; `None` after [`Reconstruction::release`].
     pub joint: Option<Joint>,
     /// Held-out frames (benchmark protocol), engine-posed.
@@ -374,6 +381,7 @@ pub fn unload_engine() {
     if let Ok(mut s) = engine_slot().lock() {
         *s = None;
     }
+    crate::vram::release_quietly();
 }
 
 /// Engine chunks of exactly `max` frame indices when `n > max`: chunk 0 is
@@ -411,40 +419,160 @@ pub fn chunk_plan(n: usize, max: usize, anchors: usize) -> Vec<Vec<usize>> {
     out
 }
 
-/// Runs the engine on every frame (in [`chunk_plan`] chunks of at most
-/// `max_frames`, registered to the first chunk by a similarity on the shared
-/// frames' camera centres). Returns the host results, load and wall seconds
-/// and the summed forward GPU time.
+/// How [`pose_frames`] runs the engine.
+#[derive(Debug, Clone)]
+pub struct EngineOpts {
+    /// Keep the engine resident afterwards (else it is dropped and its
+    /// memory returned to the driver, also when the run fails).
+    pub keep: bool,
+    /// Frames per pass when memory allows; more go through [`chunk_plan`].
+    pub max_frames: usize,
+    pub resize: ResizeMode,
+    pub wait: WaitPolicy,
+    /// Progress fractions of the engine stage.
+    pub span: (f64, f64),
+}
+
+impl EngineOpts {
+    pub fn new(keep: bool, max_frames: usize) -> Self {
+        Self {
+            keep,
+            max_frames,
+            resize: ResizeMode::default(),
+            wait: WaitPolicy::from_env(),
+            span: (0.02, 0.15),
+        }
+    }
+}
+
+/// [`pose_frames`]' results.
+pub struct Engined {
+    pub posed: Posed,
+    pub load_s: f64,
+    /// Wall seconds of the passes.
+    pub engine_s: f64,
+    /// GPU times summed over the passes.
+    pub times: crate::vggt::StageTimes,
+    pub mem: Coexist,
+}
+
+/// Runs the engine on every frame (in [`chunk_plan`] chunks, registered to
+/// the first chunk by a similarity on the shared frames' camera centres).
+/// Frames per pass: `opts.max_frames` when the free memory allows, else
+/// the largest of [`vram::engine_chunk_ladder`] that fits; when none does
+/// (or the weights do not), waits ([`vram::wait_until`]).
 pub fn pose_frames(
     weights: &std::path::Path,
     frames: &Frames,
-    keep: bool,
-    max_frames: usize,
+    opts: &EngineOpts,
     cancel: &CancellationToken,
     events: &mut dyn FnMut(Event),
-) -> Result<(Posed, f64, f64, f32)> {
-    // The pose op's engine would double the weights on the device.
-    crate::pose::unload_engine();
-    let t0 = Instant::now();
+) -> Result<Engined> {
     let mut slot = engine_slot()
         .lock()
         .map_err(|_| spl_core::anyhow!("engine lock poisoned"))?;
-    let engine = match slot.take() {
-        Some((p, e)) if p == weights => slot.insert((p, e)),
-        _ => {
-            let nn = Arc::new(spl_nn::Nn::open()?);
-            let e = VggtEngine::load(nn, weights, VggtConfig::default())
-                .with_context(|| format!("load VGGT-Omega from {}", weights.display()))?;
-            slot.insert((weights.to_path_buf(), e))
-        }
-    };
-    let load_s = t0.elapsed().as_secs_f64();
+    let r = pose_frames_in(&mut slot, weights, frames, opts, cancel, events);
+    if !opts.keep || r.is_err() {
+        *slot = None;
+        drop(slot);
+        vram::release_quietly();
+    }
+    r
+}
+
+fn pose_frames_in(
+    slot: &mut Option<(PathBuf, VggtEngine)>,
+    weights: &std::path::Path,
+    frames: &Frames,
+    opts: &EngineOpts,
+    cancel: &CancellationToken,
+    events: &mut dyn FnMut(Event),
+) -> Result<Engined> {
+    let (p0, p1) = opts.span;
+    let mut mem = Coexist::default();
+    let mut waiting = |w: &WaitState| events(Event::Waiting(p0, w.message(), w.data("posing")));
+    let free = || vram::device_memory().map(|m| m.0);
+    let t0 = Instant::now();
+    if !matches!(slot, Some((p, _)) if p == weights) {
+        *slot = None;
+        vram::release_quietly();
+        let wbytes = std::fs::metadata(weights).map(|m| m.len()).unwrap_or(0);
+        let need = vram::engine_load_need(wbytes);
+        let ((), waited) = vram::wait_until(
+            &opts.wait,
+            cancel,
+            free,
+            |f| {
+                Ok(if f >= need {
+                    Ok(())
+                } else {
+                    Err(Shortfall {
+                        what: format!("the VGGT-Omega weights ({:.2} GB)", wbytes as f64 / 1e9),
+                        need,
+                    })
+                })
+            },
+            &mut waiting,
+        )?;
+        mem.waited_s += waited;
+        let nn = Arc::new(spl_nn::Nn::open()?);
+        let e = VggtEngine::load(nn, weights, VggtConfig::default())
+            .with_context(|| format!("load VGGT-Omega from {}", weights.display()))?;
+        *slot = Some((weights.to_path_buf(), e));
+    }
+    let e = &mut slot.as_mut().expect("loaded").1;
+    let load_s = t0.elapsed().as_secs_f64() - mem.waited_s;
+    e.cfg.resize = opts.resize;
     let t1 = Instant::now();
-    let e = &mut engine.1;
     let n = frames.engine.len();
-    let plan = chunk_plan(n, max_frames.max(2), 32);
+    ensure!(n > 0, "no frames");
+
+    // Frames per pass: the largest that fits now.
+    let geom = e.preprocess(&frames.engine[..1])?.geom;
+    let ladder = vram::engine_chunk_ladder(n, opts.max_frames.max(2));
+    let (k, waited) = vram::wait_until(
+        &opts.wait,
+        cancel,
+        free,
+        |f| {
+            for &k in &ladder {
+                if e.plan(geom.with_frames(k)).is_ok() {
+                    return Ok(Ok(k));
+                }
+            }
+            let min = *ladder.last().expect("ladder");
+            let need = e
+                .plan(geom.with_frames(min))
+                .err()
+                .and_then(|err| plan_need(&format!("{err}")))
+                .unwrap_or(f + (1 << 30));
+            Ok(Err(Shortfall {
+                what: format!(
+                    "the VGGT-Omega engine ({min} frames at {}x{})",
+                    geom.width, geom.height
+                ),
+                need,
+            }))
+        },
+        &mut waiting,
+    )?;
+    mem.waited_s += waited;
+    let anchors = if k == ladder[0] {
+        32
+    } else {
+        let (free, _) = vram::device_memory()?;
+        let note = format!(
+            "low GPU memory ({:.2} GB free): engine {k} frames per pass instead of {} (chunked registration)",
+            free as f64 / 1e9,
+            ladder[0]
+        );
+        events(Event::Log(note.clone()));
+        mem.notes.push(note);
+        vram::chunk_anchors(k)
+    };
+    let plan = chunk_plan(n, k.max(2), anchors);
     let n_chunks = plan.len();
-    let mut fwd = 0.0f32;
+    let mut times = crate::vggt::StageTimes::default();
     let mut out: Option<Posed> = None;
     let mut done = vec![false; n];
     for (ci, chunk) in plan.iter().enumerate() {
@@ -453,13 +581,20 @@ pub fn pose_frames(
         let mut progress = |stage: &str, f: f32| {
             let g = (ci as f32 + f) / n_chunks as f32;
             events(Event::Progress(
-                0.02 + 0.13 * g as f64,
+                p0 + (p1 - p0) * g as f64,
                 format!("engine {}/{n_chunks}: {stage}", ci + 1),
             ));
         };
         let cams = e.run(&prepared, cancel, &mut progress)?;
         let dense = e.download(&prepared.geom)?;
-        fwd += e.times.total_ms;
+        let t = &e.times;
+        times.upload_ms += t.upload_ms;
+        times.trunk_ms += t.trunk_ms;
+        times.camera_ms += t.camera_ms;
+        times.dense_ms += t.dense_ms;
+        times.total_ms += t.total_ms;
+        times.wall_ms += t.wall_ms;
+        times.graph |= t.graph;
         let part = Posed {
             names: chunk.iter().map(|&i| frames.names[i].clone()).collect(),
             cams,
@@ -469,13 +604,27 @@ pub fn pose_frames(
         let all = out.get_or_insert_with(|| Posed::empty(n, &part));
         all.merge_chunk(&part, chunk, &mut done)?;
     }
-    if !keep {
-        *slot = None;
-    }
-    drop(slot);
     let mut posed = out.ok_or_else(|| spl_core::anyhow!("no frames"))?;
     posed.names = frames.names.clone();
-    Ok((posed, load_s, t1.elapsed().as_secs_f64(), fwd))
+    Ok(Engined {
+        posed,
+        load_s,
+        engine_s: t1.elapsed().as_secs_f64(),
+        times,
+        mem,
+    })
+}
+
+/// "… need 7.30 GB of device memory …" (the engine planner's error) → bytes.
+fn plan_need(msg: &str) -> Option<u64> {
+    let gb: f64 = msg
+        .split(" need ")
+        .nth(1)?
+        .split(" GB")
+        .next()?
+        .parse()
+        .ok()?;
+    Some((gb * 1e9) as u64 + (256 << 20))
 }
 
 /// Moves each camera of `test` with its nearest (by centre) camera of
@@ -534,6 +683,7 @@ fn bootstrap(
     (tw, th): (u32, u32),
     focal: (f64, f64),
     cfg: &PipelineConfig,
+    max_gaussians: Option<u32>,
     cancel: &CancellationToken,
 ) -> Result<Vec<View>> {
     let cache = ImageCache::from_images(gpu, (0..train.len()).collect(), imgs, 0.0)?;
@@ -545,6 +695,7 @@ fn bootstrap(
         preset: PresetName::Fast,
         iterations: Some(cfg.bootstrap_iters),
         seed: cfg.seed ^ 0xB007,
+        max_gaussians,
         ..Default::default()
     };
     let mut tr = Trainer::new(gpu, scene, tcfg)?;
@@ -606,7 +757,7 @@ pub type PosedHook<'a> = dyn FnMut(&mut Posed) -> Result<()> + 'a;
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_with(
     weights: &std::path::Path,
-    frames: Frames,
+    mut frames: Frames,
     cfg: &PipelineConfig,
     holdout_every: usize,
     cancel: &CancellationToken,
@@ -616,7 +767,7 @@ pub fn reconstruct_with(
     let started = Instant::now();
     let n = frames.names.len();
     ensure!(n >= 2, "need at least two frames, got {n}");
-    let (tw, th) = (frames.trainer[0].width, frames.trainer[0].height);
+    let (mut tw, mut th) = (frames.trainer[0].width, frames.trainer[0].height);
     ensure!(
         frames
             .trainer
@@ -628,14 +779,16 @@ pub fn reconstruct_with(
 
     // A. Engine.
     events(Event::Progress(0.02, "engine".into()));
-    let (mut posed, load_s, engine_s, fwd_ms) = pose_frames(
+    let engined = pose_frames(
         weights,
         &frames,
-        cfg.keep_engine,
-        cfg.engine_max_frames as usize,
+        &EngineOpts::new(cfg.keep_engine, cfg.engine_max_frames as usize),
         cancel,
         events,
     )?;
+    let mut mem = engined.mem;
+    let (load_s, engine_s, fwd_ms) = (engined.load_s, engined.engine_s, engined.times.total_ms);
+    let mut posed = engined.posed;
     if let Some(f) = adjust {
         f(&mut posed)?;
     }
@@ -672,6 +825,57 @@ pub fn reconstruct_with(
     // B. Trainer, Stage B init, prune-first.
     let t_setup = Instant::now();
     events(Event::Progress(0.16, "initializing".into()));
+    // Resolution and capacity for the free memory (the quality path when
+    // it is plentiful).
+    let mut tcfg = cfg.train_config();
+    let fit = {
+        let preset = tcfg.resolve();
+        let cap = match &preset.densify {
+            DensifyPreset::Mcmc(c) => c.cap_max as u64,
+            _ => 8 << 20,
+        };
+        let (pw, ph) = (posed.cams.width as u64, posed.cams.height as u64);
+        let priors = if cfg.depth_weight > 0.0 {
+            train.len() as u64 * pw * ph * 8
+        } else {
+            0
+        };
+        let extra = (256 << 20) + priors;
+        let (fit, waited) = vram::wait_until(
+            &WaitPolicy::from_env(),
+            cancel,
+            || vram::device_memory().map(|m| m.0),
+            |f| {
+                Ok(vram::fit_trainer(
+                    f,
+                    extra,
+                    tw,
+                    th,
+                    train.len(),
+                    cap,
+                    &preset,
+                ))
+            },
+            &mut |w: &WaitState| events(Event::Waiting(0.16, w.message(), w.data("init"))),
+        )?;
+        mem.waited_s += waited;
+        let (free, _) = vram::device_memory()?;
+        if let Some(note) = vram::trainer_note(&fit, tw, th, free) {
+            events(Event::Log(note.clone()));
+            mem.notes.push(note);
+        }
+        fit
+    };
+    tcfg.max_gaussians = fit.max_gaussians.or(tcfg.max_gaussians);
+    let focal = if fit.scale < 1.0 {
+        (tw, th) = vram::scaled(tw, th, fit.scale);
+        for f in &mut frames.trainer {
+            *f = crate::io::images::downscale_area(f, tw, th);
+        }
+        posed.shared_focal(&train, tw, th)
+    } else {
+        focal
+    };
     let gpu = Gpu::open()?;
     let mut focal = focal;
     // The engine's training cameras: held-out cameras are carried from them.
@@ -679,7 +883,17 @@ pub fn reconstruct_with(
     if cfg.bootstrap_iters > 0 {
         let t = Instant::now();
         let imgs: Vec<Rgb8Image> = train.iter().map(|&i| frames.trainer[i].clone()).collect();
-        let views = bootstrap(&gpu, &posed, &train, &imgs, (tw, th), focal, cfg, cancel)?;
+        let views = bootstrap(
+            &gpu,
+            &posed,
+            &train,
+            &imgs,
+            (tw, th),
+            focal,
+            cfg,
+            tcfg.max_gaussians,
+            cancel,
+        )?;
         posed.update_cameras(&train, &views, tw, th);
         focal = (views[0].fx, views[0].fy);
         times.bootstrap_s = t.elapsed().as_secs_f64();
@@ -704,7 +918,6 @@ pub fn reconstruct_with(
     let mut scene = training_scene(train_views, seed_points)?;
     let all_train = scene.train.clone();
     scene.train = Vec::new();
-    let tcfg = cfg.train_config();
     let mut tr = Trainer::new(&gpu, scene, tcfg)?;
     tr.scene.train = all_train.clone();
     tr.scene_gpu.train = all_train.clone();
@@ -871,6 +1084,7 @@ pub fn reconstruct_with(
         prune,
         init_gaussians,
         peak_vram_bytes: peak,
+        coexist: mem,
         joint: Some(joint),
         test,
         test_images: test_imgs,

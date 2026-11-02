@@ -22,6 +22,7 @@
 //!   `trainer.rs`, `ops.rs`, `refine.rs`, `io/*`, `testkit/*`
 //! - ingest (A0): `ingest/*`, `cuda/ingest.cu`
 //! - reconstruct (mvp-pipeline): `reconstruct/*`, `cuda/reconstruct.cu`
+//! - shared-GPU memory plans (gpu-coexist): `vram.rs`
 
 pub mod bench;
 pub mod eval;
@@ -44,6 +45,7 @@ pub mod rng;
 pub mod testkit;
 pub mod trainer;
 pub mod vggt;
+pub mod vram;
 
 use spl_core::Registry;
 

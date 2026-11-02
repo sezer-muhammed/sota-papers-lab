@@ -95,6 +95,12 @@ pub struct ReconstructOutput {
     pub ingest_s: f64,
     /// From the start of the run to the last export stored.
     pub wall_s: f64,
+    /// What the run gave up because other processes held GPU memory
+    /// (fewer frames per engine pass, fewer Gaussians, smaller images);
+    /// empty on the quality path.
+    pub gpu_memory: Vec<String>,
+    /// Seconds spent waiting for GPU memory.
+    pub gpu_wait_s: f64,
 }
 
 pub struct Reconstruct;
@@ -143,13 +149,20 @@ impl Op for Reconstruct {
             let mut send = |e: Event| {
                 let _ = tx.send(e);
             };
-            let r = reconstruct(&weights, frames, &cfg, 0, &cancel, &mut send)?;
+            let r = reconstruct(&weights, frames, &cfg, 0, &cancel, &mut send);
+            // The engine is gone already; the trainer goes with `r`. Hand
+            // the pool's blocks back so the idle server holds no memory.
+            let r = r.inspect_err(|_| crate::vram::release_quietly())?;
             let mut ply = Vec::new();
             write_inria_ply(&r.cloud, &mut ply)?;
             let cameras = pipeline::cameras_json(&r.views)?;
             let mut transforms = Vec::new();
             crate::export::colmap::write_transforms_json(&r.views, &mut transforms)?;
             let colmap = colmap_zip(&r)?;
+            let coexist = r.coexist.clone();
+            drop(r.joint);
+            drop(r.test);
+            crate::vram::release_quietly();
             Ok((
                 r.spz,
                 ply,
@@ -159,6 +172,7 @@ impl Op for Reconstruct {
                 r.times,
                 r.iterations,
                 r.cloud.len(),
+                coexist,
             ))
         });
         let relay = async {
@@ -169,7 +183,7 @@ impl Op for Reconstruct {
             }
         };
         let (res, ()) = tokio::join!(job, relay);
-        let (spz, ply, cameras, transforms, colmap, times, iterations, n) = res??;
+        let (spz, ply, cameras, transforms, colmap, times, iterations, n, coexist) = res??;
         cx.progress(0.98, "storing exports");
         let spz = cx
             .artifacts
@@ -202,6 +216,9 @@ impl Op for Reconstruct {
         cx.metric("engine_time", times.engine_s, "s");
         cx.metric("train_time", times.train_s, "s");
         cx.metric("wall_time", wall_s, "s");
+        if coexist.waited_s > 0.0 {
+            cx.metric("gpu_wait_time", coexist.waited_s, "s");
+        }
         cx.progress(1.0, "done");
         Ok(ReconstructOutput {
             frames: n_frames,
@@ -215,6 +232,8 @@ impl Op for Reconstruct {
             times,
             ingest_s,
             wall_s,
+            gpu_memory: coexist.notes,
+            gpu_wait_s: coexist.waited_s,
         })
     }
 }
@@ -223,6 +242,7 @@ async fn relay_event(cx: &RunCx, e: Event) -> Result<()> {
     match e {
         Event::Progress(f, msg) => cx.progress(f, msg),
         Event::Log(msg) => cx.log(msg),
+        Event::Waiting(f, msg, data) => cx.progress_with(f, msg, data),
         Event::Cameras(json) => {
             let a = cx
                 .artifacts

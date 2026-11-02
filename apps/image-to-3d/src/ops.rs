@@ -30,7 +30,9 @@ use crate::kernels::layout::{EPS2D_DEFAULT, FLAG_AA};
 use crate::kernels::raster::{FrameSource, GpuRaster, SplatRaster};
 use crate::kernels::{Capacity, RasterVariant, RenderMode};
 use crate::model::{Gaussians, GaussiansHost};
+use crate::presets::DensifyPreset;
 use crate::trainer::{TrainConfig, TrainProgress, TrainSummary, Trainer, planar_to_rgb8};
+use crate::vram;
 
 fn yes() -> bool {
     true
@@ -137,6 +139,11 @@ pub struct TrainOutput {
     pub spz: Option<ArtifactRef>,
     #[ts(optional)]
     pub colmap: Option<ArtifactRef>,
+    /// What the run gave up because other processes held GPU memory
+    /// (fewer Gaussians, smaller images); empty on the quality path.
+    pub gpu_memory: Vec<String>,
+    /// Seconds spent waiting for GPU memory.
+    pub gpu_wait_s: f64,
 }
 
 pub struct Train;
@@ -154,9 +161,12 @@ impl Op for Train {
         let root = dataset_root(cx, &input).await?;
         let load = input.load.clone();
         cx.progress(0.0, "loading dataset");
-        let (scene, load_s) = tokio::task::spawn_blocking(move || {
-            let started = std::time::Instant::now();
-            load_colmap_scene(&root, &load).map(|s| (s, started.elapsed().as_secs_f64()))
+        let (scene, load_s) = tokio::task::spawn_blocking({
+            let root = root.clone();
+            move || {
+                let started = std::time::Instant::now();
+                load_colmap_scene(&root, &load).map(|s| (s, started.elapsed().as_secs_f64()))
+            }
         })
         .await??;
         let info = SceneInfo::of(&scene, load_s);
@@ -185,37 +195,82 @@ impl Op for Train {
                 ply: None,
                 spz: None,
                 colmap: None,
+                gpu_memory: Vec::new(),
+                gpu_wait_s: 0.0,
             });
         }
 
-        let cfg = input.train.clone();
+        let mut cfg = input.train.clone();
         let cancel = cx.cancel.clone();
         let do_eval = input.eval;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TrainProgress>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
         let views = scene.views.clone();
+        let load = input.load.clone();
         let job = tokio::task::spawn_blocking(move || -> Result<Trained> {
-            let gpu = Gpu::open()?;
-            let mut trainer = Trainer::new(&gpu, scene, cfg)?;
-            let summary = trainer.run(&cancel, &mut |p| {
-                let _ = tx.send(p.clone());
-            })?;
-            let eval = if do_eval {
-                Some(evaluate(&mut trainer, None)?.mean)
+            // Resolution and capacity for the free memory (the quality path
+            // when it is plentiful); waits when even the smallest misses.
+            let (w, h) = scene
+                .views
+                .iter()
+                .fold((1, 1), |(w, h), v| (w.max(v.width), h.max(v.height)));
+            let preset = cfg.resolve();
+            let cap = match &preset.densify {
+                DensifyPreset::Mcmc(c) => c.cap_max as u64,
+                _ => 8 << 20,
+            }
+            .min(cfg.max_gaussians.map_or(u64::MAX, u64::from));
+            let (fit, waited) = vram::wait_until(
+                &vram::WaitPolicy::from_env(),
+                &cancel,
+                || vram::device_memory().map(|m| m.0),
+                |f| {
+                    Ok(vram::fit_trainer(
+                        f,
+                        256 << 20,
+                        w,
+                        h,
+                        scene.train.len(),
+                        cap,
+                        &preset,
+                    ))
+                },
+                &mut |ws: &vram::WaitState| {
+                    let _ = tx.send(Progress::Waiting(ws.message(), ws.data("refine")));
+                },
+            )?;
+            let mut coexist = vram::Coexist {
+                notes: Vec::new(),
+                waited_s: waited,
+            };
+            let (free, _) = vram::device_memory()?;
+            if let Some(note) = vram::trainer_note(&fit, w, h, free) {
+                let _ = tx.send(Progress::Log(note.clone()));
+                coexist.notes.push(note);
+            }
+            cfg.max_gaussians = fit.max_gaussians.or(cfg.max_gaussians);
+            let scene = if fit.scale < 1.0 {
+                let mut load = load;
+                load.max_width = Some(vram::scaled(w, h, fit.scale).0);
+                load_colmap_scene(&root, &load)?
             } else {
-                None
+                scene
             };
-            let (cloud, summary) = {
-                let (cloud, mut s) = trainer.finish()?;
-                s.train_s = summary.train_s;
-                (cloud, s)
-            };
-            Ok(Trained {
-                cloud,
-                summary,
-                eval,
-            })
+            let r = train_blocking(scene, cfg, do_eval, &cancel, &tx);
+            vram::release_quietly();
+            r.map(|t| Trained { coexist, ..t })
         });
         while let Some(p) = rx.recv().await {
+            let p = match p {
+                Progress::Train(p) => p,
+                Progress::Waiting(msg, data) => {
+                    cx.progress_with(0.0, msg, data);
+                    continue;
+                }
+                Progress::Log(msg) => {
+                    cx.log(msg);
+                    continue;
+                }
+            };
             let loss = p.loss.map_or(String::new(), |l| format!(", loss {l:.4}"));
             cx.progress(
                 p.t as f64 / p.total.max(1) as f64,
@@ -229,6 +284,7 @@ impl Op for Train {
             cloud,
             summary,
             eval,
+            coexist,
         } = job.await??;
         cx.metric("train_time", summary.train_s, "s");
         cx.metric("final_gaussians", summary.final_gaussians as f64, "");
@@ -248,6 +304,8 @@ impl Op for Train {
             ply: None,
             spz: None,
             colmap: None,
+            gpu_memory: coexist.notes,
+            gpu_wait_s: coexist.waited_s,
         };
         for fmt in &input.export {
             match fmt {
@@ -288,6 +346,43 @@ struct Trained {
     cloud: GaussiansHost,
     summary: TrainSummary,
     eval: Option<ImageMetrics>,
+    coexist: vram::Coexist,
+}
+
+/// Messages from the training thread.
+enum Progress {
+    Train(TrainProgress),
+    /// Waiting for GPU memory: message, progress data.
+    Waiting(String, serde_json::Value),
+    Log(String),
+}
+
+/// Trains, evaluates and downloads; every device buffer is gone on return.
+fn train_blocking(
+    scene: Scene,
+    cfg: TrainConfig,
+    do_eval: bool,
+    cancel: &spl_core::CancellationToken,
+    tx: &tokio::sync::mpsc::UnboundedSender<Progress>,
+) -> Result<Trained> {
+    let gpu = Gpu::open()?;
+    let mut trainer = Trainer::new(&gpu, scene, cfg)?;
+    let summary = trainer.run(cancel, &mut |p| {
+        let _ = tx.send(Progress::Train(p.clone()));
+    })?;
+    let eval = if do_eval {
+        Some(evaluate(&mut trainer, None)?.mean)
+    } else {
+        None
+    };
+    let (cloud, mut s) = trainer.finish()?;
+    s.train_s = summary.train_s;
+    Ok(Trained {
+        cloud,
+        summary: s,
+        eval,
+        coexist: vram::Coexist::default(),
+    })
 }
 
 /// The COLMAP sparse model (bin) of the cameras plus points from the splat

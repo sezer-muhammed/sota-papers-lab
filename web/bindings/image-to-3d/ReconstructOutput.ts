@@ -6,4 +6,14 @@ export type ReconstructOutput = { frames: number, gaussians: number, iterations:
 /**
  * From the start of the run to the last export stored.
  */
-wall_s: number, };
+wall_s: number, 
+/**
+ * What the run gave up because other processes held GPU memory
+ * (fewer frames per engine pass, fewer Gaussians, smaller images);
+ * empty on the quality path.
+ */
+gpu_memory: Array<string>, 
+/**
+ * Seconds spent waiting for GPU memory.
+ */
+gpu_wait_s: number, };
