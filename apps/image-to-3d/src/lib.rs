@@ -27,6 +27,7 @@ pub mod bench;
 pub mod eval;
 pub mod export;
 pub mod frame;
+pub mod generate;
 pub mod gpu;
 pub mod ingest;
 pub mod init;
@@ -53,5 +54,6 @@ pub fn register(registry: &mut Registry) {
         .op(ops::Render)
         .op(pose::Pose)
         .op(reconstruct::Reconstruct)
+        .op(generate::Generate)
         .op(bench::Bench);
 }
