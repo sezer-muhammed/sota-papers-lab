@@ -9,7 +9,7 @@ Unposed images or video to Gaussian splats and meshes.
 | Design | `reports/Image to 3D.md`; specs `reports/image-to-3d/spec-raster.md`, `spec-train.md`; module contract [DESIGN.md](DESIGN.md) |
 | Paper | see `paper.toml` |
 
-Status: Phase 3 skeleton. Dataset loading (COLMAP bin/txt, splits, intrinsics, PIL-exact JPEG decode, GPU image cache), the Gaussian store, buffer allocation, NVRTC compilation and the test harness work; the splat kernels are stubs owned per [DESIGN.md](DESIGN.md), so training and rendering return "not implemented (owner: ...)".
+Status: Phase 3 trainer assembled. `image_to_3d.train` trains on COLMAP poses (CUDA graphs per iteration, FastGS/ADC/MCMC densification, fused loss and Adam), evaluates the held-out views (PSNR, SSIM on the CPU) and exports PLY, SPZ and COLMAP; `image_to_3d.render` renders a PLY/SPZ. Not yet: pose refinement and PPISP (Phase 4), DashGaussian warm-up (`DashSchedule::from_spectra`; the Fast preset runs at full resolution), GPU metrics kernels, the fused-Adam sink. Full runs on a dataset: `trainer_gpu_tests.rs` (`SPL_TRAIN_*` variables, see its header).
 
 ## Run alone
 

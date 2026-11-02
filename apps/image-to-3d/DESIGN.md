@@ -148,10 +148,14 @@ plan      = adam.plan(t)                       due groups, step sizes, bias corr
 params    = trainer.iter_params(...)           one IterParams (Section 5)
 ring.push(params)                              blocks only while slot t % 8 is in flight
 key = GraphKey { n, render size, degree, due_mask, stats, abs_grad }
-if key changed: re-capture record_iteration    CUDA-graph capture point
-launch the graph (eager until E7 lands capture)
-hooks(t): strategy.after_step (densify, prune, opacity clamp/reset, final prune), Morton, snapshot, eval
-every ~100 t: lagging read of the loss sums and PinnedStatus; overflow → grow, drop graphs, replay from the first failed t
+graph = cache[key] or capture(record_iteration)  up to 8 graphs per n (step-plan shapes alternate)
+launch the graph; ring.enqueued()               event per slot guards the next overwrite
+hooks(t): strategy.after_step (densify, prune, opacity clamp/reset, final prune), Morton
+          any change of the buffers drops every cached graph
+before each step: PinnedStatus (lagging, no sync) shows an overflow → sync, rebuild the
+          raster at 1.25x the reported instances, carry the ring counter over, drop graphs;
+          the poisoned iterations (at most the ring depth) are lost, not replayed
+every 0.5 s: loss sums (host sync), VRAM sample, progress
 ```
 
 ### 4.2 Device side (`record_iteration`, captured; one stream, no host sync)
