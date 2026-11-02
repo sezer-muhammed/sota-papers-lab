@@ -7,4 +7,9 @@ export type RunProgress = {
 /**
  * 0 to 1.
  */
-fraction: number, message: string, };
+fraction: number, message: string, 
+/**
+ * Structured state the op attached (`cx.progress_with`): stage,
+ * iteration, counts.
+ */
+data?: unknown, };

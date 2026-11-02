@@ -1,0 +1,92 @@
+# Pose and depth estimation: VGGT-Ω accuracy vs DUSt3R / MASt3R.
+#
+# Datasets not yet in datasets.toml — manifests to be added when the pose
+# benchmark is first run. Metrics follow the VGGT evaluation protocol.
+
+[suite]
+name = "pose"
+description = "Camera pose and depth accuracy of the VGGT-Ω engine"
+app = "image-to-3d"
+op = "image_to_3d.bench"
+
+[protocol]
+metrics = ["auc_3", "auc_30", "depth_absrel", "delta_1_25", "stage_ms", "peak_vram"]
+datasets_toml = "benchmarks/image-to-3d/datasets.toml"
+
+[baselines]
+results_jsonl = "~/spl-work/bench/results.jsonl"
+paper_toml = "apps/image-to-3d/paper.toml"
+
+# ETH3D (placeholder — manifest needed in datasets.toml)
+
+[[scenes]]
+name = "courtyard"
+dataset = "eth3d"
+
+[[scenes]]
+name = "delivery_area"
+dataset = "eth3d"
+
+[[scenes]]
+name = "electro"
+dataset = "eth3d"
+
+[[scenes]]
+name = "facade"
+dataset = "eth3d"
+
+[[scenes]]
+name = "meadow"
+dataset = "eth3d"
+
+# 7-Scenes (placeholder)
+
+[[scenes]]
+name = "chess"
+dataset = "7scenes"
+
+[[scenes]]
+name = "fire"
+dataset = "7scenes"
+
+[[scenes]]
+name = "heads"
+dataset = "7scenes"
+
+[[scenes]]
+name = "office"
+dataset = "7scenes"
+
+[[scenes]]
+name = "pumpkin"
+dataset = "7scenes"
+
+[[scenes]]
+name = "redkitchen"
+dataset = "7scenes"
+
+[[scenes]]
+name = "stairs"
+dataset = "7scenes"
+
+# NRGBD (placeholder)
+
+[[scenes]]
+name = "breakfast_room"
+dataset = "nrgbd"
+
+[[scenes]]
+name = "complete_kitchen"
+dataset = "nrgbd"
+
+[[scenes]]
+name = "green_room"
+dataset = "nrgbd"
+
+[[scenes]]
+name = "grey_white_room"
+dataset = "nrgbd"
+
+[[scenes]]
+name = "morning_apartment"
+dataset = "nrgbd"

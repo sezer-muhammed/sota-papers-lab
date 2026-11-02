@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use spl_core::{Result, bail};
+use spl_core::{ArtifactRef, Result, bail};
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -93,6 +93,24 @@ pub struct RunArtifact {
     pub direction: String,
     /// The op's name for the artifact; hosts number unnamed outputs `out-0`, `out-1`, ...
     pub slot_name: String,
+}
+
+/// A run's current artifact for one slot, as the op last announced it
+/// (`cx.announce`). Kept after the run ends.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Announcement {
+    /// The op's name for it: `points`, `cameras`, `splat`, ...
+    pub slot: String,
+    pub artifact: ArtifactRef,
+    /// 1 for the slot's first announcement, then 2, 3, ...: a client that
+    /// shows revision n only fetches the artifact again for a higher one.
+    pub revision: u32,
+    /// Small JSON the op attached (`{"iteration": 7000}`).
+    #[ts(type = "unknown")]
+    pub info: Option<serde_json::Value>,
+    #[ts(type = "number")]
+    pub announced_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

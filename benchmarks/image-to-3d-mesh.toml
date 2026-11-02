@@ -1,0 +1,90 @@
+# Mesh extraction quality: Gaussian splats → textured mesh → F1 / Chamfer.
+#
+# T&T official F1 with Sim(3) alignment; DTU Chamfer on 15 scans.
+# DTU datasets are placeholders — manifests to be added.
+
+[suite]
+name = "mesh"
+description = "Mesh quality from Gaussian splat extraction (F1, Chamfer distance)"
+app = "image-to-3d"
+op = "image_to_3d.bench"
+
+[protocol]
+metrics = ["f1", "precision", "recall", "chamfer_distance", "train_time", "mesh_time", "peak_vram"]
+datasets_toml = "benchmarks/image-to-3d/datasets.toml"
+
+[baselines]
+results_jsonl = "~/spl-work/bench/results.jsonl"
+paper_toml = "apps/image-to-3d/paper.toml"
+
+# Tanks and Temples (available in datasets.toml)
+
+[[scenes]]
+name = "truck"
+dataset = "tandt"
+
+[[scenes]]
+name = "train"
+dataset = "tandt"
+
+# DTU scans (placeholder — manifest needed in datasets.toml)
+
+[[scenes]]
+name = "scan24"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan37"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan40"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan55"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan63"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan65"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan69"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan83"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan97"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan105"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan106"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan110"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan114"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan118"
+dataset = "dtu"
+
+[[scenes]]
+name = "scan122"
+dataset = "dtu"

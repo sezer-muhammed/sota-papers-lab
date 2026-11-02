@@ -1,0 +1,34 @@
+[package]
+name = "spl-app-image-to-3d"
+description = "Unposed images or video to Gaussian splats and meshes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+flate2 = "1"
+memmap2 = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+kiddo = "4"
+mozjpeg = { version = "0.10", default-features = false, features = ["parallel"] }
+rayon = "1"
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+spl-core.workspace = true
+spl-gpu.workspace = true
+spl-nn.workspace = true
+tempfile = "3"
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+ts-rs.workspace = true
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+spl-data.workspace = true
+
+[lints]
+workspace = true
