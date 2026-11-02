@@ -20,6 +20,7 @@
 //! - trainer (E7): `gpu.rs`, `frame.rs`, `rng.rs`, `presets.rs`,
 //!   `trainer.rs`, `ops.rs`, `refine.rs`, `io/*`, `testkit/*`
 
+pub mod bench;
 pub mod eval;
 pub mod export;
 pub mod frame;
@@ -38,5 +39,5 @@ pub mod trainer;
 use spl_core::Registry;
 
 pub fn register(registry: &mut Registry) {
-    registry.op(ops::Train).op(ops::Render);
+    registry.op(ops::Train).op(ops::Render).op(bench::Bench);
 }
