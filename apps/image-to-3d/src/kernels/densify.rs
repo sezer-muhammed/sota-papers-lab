@@ -195,6 +195,9 @@ pub trait Strategy: Send {
     fn wants_views(&self, _t: u32) -> bool {
         false
     }
+    /// Morton re-sort of every per-Gaussian array (spec-train 5.9), after
+    /// `after_step` of iteration t, through the strategy's compactor.
+    fn morton_sort(&mut self, cx: &mut DensifyCx<'_>, t: u32) -> Result<()>;
 }
 
 /// `start < t < end` and `t % every == 0`: the densify iterations of every
@@ -934,12 +937,30 @@ fn emit_all(cx: &mut DensifyCx<'_>, w: &mut Work, t: u32) -> Result<EmitResult> 
     let cap = cx.g.cap;
     // Statistics are zeroed right after the step and gradients of groups that
     // stepped at t are dead data: only accumulating groups' partial sums move.
-    let carry: [bool; 6] = std::array::from_fn(|k| !cx.adam.groups[k].plan.due(t));
+    let carry = carried_grads(cx.adam, t);
     let mut extra = PerGaussianArrays::new();
     extra.add_grad_groups(&s, cx.grads, carry);
     extra.add_moments(&s, &mut cx.adam.moments, cap);
     w.compactor
         .emit(cx.gpu, &mut w.plan, cx.g, &extra, cx.rng, t)
+}
+
+/// Gradient groups whose buffers carry partial sums after the step at t
+/// (accumulating groups that did not step); the rest are dead data.
+fn carried_grads(adam: &Adam, t: u32) -> [bool; 6] {
+    std::array::from_fn(|k| !adam.groups[k].plan.due(t))
+}
+
+/// Morton re-sort of parameters, moments, carried gradients and statistics.
+fn morton_all(compactor: &mut Compactor, cx: &mut DensifyCx<'_>, t: u32) -> Result<()> {
+    let s = cx.gpu.stream.clone();
+    let cap = cx.g.cap;
+    let carry = carried_grads(cx.adam, t);
+    let mut extra = PerGaussianArrays::new();
+    extra.add_grad_groups(&s, cx.grads, carry);
+    extra.add_moments(&s, &mut cx.adam.moments, cap);
+    extra.add_stats(&s, cx.stats);
+    compactor.morton_sort(cx.gpu, cx.g, &extra)
 }
 
 fn outcome(r: &EmitResult) -> DensifyOutcome {
@@ -994,6 +1015,14 @@ impl Strategy for Adc {
 
     fn wants_stats(&self, t: u32) -> bool {
         t < self.cfg.end
+    }
+
+    fn morton_sort(&mut self, cx: &mut DensifyCx<'_>, t: u32) -> Result<()> {
+        let w = match &mut self.work {
+            Some(w) => w,
+            None => self.work.insert(Work::new(cx.gpu, cx.g.cap as usize)?),
+        };
+        morton_all(&mut w.compactor, cx, t)
     }
 }
 
@@ -1144,6 +1173,14 @@ impl Strategy for FastGs {
 
     fn wants_views(&self, t: u32) -> bool {
         window_due(t, self.cfg.start, self.cfg.end, self.cfg.every) || self.cfg.final_prune_due(t)
+    }
+
+    fn morton_sort(&mut self, cx: &mut DensifyCx<'_>, t: u32) -> Result<()> {
+        let w = match &mut self.work {
+            Some(w) => w,
+            None => self.work.insert(Work::new(cx.gpu, cx.g.cap as usize)?),
+        };
+        morton_all(&mut w.compactor, cx, t)
     }
 }
 
@@ -1404,6 +1441,8 @@ pub fn mcmc_round(
 struct Mcmc {
     cfg: McmcConfig,
     work: Option<McmcWork>,
+    /// Allocated on the first Morton re-sort only.
+    compactor: Option<Compactor>,
 }
 
 impl Strategy for Mcmc {
@@ -1419,7 +1458,7 @@ impl Strategy for Mcmc {
         let s = cx.gpu.stream.clone();
         let cap = cx.g.cap;
         let n_before = cx.g.n;
-        let carry: [bool; 6] = std::array::from_fn(|k| !cx.adam.groups[k].plan.due(t));
+        let carry = carried_grads(cx.adam, t);
         let mut extra = PerGaussianArrays::new();
         extra.add_grad_groups(&s, cx.grads, carry);
         extra.add_moments(&s, &mut cx.adam.moments, cap);
@@ -1441,6 +1480,16 @@ impl Strategy for Mcmc {
     fn wants_stats(&self, _t: u32) -> bool {
         false
     }
+
+    fn morton_sort(&mut self, cx: &mut DensifyCx<'_>, t: u32) -> Result<()> {
+        let c = match &mut self.compactor {
+            Some(c) => c,
+            None => self
+                .compactor
+                .insert(Compactor::new(cx.gpu, cx.g.cap as usize)?),
+        };
+        morton_all(c, cx, t)
+    }
 }
 
 pub fn adc(cfg: AdcConfig) -> Box<dyn Strategy> {
@@ -1456,7 +1505,11 @@ pub fn fastgs(cfg: FastGsConfig) -> Box<dyn Strategy> {
 }
 
 pub fn mcmc(cfg: McmcConfig) -> Box<dyn Strategy> {
-    Box::new(Mcmc { cfg, work: None })
+    Box::new(Mcmc {
+        cfg,
+        work: None,
+        compactor: None,
+    })
 }
 
 #[cfg(test)]

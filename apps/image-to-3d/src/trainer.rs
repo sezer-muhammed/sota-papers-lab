@@ -454,14 +454,18 @@ impl Trainer {
             views: &views,
         };
         let outcome = self.strategy.after_step(&mut cx, t)?;
+        // Right after emission when both fall on t (spec-train 5.9).
+        let morton = self.schedule.morton_due(t);
+        if morton {
+            self.strategy.morton_sort(&mut cx, t)?;
+        }
         let densify = outcome.changed.then_some(outcome);
         if let Some(d) = densify {
             self.summary.densify_steps += 1;
             self.summary.capped += d.capped;
-            self.graph = None;
         }
-        if self.schedule.morton_due(t) {
-            return Err(not_implemented("Morton re-sort hook", OWNER));
+        if densify.is_some() || morton {
+            self.graph = None;
         }
         Ok(densify)
     }
