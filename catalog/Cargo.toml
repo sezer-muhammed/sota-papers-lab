@@ -7,7 +7,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = ["device-info", "raw-retouch"]
+default = ["device-info", "raw-retouch", "image-to-3d"]
+image-to-3d = ["dep:spl-app-image-to-3d"]
 raw-retouch = ["dep:spl-app-raw-retouch"]
 device-info = ["dep:spl-app-device-info"]
 
@@ -19,3 +20,4 @@ workspace = true
 spl-core.workspace = true
 spl-app-device-info = { workspace = true, optional = true }
 spl-app-raw-retouch = { workspace = true, optional = true }
+spl-app-image-to-3d = { workspace = true, optional = true }
