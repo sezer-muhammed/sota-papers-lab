@@ -304,6 +304,7 @@ fn gpu_bench_sort_and_binning() {
             "bin_scan",
             "onesweep_u16 p0",
             "onesweep_u16 p1",
+            "scan_emit (fused)",
         ];
         let mut per: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
         let mut whole = Vec::new();
@@ -390,6 +391,10 @@ fn gpu_bench_sort_and_binning() {
                 }));
             }
             f.tile_sorted = 0;
+            // The fused form bin_tiles runs, on the same sorted depth order.
+            t.push(time(&gpu, &timer, || {
+                scan_emit(&k, &s, &mut sorter, &mut f).unwrap()
+            }));
             // Whole sequence, as one graph would run it.
             s.memcpy_dtod(&pk, &mut f.depth_key[0]).unwrap();
             s.memcpy_dtod(&pv, &mut f.depth_val[0]).unwrap();

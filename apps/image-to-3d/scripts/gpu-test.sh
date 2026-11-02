@@ -40,7 +40,7 @@ lock=()
 for b in $bins; do
   "${lock[@]}" docker run --rm --gpus all --user "$(id -u):$(id -g)" \
     -e HOME=/tmp -e RUST_BACKTRACE=1 -e SPL_DATASETS=/datasets \
-    -e SPL_NVRTC_LINEINFO="${SPL_NVRTC_LINEINFO:-}" \
+    -e SPL_NVRTC_LINEINFO="${SPL_NVRTC_LINEINFO:-}" -e SPL_SORT_DUMP="${SPL_SORT_DUMP:-}" \
     "${mounts[@]}" -w "$dir" --entrypoint "" "$image" \
     "$b" --nocapture --test-threads=1 --include-ignored "$@"
 done
