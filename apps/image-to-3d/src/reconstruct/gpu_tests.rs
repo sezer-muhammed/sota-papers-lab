@@ -10,8 +10,8 @@
 //! | `SPL_RECON_CONFIG` | none | `PipelineConfig` JSON patch, or an array of patches run one after another on the same ingest (ablations; tags get `-<i>`) |
 //! | `SPL_RECON_HOLDOUT` | 8 | every n-th frame held out (0 = none) |
 //! | `SPL_RECON_TTR` | 200 | test-time pose refinement iterations per view |
-//! | `SPL_RECON_TTR_LR` | 1e-3 | its rotation LR (translation: same × extent) |
-//! | `SPL_RECON_MAX_FRAMES` | 300 | frames (video keyframes) |
+//! | `SPL_RECON_TTR_LR` | 3e-3 | its rotation LR (translation: same × extent); bicycle Fast: 1e-3 21.47 dB, 3e-3 22.25, 1e-2 20.06 |
+//! | `SPL_RECON_MAX_FRAMES` | all | frames (video keyframes) |
 //! | `SPL_RECON_TAG` | `<scene>-<preset>` | output folder name |
 //! | `SPL_VGGT_WEIGHTS` | — | engine weights |
 //! | `SPL_RECON_GT_POSES` | 0 | 1 = replace the engine's cameras by the dataset's COLMAP cameras, Sim(3)-aligned into the engine's frame (diagnostic: isolates pose error) |
@@ -62,7 +62,7 @@ fn gpu_reconstruct_protocol() {
         },
         Err(_) => vec![serde_json::json!({})],
     };
-    let max_frames: u32 = env("SPL_RECON_MAX_FRAMES", "300").parse().unwrap();
+    let max_frames: u32 = env("SPL_RECON_MAX_FRAMES", "100000").parse().unwrap();
     let video = std::env::var("SPL_RECON_VIDEO").ok().map(PathBuf::from);
     let short = scene_name.rsplit('/').next().unwrap().to_string();
     let tag = env("SPL_RECON_TAG", &format!("{short}-{preset_name}"));
@@ -146,7 +146,7 @@ fn run_one(
 ) {
     let holdout: usize = env("SPL_RECON_HOLDOUT", "8").parse().unwrap();
     let ttr: u32 = env("SPL_RECON_TTR", "200").parse().unwrap();
-    let ttr_lr: f32 = env("SPL_RECON_TTR_LR", "1e-3").parse().unwrap();
+    let ttr_lr: f32 = env("SPL_RECON_TTR_LR", "3e-3").parse().unwrap();
     let out = PathBuf::from("/out/image-to-3d/reconstruct").join(tag);
     std::fs::create_dir_all(&out).unwrap();
     let weights = PathBuf::from(env(
