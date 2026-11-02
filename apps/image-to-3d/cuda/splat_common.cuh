@@ -304,6 +304,52 @@ SPL_INLINE float3 sh_basis_vjp(uint32_t deg, float x, float y, float z, const fl
     return g;
 }
 
+// Basis function k (0..14, beyond DC) of sh_basis and its gradient d Y_k / d(x, y, z), for
+// loops unrolled over k (k folds to a constant, so each call is a few FMAs and the caller
+// needs no 15-entry arrays). xx = x^2 etc.
+SPL_INLINE float sh_y(int k, float x, float y, float z, float xx, float yy, float zz) {
+    switch (k) {
+        case 0: return -SH_C1 * y;
+        case 1: return SH_C1 * z;
+        case 2: return -SH_C1 * x;
+        case 3: return SH_C2_0 * x * y;
+        case 4: return SH_C2_1 * y * z;
+        case 5: return SH_C2_2 * (2.f * zz - xx - yy);
+        case 6: return SH_C2_3 * x * z;
+        case 7: return SH_C2_4 * (xx - yy);
+        case 8: return SH_C3_0 * y * (3.f * xx - yy);
+        case 9: return SH_C3_1 * x * y * z;
+        case 10: return SH_C3_2 * y * (4.f * zz - xx - yy);
+        case 11: return SH_C3_3 * z * (2.f * zz - 3.f * xx - 3.f * yy);
+        case 12: return SH_C3_4 * x * (4.f * zz - xx - yy);
+        case 13: return SH_C3_5 * z * (xx - yy);
+        default: return SH_C3_6 * x * (xx - 3.f * yy);
+    }
+}
+
+SPL_INLINE float3 sh_dy(int k, float x, float y, float z, float xx, float yy, float zz) {
+    switch (k) {
+        case 0: return make_float3(0.f, -SH_C1, 0.f);
+        case 1: return make_float3(0.f, 0.f, SH_C1);
+        case 2: return make_float3(-SH_C1, 0.f, 0.f);
+        case 3: return make_float3(SH_C2_0 * y, SH_C2_0 * x, 0.f);
+        case 4: return make_float3(0.f, SH_C2_1 * z, SH_C2_1 * y);
+        case 5: return make_float3(-2.f * SH_C2_2 * x, -2.f * SH_C2_2 * y, 4.f * SH_C2_2 * z);
+        case 6: return make_float3(SH_C2_3 * z, 0.f, SH_C2_3 * x);
+        case 7: return make_float3(2.f * SH_C2_4 * x, -2.f * SH_C2_4 * y, 0.f);
+        case 8: return make_float3(6.f * SH_C3_0 * x * y, 3.f * SH_C3_0 * (xx - yy), 0.f);
+        case 9: return make_float3(SH_C3_1 * y * z, SH_C3_1 * x * z, SH_C3_1 * x * y);
+        case 10:
+            return make_float3(-2.f * SH_C3_2 * x * y, SH_C3_2 * (4.f * zz - xx - 3.f * yy), 8.f * SH_C3_2 * y * z);
+        case 11:
+            return make_float3(-6.f * SH_C3_3 * x * z, -6.f * SH_C3_3 * y * z, 3.f * SH_C3_3 * (2.f * zz - xx - yy));
+        case 12:
+            return make_float3(SH_C3_4 * (4.f * zz - 3.f * xx - yy), -2.f * SH_C3_4 * x * y, 8.f * SH_C3_4 * x * z);
+        case 13: return make_float3(2.f * SH_C3_5 * x * z, -2.f * SH_C3_5 * y * z, SH_C3_5 * (xx - yy));
+        default: return make_float3(3.f * SH_C3_6 * (xx - yy), -6.f * SH_C3_6 * x * y, 0.f);
+    }
+}
+
 // ---------------------------------------------------------------- tile span (spec-raster 2.8)
 // Every operation below uses explicit round-to-nearest intrinsics (no FMA contraction, no
 // fast-math approximations), so preprocess_fwd (count), emit (tiles) and raster_fwd

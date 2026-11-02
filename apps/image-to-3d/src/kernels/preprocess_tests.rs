@@ -2235,7 +2235,23 @@ fn gpu_preprocess_bench_garden() {
         .iter()
         .map(|&i| scene.views[i].clone())
         .collect();
-    let bench_views: Vec<usize> = (0..views.len()).step_by(8).collect();
+    // SPL_BENCH_VIEWS limits the timed views (profiling runs), SPL_BENCH_SIZES
+    // the model sizes ("1M,3M,6M").
+    let max_views = std::env::var("SPL_BENCH_VIEWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
+    let sizes = std::env::var("SPL_BENCH_SIZES").unwrap_or_else(|_| "1M,3M,6M".into());
+    // SPL_PRE_VARIANTS: occupancy targets "fwd,bwd;..." (PRE_FWD/BWD_MIN_BLOCKS).
+    let variants: Vec<(u32, u32)> = std::env::var("SPL_PRE_VARIANTS")
+        .unwrap_or_else(|_| "3,2".into())
+        .split(';')
+        .map(|v| {
+            let (f, b) = v.split_once(',').expect("fwd,bwd");
+            (f.trim().parse().unwrap(), b.trim().parse().unwrap())
+        })
+        .collect();
+    let bench_views: Vec<usize> = (0..views.len()).step_by(8).take(max_views).collect();
     let t0 = std::time::Instant::now();
     let model = read_ply(&ply);
     let order = morton_order(&model);
@@ -2281,14 +2297,34 @@ fn gpu_preprocess_bench_garden() {
         z.write(&out.join("garden_views.npz")).unwrap();
     }
     let gpu = gpu();
+    {
+        let k = SplatKernels::load(&gpu, RasterVariant::default()).unwrap();
+        let p = &k.preprocess;
+        for (name, f, blocks) in [
+            ("preprocess_fwd", &p.fwd, p.fwd_blocks),
+            ("preprocess_bwd", &p.bwd, p.bwd_blocks),
+        ] {
+            use spl_gpu::cudarc::driver::sys::CUfunction_attribute as A;
+            let regs = f.get_attribute(A::CU_FUNC_ATTRIBUTE_NUM_REGS).unwrap();
+            let local = f
+                .get_attribute(A::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)
+                .unwrap();
+            println!(
+                "{name}: {regs} registers, {local} B local memory, grid {blocks} x {}",
+                crate::kernels::layout::PRE_THREADS
+            );
+        }
+    }
     let before = gpu_snapshot();
     let mut rows = Vec::new();
     let every_third: Vec<u32> = order.iter().copied().step_by(3).collect();
-    for (label, host) in [
-        ("1M", gather(&model, &every_third, false)),
-        ("3M", gather(&model, &order, false)),
-        ("6M", gather(&model, &order, true)),
-    ] {
+    for label in sizes.split(',') {
+        let host = match label {
+            "1M" => gather(&model, &every_third, false),
+            "3M" => gather(&model, &order, false),
+            "6M" => gather(&model, &order, true),
+            other => panic!("unknown size {other}"),
+        };
         let n = host.len();
         let mut rig = Rig::new(&gpu, &host, &views, RasterVariant::default(), None, None);
         drop(host);
@@ -2309,97 +2345,108 @@ fn gpu_preprocess_bench_garden() {
         )
         .unwrap();
         let mut stats = DensifyStats::alloc(&gpu, rig.g.cap as usize, true).unwrap();
-        let (mut fwd_ms, mut bwd_ms, mut bwd2_ms) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut vis_sum, mut inst_sum) = (0f64, 0f64);
-        let (mut fwd_bytes, mut bwd_bytes) = (0f64, 0f64);
-        for &vi in &bench_views {
-            let mut params = iter_params(n, vi as u32, 3, 0, 0.3);
-            params.adam.overwrite_mask = 0x3f;
-            rig.f.iter.upload(&gpu, &params, None).unwrap();
-            let k = &rig.k;
-            let fstat = bench(&gpu, 3, 10, || {
-                frame_begin_eager(k, &s, &rig.cams, &mut rig.f)?;
-                preprocess_fwd(k, &s, &mut rig.g, &mut rig.f, &mut rig.g2d)
-            })
+        for &(fb, bb) in &variants {
+            rig.k.preprocess = PreprocessKernels::load(
+                &gpu,
+                &RasterVariant::default()
+                    .defines()
+                    .set("PRE_FWD_MIN_BLOCKS", fb)
+                    .set("PRE_BWD_MIN_BLOCKS", bb),
+            )
             .unwrap();
-            let status = rig.f.iter.read_status(&gpu).unwrap();
-            let v = status.n_visible as usize;
-            let tiles: Vec<u32> = s.clone_dtoh(&rig.f.n_tiles.slice(..v.max(1))).unwrap();
-            vis_sum += v as f64;
-            inst_sum += tiles[..v].iter().map(|&t| t as f64).sum::<f64>();
-            s.memcpy_dtod(&src, &mut rig.g2d.g).unwrap();
-            let bstat = bench(&gpu, 3, 10, || {
-                preprocess_bwd(
-                    k,
-                    &s,
-                    &mut rig.g,
-                    &rig.f,
-                    &rig.g2d,
-                    GradSink::Write(&mut grads),
-                    None,
-                    None,
-                )
-            })
-            .unwrap();
-            let mut p2 = params;
-            p2.frame.flags = FLAG_CAM_GRAD | FLAG_DENSIFY_STATS;
-            rig.f.iter.upload(&gpu, &p2, None).unwrap();
-            let b2 = bench(&gpu, 3, 10, || {
-                preprocess_bwd(
-                    k,
-                    &s,
-                    &mut rig.g,
-                    &rig.f,
-                    &rig.g2d,
-                    GradSink::Write(&mut grads),
-                    Some(&mut camg),
-                    Some(&mut stats),
-                )?;
-                cam_reduce(k, &s, &rig.f, &mut camg)
-            })
-            .unwrap();
-            // Bytes model: all N read mean + opacity (16 B); visible read the
-            // rest of the parameters (16 + 12 + 12 + 180 B) and write 48 B rec,
-            // 16 B keys/idx/tiles, 44 B g2d zeroing; vis mask N/8.
-            fwd_bytes += 16.0 * n as f64 + n as f64 / 8.0 + (220.0 + 108.0 + 4.0) * v as f64;
-            // Backward per visible: vis_idx 4 + g2d 36 + params 236 + gradients 236.
-            bwd_bytes += 512.0 * v as f64;
-            fwd_ms.push(fstat.median_ms);
-            bwd_ms.push(bstat.median_ms);
-            bwd2_ms.push(b2.median_ms);
+            let (mut fwd_ms, mut bwd_ms, mut bwd2_ms) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut vis_sum, mut inst_sum) = (0f64, 0f64);
+            let (mut fwd_bytes, mut bwd_bytes) = (0f64, 0f64);
+            for &vi in &bench_views {
+                let mut params = iter_params(n, vi as u32, 3, 0, 0.3);
+                params.adam.overwrite_mask = 0x3f;
+                rig.f.iter.upload(&gpu, &params, None).unwrap();
+                let k = &rig.k;
+                let fstat = bench(&gpu, 3, 10, || {
+                    frame_begin_eager(k, &s, &rig.cams, &mut rig.f)?;
+                    preprocess_fwd(k, &s, &mut rig.g, &mut rig.f, &mut rig.g2d)
+                })
+                .unwrap();
+                let status = rig.f.iter.read_status(&gpu).unwrap();
+                let v = status.n_visible as usize;
+                let tiles: Vec<u32> = s.clone_dtoh(&rig.f.n_tiles.slice(..v.max(1))).unwrap();
+                vis_sum += v as f64;
+                inst_sum += tiles[..v].iter().map(|&t| t as f64).sum::<f64>();
+                s.memcpy_dtod(&src, &mut rig.g2d.g).unwrap();
+                let bstat = bench(&gpu, 3, 10, || {
+                    preprocess_bwd(
+                        k,
+                        &s,
+                        &mut rig.g,
+                        &rig.f,
+                        &rig.g2d,
+                        GradSink::Write(&mut grads),
+                        None,
+                        None,
+                    )
+                })
+                .unwrap();
+                let mut p2 = params;
+                p2.frame.flags = FLAG_CAM_GRAD | FLAG_DENSIFY_STATS;
+                rig.f.iter.upload(&gpu, &p2, None).unwrap();
+                let b2 = bench(&gpu, 3, 10, || {
+                    preprocess_bwd(
+                        k,
+                        &s,
+                        &mut rig.g,
+                        &rig.f,
+                        &rig.g2d,
+                        GradSink::Write(&mut grads),
+                        Some(&mut camg),
+                        Some(&mut stats),
+                    )?;
+                    cam_reduce(k, &s, &rig.f, &mut camg)
+                })
+                .unwrap();
+                // Bytes model: all N read mean + opacity (16 B); visible read the
+                // rest of the parameters (16 + 12 + 12 + 180 B) and write 48 B rec,
+                // 16 B keys/idx/tiles, 44 B g2d zeroing; vis mask N/8.
+                fwd_bytes += 16.0 * n as f64 + n as f64 / 8.0 + (220.0 + 108.0 + 4.0) * v as f64;
+                // Backward per visible: vis_idx 4 + g2d 36 + params 236 + gradients 236.
+                bwd_bytes += 512.0 * v as f64;
+                fwd_ms.push(fstat.median_ms);
+                bwd_ms.push(bstat.median_ms);
+                bwd2_ms.push(b2.median_ms);
+            }
+            let nv = bench_views.len() as f64;
+            let fs = Stats::from_samples(&fwd_ms);
+            let bs = Stats::from_samples(&bwd_ms);
+            let row = BenchRow {
+                label: format!("{label} f{fb}b{bb}"),
+                n,
+                views: bench_views.len(),
+                visible_mean: vis_sum / nv,
+                instances_mean: inst_sum / nv,
+                fwd_gbps: fwd_bytes / nv / (fs.mean_ms * 1e-3) / 1e9,
+                bwd_gbps: bwd_bytes / nv / (bs.mean_ms * 1e-3) / 1e9,
+                bwd_cam_stats: Stats::from_samples(&bwd2_ms),
+                fwd: fs,
+                bwd: bs,
+            };
+            println!(
+                "{}: N {n}, V {:.0} ({:.1}%), instances {:.0} ({:.2}/visible) | fwd mean {:.3} ms (median {:.3}, p10 {:.3}, p90 {:.3}) ~{:.0} GB/s | bwd mean {:.3} ms (median {:.3}) ~{:.0} GB/s | bwd+cam+stats {:.3} ms",
+                row.label,
+                row.visible_mean,
+                100.0 * row.visible_mean / n as f64,
+                row.instances_mean,
+                row.instances_mean / row.visible_mean,
+                row.fwd.mean_ms,
+                row.fwd.median_ms,
+                row.fwd.p10_ms,
+                row.fwd.p90_ms,
+                row.fwd_gbps,
+                row.bwd.mean_ms,
+                row.bwd.median_ms,
+                row.bwd_gbps,
+                row.bwd_cam_stats.mean_ms
+            );
+            rows.push(row);
         }
-        let nv = bench_views.len() as f64;
-        let fs = Stats::from_samples(&fwd_ms);
-        let bs = Stats::from_samples(&bwd_ms);
-        let row = BenchRow {
-            label: label.into(),
-            n,
-            views: bench_views.len(),
-            visible_mean: vis_sum / nv,
-            instances_mean: inst_sum / nv,
-            fwd_gbps: fwd_bytes / nv / (fs.mean_ms * 1e-3) / 1e9,
-            bwd_gbps: bwd_bytes / nv / (bs.mean_ms * 1e-3) / 1e9,
-            bwd_cam_stats: Stats::from_samples(&bwd2_ms),
-            fwd: fs,
-            bwd: bs,
-        };
-        println!(
-            "{label}: N {n}, V {:.0} ({:.1}%), instances {:.0} ({:.2}/visible) | fwd mean {:.3} ms (median {:.3}, p10 {:.3}, p90 {:.3}) ~{:.0} GB/s | bwd mean {:.3} ms (median {:.3}) ~{:.0} GB/s | bwd+cam+stats {:.3} ms",
-            row.visible_mean,
-            100.0 * row.visible_mean / n as f64,
-            row.instances_mean,
-            row.instances_mean / row.visible_mean,
-            row.fwd.mean_ms,
-            row.fwd.median_ms,
-            row.fwd.p10_ms,
-            row.fwd.p90_ms,
-            row.fwd_gbps,
-            row.bwd.mean_ms,
-            row.bwd.median_ms,
-            row.bwd_gbps,
-            row.bwd_cam_stats.mean_ms
-        );
-        rows.push(row);
     }
     let after = gpu_snapshot();
     println!("nvidia-smi before {before:?}\nnvidia-smi after  {after:?}");

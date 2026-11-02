@@ -132,18 +132,33 @@ extern "C" __global__ void frame_end(const IterParams* __restrict__ params, uint
 
 // ---------------------------------------------------------------- shared forward state
 
-// Everything the forward computes about one Gaussian, so preprocess_bwd recomputes exactly
-// the forward's numbers (the compiler drops what a kernel does not use).
+// Occupancy targets (blocks of PRE_THREADS per SM) the register allocation must allow.
+// Both kernels are memory bound, so they trade a few recomputations for occupancy.
+#ifndef PRE_FWD_MIN_BLOCKS
+#define PRE_FWD_MIN_BLOCKS 3
+#endif
+#ifndef PRE_BWD_MIN_BLOCKS
+#define PRE_BWD_MIN_BLOCKS 2
+#endif
+
+// Copies the frame camera and parameters into shared memory (one word per thread); the
+// caller synchronizes before use. Shared copies keep ~45 uniform values out of registers.
+SPL_INLINE void stage_frame(const FrameCam* __restrict__ cam, const IterParams* __restrict__ params,
+                            FrameCam& s_cam, FrameParams& s_fp) {
+    const uint32_t t = threadIdx.x;
+    if (t < sizeof(FrameCam) / 4) ((uint32_t*)&s_cam)[t] = ((const uint32_t*)cam)[t];
+    if (t < sizeof(FrameParams) / 4) ((uint32_t*)&s_fp)[t] = ((const uint32_t*)&params->frame)[t];
+}
+
+// The forward's per-Gaussian geometry (spec-raster 2 steps 1-6), as both kernels need it.
 struct Proj {
-    float3 mu;           // world mean
     float3 pc;           // camera-space mean (u, v, z)
     float rz;            // 1 / z
     float x, y;          // u / z, v / z
     float xc, yc;        // clipped to the J limits
-    bool in_x, in_y;     // x, y inside the limits (gradient flows through x, y)
+    bool in_x, in_y;     // x, y inside the limits (the gradient flows through x, y)
     float qn[4];         // unit quaternion (w, x, y, z)
     float qinv;          // 1 / |q|
-    float Rq[9];         // rotation of the Gaussian
     float s2[3];         // exp(2 s_hat)
     float sf2[3];        // s2 + v3 (3D filter) or s2
     float v3;            // 3D filter variance (0 = off)
@@ -157,17 +172,15 @@ struct Proj {
     float o, oeff;       // sigmoid(o_hat), o c2 c3
 };
 
-// Depth and opacity culls, then the EWA projection (spec-raster 2 steps 1-5). Returns false
-// when the Gaussian is culled before the conic. `flags` is FrameParams.flags.
-SPL_INLINE bool project(uint32_t p, const FrameCam& cam, uint32_t flags, float eps2d,
-                        const float* __restrict__ mean, const float* __restrict__ log_scale,
-                        const float4* __restrict__ quat, const float* __restrict__ opacity,
-                        const float* __restrict__ filter3d, Proj& g) {
-    g.mu = make_float3(mean[3 * p], mean[3 * p + 1], mean[3 * p + 2]);
+// Depth and opacity culls, then the EWA projection. Returns false when culled before the
+// conic. Loads only what each cull needs (culled Gaussians cost 16 B).
+SPL_INLINE bool project(uint32_t p, float3 mu, const FrameCam& cam, uint32_t flags, float eps2d,
+                        const float* __restrict__ log_scale, const float4* __restrict__ quat,
+                        const float* __restrict__ opacity, const float* __restrict__ filter3d, Proj& g) {
     const float* R = cam.R;
-    g.pc.x = R[0] * g.mu.x + R[1] * g.mu.y + R[2] * g.mu.z + cam.t[0];
-    g.pc.y = R[3] * g.mu.x + R[4] * g.mu.y + R[5] * g.mu.z + cam.t[1];
-    g.pc.z = R[6] * g.mu.x + R[7] * g.mu.y + R[8] * g.mu.z + cam.t[2];
+    g.pc.x = R[0] * mu.x + R[1] * mu.y + R[2] * mu.z + cam.t[0];
+    g.pc.y = R[3] * mu.x + R[4] * mu.y + R[5] * mu.z + cam.t[1];
+    g.pc.z = R[6] * mu.x + R[7] * mu.y + R[8] * mu.z + cam.t[2];
     if (!(g.pc.z >= cam.near_z && g.pc.z <= cam.far_z)) return false;
     g.o = 1.f / (1.f + __expf(-opacity[p]));
     if (g.o < ALPHA_MIN) return false;
@@ -179,7 +192,8 @@ SPL_INLINE bool project(uint32_t p, const FrameCam& cam, uint32_t flags, float e
     g.qn[1] = q.y * g.qinv;
     g.qn[2] = q.z * g.qinv;
     g.qn[3] = q.w * g.qinv;
-    quat_to_rotmat(g.qn[0], g.qn[1], g.qn[2], g.qn[3], g.Rq);
+    float Rq[9];
+    quat_to_rotmat(g.qn[0], g.qn[1], g.qn[2], g.qn[3], Rq);
     g.v3 = (filter3d && (flags & FLAG_FILTER3D)) ? filter3d[p] : 0.f;
     g.c3 = 1.f;
 #pragma unroll
@@ -207,7 +221,7 @@ SPL_INLINE bool project(uint32_t p, const FrameCam& cam, uint32_t flags, float e
     for (int r = 0; r < 2; ++r) {
 #pragma unroll
         for (int k = 0; k < 3; ++k)
-            g.T[3 * r + k] = g.M[3 * r] * g.Rq[k] + g.M[3 * r + 1] * g.Rq[3 + k] + g.M[3 * r + 2] * g.Rq[6 + k];
+            g.T[3 * r + k] = g.M[3 * r] * Rq[k] + g.M[3 * r + 1] * Rq[3 + k] + g.M[3 * r + 2] * Rq[6 + k];
     }
     g.a0 = g.T[0] * g.T[0] * g.sf2[0] + g.T[1] * g.T[1] * g.sf2[1] + g.T[2] * g.T[2] * g.sf2[2];
     g.b = g.T[0] * g.T[3] * g.sf2[0] + g.T[1] * g.T[4] * g.sf2[1] + g.T[2] * g.T[5] * g.sf2[2];
@@ -229,6 +243,10 @@ SPL_INLINE float3 view_dir(const float3 mu, const FrameCam& cam, float& dist) {
     const float inv = rsqrtf(l2);
     dist = l2 * inv;
     return make_float3(d.x * inv, d.y * inv, d.z * inv);
+}
+
+SPL_INLINE float3 load3(const float* __restrict__ a, uint32_t p) {
+    return make_float3(a[3 * p], a[3 * p + 1], a[3 * p + 2]);
 }
 
 // ---------------------------------------------------------------- preprocess_fwd
@@ -277,8 +295,9 @@ SPL_INLINE uint32_t chunk_lookback(uint32_t* lb, uint32_t chunk, uint32_t total,
 // compacts visible primitives in order into v-space (decoupled look-back over `lookback`):
 // vis_idx, rec, depth_key = float bits of z (z > 0, so monotone), depth_val = v, n_tiles,
 // zeroes g2d[.][v] (+ abs, extra), writes vis_mask words, last_visible[p] = iteration and
-// status[ST_N_VIS]. chunk_ctr and lookback are zero on entry (memset by the stage function).
-extern "C" __global__ void __launch_bounds__(PRE_THREADS)
+// status[ST_N_VIS]. Records are staged in shared memory and written out as contiguous
+// float4 runs. chunk_ctr and lookback are zero on entry (memset by the stage function).
+extern "C" __global__ void __launch_bounds__(PRE_THREADS, PRE_FWD_MIN_BLOCKS)
     preprocess_fwd(const IterParams* __restrict__ params, const FrameCam* __restrict__ cam_p,
                    const float* __restrict__ mean, const float* __restrict__ log_scale,
                    const float4* __restrict__ quat, const float* __restrict__ opacity,
@@ -289,100 +308,111 @@ extern "C" __global__ void __launch_bounds__(PRE_THREADS)
                    uint32_t* __restrict__ depth_val, uint32_t* __restrict__ n_tiles, float* __restrict__ g2d,
                    float* __restrict__ g2d_abs, float* __restrict__ g2d_extra, uint32_t* __restrict__ chunk_ctr,
                    uint32_t* __restrict__ lookback, uint32_t* __restrict__ status) {
-    __shared__ uint32_t s_chunk;
+    __shared__ FrameCam s_cam;
+    __shared__ FrameParams s_fp;
+    __shared__ uint32_t s_chunk, s_base, s_count;
     __shared__ uint32_t s_warp[PRE_THREADS / 32];
-    const FrameCam cam = *cam_p;
-    const FrameParams fp = params->frame;
-    const uint32_t n = min(fp.n_gaussians, n_cap);
-    const uint32_t deg = min(fp.sh_degree, (uint32_t)MAX_SH_DEGREE);
-    const uint32_t n_rest = sh_rest_count(deg);
-    const uint32_t n_chunks = (n + PRE_THREADS - 1) / PRE_THREADS;
+    __shared__ float4 s_rec[3 * PRE_THREADS];   // records of this chunk, by thread
+    __shared__ uint32_t s_ntl[PRE_THREADS];     // tile counts, by thread
+    __shared__ uint16_t s_src[PRE_THREADS];     // thread of the r-th visible Gaussian
+    stage_frame(cam_p, params, s_cam, s_fp);
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
 
     for (;;) {
         if (threadIdx.x == 0) s_chunk = atomicAdd(chunk_ctr, 1u);
         __syncthreads();
+        const uint32_t n = min(s_fp.n_gaussians, n_cap);
+        const uint32_t n_chunks = (n + PRE_THREADS - 1) / PRE_THREADS;
         const uint32_t chunk = s_chunk;
         if (chunk >= n_chunks) break;
         const uint32_t p = chunk * PRE_THREADS + threadIdx.x;
 
-        Proj g;
-        bool alive = p < n && project(p, cam, fp.flags, fp.eps2d, mean, log_scale, quat, opacity, filter3d, g);
-        SplatRec r;
-        SpanEllipse e;
-        int px0 = 0, px1 = -1, py0 = 0, py1 = -1, ty0 = 0, ty1 = -1;
-        if (alive) {
-            const float inv = 1.f / g.det;
-            const float A = g.c * inv, B = -g.b * inv, C = g.a * inv;
-            r.mx = cam.fx * g.x + cam.cx;
-            r.my = cam.fy * g.y + cam.cy;
-            r.ca = CONIC_SCALE_AC * A;
-            r.cb = CONIC_SCALE_B * B;
-            r.cc = CONIC_SCALE_AC * C;
-            r.o = g.oeff;
-            r.pthr = fmaxf(__log2f(255.f * g.oeff), 0.f);
-            r.z = g.pc.z;
-            e = span_ellipse(r, fp.box_beta);
-            alive = e.det > 0.f && span_pixel_box(e, cam.width, cam.height, px0, px1, py0, py1);
-            ty0 = py0 / TILE_H;
-            ty1 = py1 / TILE_H;
-        }
-        // Tile count: small spans per lane, large ones by the whole warp.
-        uint32_t ntl = 0;
-        const int rows = alive ? ty1 - ty0 + 1 : 0;
-        if (alive && rows <= SPAN_LANE_ROWS) {
-            for (int ty = ty0; ty <= ty1; ++ty) {
-                int a0, a1;
-                ntl += span_tile_row(e, ty, px0, px1, py0, py1, a0, a1);
+        bool vis;
+        {
+            const FrameCam& cam = s_cam;
+            const uint32_t flags = s_fp.flags;
+            Proj g;
+            const float3 mu = p < n ? load3(mean, p) : make_float3(0.f, 0.f, -1.f);
+            bool alive = p < n && project(p, mu, cam, flags, s_fp.eps2d, log_scale, quat, opacity, filter3d, g);
+            SplatRec r;
+            SpanEllipse e;
+            int px0 = 0, px1 = -1, py0 = 0, py1 = -1, ty0 = 0, ty1 = -1;
+            if (alive) {
+                const float inv = 1.f / g.det;
+                r.mx = cam.fx * g.x + cam.cx;
+                r.my = cam.fy * g.y + cam.cy;
+                r.ca = CONIC_SCALE_AC * (g.c * inv);
+                r.cb = CONIC_SCALE_B * (-g.b * inv);
+                r.cc = CONIC_SCALE_AC * (g.a * inv);
+                r.o = g.oeff;
+                r.pthr = fmaxf(__log2f(255.f * g.oeff), 0.f);
+                r.z = g.pc.z;
+                e = span_ellipse(r, s_fp.box_beta);
+                alive = e.det > 0.f && span_pixel_box(e, cam.width, cam.height, px0, px1, py0, py1);
+                ty0 = py0 / TILE_H;
+                ty1 = py1 / TILE_H;
             }
-        }
-        uint32_t big = __ballot_sync(FULL_MASK, rows > SPAN_LANE_ROWS);
-        while (big) {
-            const int src = __ffs(big) - 1;
-            big &= big - 1u;
-            SpanEllipse eb;
-            eb.mx = __shfl_sync(FULL_MASK, e.mx, src);
-            eb.my = __shfl_sync(FULL_MASK, e.my, src);
-            eb.A = __shfl_sync(FULL_MASK, e.A, src);
-            eb.B = __shfl_sync(FULL_MASK, e.B, src);
-            eb.C = __shfl_sync(FULL_MASK, e.C, src);
-            eb.det = __shfl_sync(FULL_MASK, e.det, src);
-            eb.k = __shfl_sync(FULL_MASK, e.k, src);
-            eb.x_ext = __shfl_sync(FULL_MASK, e.x_ext, src);
-            eb.y_ext = __shfl_sync(FULL_MASK, e.y_ext, src);
-            const int bx0 = __shfl_sync(FULL_MASK, px0, src), bx1 = __shfl_sync(FULL_MASK, px1, src);
-            const int by0 = __shfl_sync(FULL_MASK, py0, src), by1 = __shfl_sync(FULL_MASK, py1, src);
-            const int bt0 = __shfl_sync(FULL_MASK, ty0, src), bt1 = __shfl_sync(FULL_MASK, ty1, src);
-            uint32_t cnt = 0;
-            for (int ty = bt0 + (int)lane; ty <= bt1; ty += 32) {
-                int a0, a1;
-                cnt += span_tile_row(eb, ty, bx0, bx1, by0, by1, a0, a1);
-            }
-            cnt = __reduce_add_sync(FULL_MASK, cnt);
-            if ((int)lane == src) ntl = cnt;
-        }
-        const bool vis = alive && ntl > 0;
-
-        // Colour (visible only): 0.5 + SH, clamped at 0 (spec-raster 2.7).
-        if (vis) {
-            float dist;
-            const float3 d = view_dir(g.mu, cam, dist);
-            float Y[15];
-            sh_basis(deg, d.x, d.y, d.z, Y);
-            float col[3];
-#pragma unroll
-            for (int ch = 0; ch < 3; ++ch) col[ch] = 0.5f + SH_C0 * sh_dc[3 * p + ch];
-#pragma unroll
-            for (int k = 0; k < 15; ++k) {
-                if ((uint32_t)k < n_rest) {
-#pragma unroll
-                    for (int ch = 0; ch < 3; ++ch) col[ch] += Y[k] * sh_rest[(size_t)(3 * k + ch) * n_cap + p];
+            // Tile count: small spans per lane, large ones by the whole warp.
+            uint32_t ntl = 0;
+            const int rows = alive ? ty1 - ty0 + 1 : 0;
+            if (alive && rows <= SPAN_LANE_ROWS) {
+                for (int ty = ty0; ty <= ty1; ++ty) {
+                    int a0, a1;
+                    ntl += span_tile_row(e, ty, px0, px1, py0, py1, a0, a1);
                 }
             }
-            r.flags = (col[0] <= 0.f ? 1u : 0u) | (col[1] <= 0.f ? 2u : 0u) | (col[2] <= 0.f ? 4u : 0u);
-            r.r = fmaxf(col[0], 0.f);
-            r.g = fmaxf(col[1], 0.f);
-            r.b = fmaxf(col[2], 0.f);
+            uint32_t big = __ballot_sync(FULL_MASK, rows > SPAN_LANE_ROWS);
+            while (big) {
+                const int src = __ffs(big) - 1;
+                big &= big - 1u;
+                SpanEllipse eb;
+                eb.mx = __shfl_sync(FULL_MASK, e.mx, src);
+                eb.my = __shfl_sync(FULL_MASK, e.my, src);
+                eb.A = __shfl_sync(FULL_MASK, e.A, src);
+                eb.B = __shfl_sync(FULL_MASK, e.B, src);
+                eb.C = __shfl_sync(FULL_MASK, e.C, src);
+                eb.det = __shfl_sync(FULL_MASK, e.det, src);
+                eb.k = __shfl_sync(FULL_MASK, e.k, src);
+                eb.x_ext = __shfl_sync(FULL_MASK, e.x_ext, src);
+                eb.y_ext = __shfl_sync(FULL_MASK, e.y_ext, src);
+                const int bx0 = __shfl_sync(FULL_MASK, px0, src), bx1 = __shfl_sync(FULL_MASK, px1, src);
+                const int by0 = __shfl_sync(FULL_MASK, py0, src), by1 = __shfl_sync(FULL_MASK, py1, src);
+                const int bt0 = __shfl_sync(FULL_MASK, ty0, src), bt1 = __shfl_sync(FULL_MASK, ty1, src);
+                uint32_t cnt = 0;
+                for (int ty = bt0 + (int)lane; ty <= bt1; ty += 32) {
+                    int a0, a1;
+                    cnt += span_tile_row(eb, ty, bx0, bx1, by0, by1, a0, a1);
+                }
+                cnt = __reduce_add_sync(FULL_MASK, cnt);
+                if ((int)lane == src) ntl = cnt;
+            }
+            vis = alive && ntl > 0;
+
+            // Colour (visible only): 0.5 + SH, clamped at 0 (spec-raster 2.7).
+            if (vis) {
+                float dist;
+                const float3 d = view_dir(mu, cam, dist);
+                const float xx = d.x * d.x, yy = d.y * d.y, zz = d.z * d.z;
+                const uint32_t deg = min(s_fp.sh_degree, (uint32_t)MAX_SH_DEGREE);
+                const uint32_t n_rest = sh_rest_count(deg);
+                float col[3];
+#pragma unroll
+                for (int ch = 0; ch < 3; ++ch) col[ch] = 0.5f + SH_C0 * sh_dc[3 * p + ch];
+#pragma unroll
+                for (int k = 0; k < 15; ++k) {
+                    if ((uint32_t)k < n_rest) {
+                        const float y = sh_y(k, d.x, d.y, d.z, xx, yy, zz);
+#pragma unroll
+                        for (int ch = 0; ch < 3; ++ch) col[ch] += y * sh_rest[(size_t)(3 * k + ch) * n_cap + p];
+                    }
+                }
+                const uint32_t cf = (col[0] <= 0.f ? 1u : 0u) | (col[1] <= 0.f ? 2u : 0u) | (col[2] <= 0.f ? 4u : 0u);
+                s_rec[3 * threadIdx.x] = make_float4(r.mx, r.my, r.ca, r.cb);
+                s_rec[3 * threadIdx.x + 1] = make_float4(r.cc, r.o, fmaxf(col[0], 0.f), fmaxf(col[1], 0.f));
+                s_rec[3 * threadIdx.x + 2] = make_float4(fmaxf(col[2], 0.f), r.pthr, r.z, __uint_as_float(cf));
+                s_ntl[threadIdx.x] = ntl;
+                last_visible[p] = s_fp.iteration;
+            }
         }
 
         // Order-preserving compaction: block scan, then look-back over chunks.
@@ -403,38 +433,43 @@ extern "C" __global__ void __launch_bounds__(PRE_THREADS)
             }
             const uint32_t total = __shfl_sync(FULL_MASK, incl, PRE_THREADS / 32 - 1);
             const uint32_t base = chunk_lookback(lookback, chunk, total, lane);
-            if (lane < PRE_THREADS / 32) s_warp[lane] = base + incl - cnt;
-            if (lane == 0 && chunk == n_chunks - 1) status[ST_N_VIS] = base + total;
-        }
-        __syncthreads();
-        if (vis) {
-            const uint32_t v = s_warp[warp] + __popc(ballot & lanemask_lt());
-            if (v < v_cap) {
-                vis_idx[v] = p;
-                float4* dst = (float4*)(rec + v);
-                dst[0] = make_float4(r.mx, r.my, r.ca, r.cb);
-                dst[1] = make_float4(r.cc, r.o, r.r, r.g);
-                dst[2] = make_float4(r.b, r.pthr, r.z, __uint_as_float(r.flags));
-                depth_key[v] = __float_as_uint(r.z);
-                depth_val[v] = v;
-                n_tiles[v] = ntl;
-#pragma unroll
-                for (int j = 0; j < 9; ++j) g2d[(size_t)j * v_cap + v] = 0.f;
-                if (g2d_abs) {
-                    g2d_abs[v] = 0.f;
-                    g2d_abs[(size_t)v_cap + v] = 0.f;
-                }
-                if (g2d_extra) {
-#pragma unroll
-                    for (int j = 0; j < EXTRA_CH; ++j) g2d_extra[(size_t)j * v_cap + v] = 0.f;
-                }
-                last_visible[p] = fp.iteration;
-            } else {
-                atomicOr(&status[ST_OVERFLOW], OVF_VISIBLE);
+            if (lane < PRE_THREADS / 32) s_warp[lane] = incl - cnt;
+            if (lane == 0) {
+                s_base = base;
+                s_count = total;
+                if (chunk == n_chunks - 1) status[ST_N_VIS] = base + total;
+                if (base + total > v_cap) atomicOr(&status[ST_OVERFLOW], OVF_VISIBLE);
             }
         }
-        // No barrier needed here: s_chunk and s_warp are rewritten next round only by
-        // threads that passed its first barrier, after every read of this round.
+        __syncthreads();
+        if (vis) s_src[s_warp[warp] + __popc(ballot & lanemask_lt())] = (uint16_t)threadIdx.x;
+        __syncthreads();
+
+        // Coalesced write-out of the chunk's visible Gaussians at [base, base + count).
+        const uint32_t base = s_base;
+        const uint32_t count = base < v_cap ? min(s_count, v_cap - base) : 0u;
+        for (uint32_t r = threadIdx.x; r < count; r += PRE_THREADS) {
+            const uint32_t v = base + r;
+            const uint32_t src = s_src[r];
+            vis_idx[v] = chunk * PRE_THREADS + src;
+            depth_key[v] = __float_as_uint(s_rec[3 * src + 2].z);
+            depth_val[v] = v;
+            n_tiles[v] = s_ntl[src];
+#pragma unroll
+            for (int j = 0; j < 9; ++j) g2d[(size_t)j * v_cap + v] = 0.f;
+            if (g2d_abs) {
+                g2d_abs[v] = 0.f;
+                g2d_abs[(size_t)v_cap + v] = 0.f;
+            }
+            if (g2d_extra) {
+#pragma unroll
+                for (int j = 0; j < EXTRA_CH; ++j) g2d_extra[(size_t)j * v_cap + v] = 0.f;
+            }
+        }
+        float4* dst = (float4*)(rec + base);
+        for (uint32_t j = threadIdx.x; j < 3 * count; j += PRE_THREADS) dst[j] = s_rec[3 * s_src[j / 3] + j % 3];
+        // No barrier needed here: shared state is rewritten next round only after its first
+        // barrier, which every thread reaches after its reads of this round.
     }
 }
 
@@ -454,7 +489,9 @@ SPL_INLINE void sink_put(float* __restrict__ grad, size_t i, float g, bool overw
 // With FLAG_CAM_GRAD and cam_partial, per-block sums of (g_rho, g_phi, g_fx W, g_fy H,
 // g_cx W, g_cy H) go to cam_partial[block][CAM_GRAD_N] (fixed grid: deterministic).
 // With FLAG_DENSIFY_STATS and stat_vis_count, the densification statistics accumulate at p.
-extern "C" __global__ void __launch_bounds__(PRE_THREADS)
+// The SH part runs first and the geometry part retires its temporaries in order, so the
+// kernel fits PRE_BWD_MIN_BLOCKS blocks per SM.
+extern "C" __global__ void __launch_bounds__(PRE_THREADS, PRE_BWD_MIN_BLOCKS)
     preprocess_bwd(const IterParams* __restrict__ params, const FrameCam* __restrict__ cam_p,
                    const float* __restrict__ mean, const float* __restrict__ log_scale,
                    const float4* __restrict__ quat, const float* __restrict__ opacity,
@@ -469,94 +506,151 @@ extern "C" __global__ void __launch_bounds__(PRE_THREADS)
                    float* __restrict__ stat_grad_sum, float* __restrict__ stat_grad_abs_sum,
                    const uint32_t* __restrict__ status) {
     if (status[ST_OVERFLOW]) return;
-    __shared__ float s_cam[PRE_THREADS / 32][CAM_GRAD_N];
-    const FrameCam cam = *cam_p;
-    const FrameParams fp = params->frame;
+    __shared__ FrameCam s_cam;
+    __shared__ FrameParams s_fp;
+    __shared__ float s_red[PRE_THREADS / 32][CAM_GRAD_N];
+    stage_frame(cam_p, params, s_cam, s_fp);
+    __syncthreads();
+    const FrameCam& cam = s_cam;
     const uint32_t ow = params->adam.overwrite_mask;
     const uint32_t V = min(status[ST_N_VIS], v_cap);
-    const uint32_t deg = min(fp.sh_degree, (uint32_t)MAX_SH_DEGREE);
-    const uint32_t n_rest = sh_rest_count(deg);
-    const bool want_cam = cam_partial && (fp.flags & FLAG_CAM_GRAD);
-    const bool want_stats = stat_vis_count && (fp.flags & FLAG_DENSIFY_STATS);
-    const bool aa_grad = (fp.flags & FLAG_AA) && (fp.flags & FLAG_AA_GRAD);
+    const uint32_t flags = s_fp.flags;
+    const bool want_cam = cam_partial && (flags & FLAG_CAM_GRAD);
+    const bool want_stats = stat_vis_count && (flags & FLAG_DENSIFY_STATS);
+    const bool write = sink == SINK_WRITE;
+    // Bits of AdamIterPlan.overwrite_mask: GROUP_* order of adam.cuh.
+    const bool o_mean = ow & 1u, o_scale = ow & 2u, o_rot = ow & 4u, o_op = ow & 8u, o_dc = ow & 16u,
+               o_rest = ow & 32u;
     float acc[CAM_GRAD_N];
 #pragma unroll
     for (int i = 0; i < CAM_GRAD_N; ++i) acc[i] = 0.f;
 
     for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < V; v += gridDim.x * blockDim.x) {
         const uint32_t p = vis_idx[v];
-        const float gmx = g2d[v], gmy = g2d[(size_t)v_cap + v];
-        const float gA = g2d[2 * (size_t)v_cap + v], gB = g2d[3 * (size_t)v_cap + v];
-        const float gC = g2d[4 * (size_t)v_cap + v], go = g2d[5 * (size_t)v_cap + v];
-        float gcol[3] = {g2d[6 * (size_t)v_cap + v], g2d[7 * (size_t)v_cap + v], g2d[8 * (size_t)v_cap + v]};
-        const float gz_extra = (EXTRA_CH > 0 && g2d_extra) ? g2d_extra[v] : 0.f;
+        const float3 mu = load3(mean, p);
 
-        Proj g;
-        // Visible in the forward, so the culls pass again (same inputs, same code).
-        project(p, cam, fp.flags, fp.eps2d, mean, log_scale, quat, opacity, filter3d, g);
-
-        // ---- SH colour (spec-raster 5.3 step 8)
-        float dist;
-        const float3 d = view_dir(g.mu, cam, dist);
-        float Y[15];
-        sh_basis(deg, d.x, d.y, d.z, Y);
-        float f[15][3];
-        float raw[3];
-#pragma unroll
-        for (int ch = 0; ch < 3; ++ch) raw[ch] = 0.5f + SH_C0 * sh_dc[3 * p + ch];
-#pragma unroll
-        for (int k = 0; k < 15; ++k) {
+        // ---- SH colour (spec-raster 5.3 step 8), one pass over the coefficients: raw colour
+        // for the clamp mask, and D_c = sum_k f_kc dY_k/dd per channel for the direction.
+        float3 gmu_sh;
+        {
+            const uint32_t deg = min(s_fp.sh_degree, (uint32_t)MAX_SH_DEGREE);
+            const uint32_t n_rest = sh_rest_count(deg);
+            float dist;
+            const float3 d = view_dir(mu, cam, dist);
+            const float xx = d.x * d.x, yy = d.y * d.y, zz = d.z * d.z;
+            float raw[3];
+            float3 D[3];
 #pragma unroll
             for (int ch = 0; ch < 3; ++ch) {
-                f[k][ch] = (uint32_t)k < n_rest ? sh_rest[(size_t)(3 * k + ch) * n_cap + p] : 0.f;
-                raw[ch] += Y[k] * f[k][ch];
+                raw[ch] = 0.5f + SH_C0 * sh_dc[3 * p + ch];
+                D[ch] = make_float3(0.f, 0.f, 0.f);
+            }
+#pragma unroll
+            for (int k = 0; k < 15; ++k) {
+                if ((uint32_t)k < n_rest) {
+                    const float y = sh_y(k, d.x, d.y, d.z, xx, yy, zz);
+                    const float3 dy = sh_dy(k, d.x, d.y, d.z, xx, yy, zz);
+#pragma unroll
+                    for (int ch = 0; ch < 3; ++ch) {
+                        const float f = sh_rest[(size_t)(3 * k + ch) * n_cap + p];
+                        raw[ch] += y * f;
+                        D[ch].x += f * dy.x;
+                        D[ch].y += f * dy.y;
+                        D[ch].z += f * dy.z;
+                    }
+                }
+            }
+            float gr[3];
+#pragma unroll
+            for (int ch = 0; ch < 3; ++ch) gr[ch] = raw[ch] > 0.f ? g2d[(size_t)(6 + ch) * v_cap + v] : 0.f;
+            const float3 gd = make_float3(gr[0] * D[0].x + gr[1] * D[1].x + gr[2] * D[2].x,
+                                          gr[0] * D[0].y + gr[1] * D[1].y + gr[2] * D[2].y,
+                                          gr[0] * D[0].z + gr[1] * D[1].z + gr[2] * D[2].z);
+            const float gdd = gd.x * d.x + gd.y * d.y + gd.z * d.z;
+            const float idist = 1.f / dist;
+            gmu_sh = make_float3((gd.x - gdd * d.x) * idist, (gd.y - gdd * d.y) * idist, (gd.z - gdd * d.z) * idist);
+            if (write) {
+#pragma unroll
+                for (int ch = 0; ch < 3; ++ch) sink_put(grad_sh_dc, 3 * (size_t)p + ch, SH_C0 * gr[ch], o_dc);
+#pragma unroll
+                for (int k = 0; k < 15; ++k) {
+                    if ((uint32_t)k < n_rest || o_rest) {
+                        const float y = (uint32_t)k < n_rest ? sh_y(k, d.x, d.y, d.z, xx, yy, zz) : 0.f;
+#pragma unroll
+                        for (int ch = 0; ch < 3; ++ch)
+                            sink_put(grad_sh_rest, (size_t)(3 * k + ch) * n_cap + p, y * gr[ch], o_rest);
+                    }
+                }
             }
         }
-#pragma unroll
-        for (int ch = 0; ch < 3; ++ch) gcol[ch] = raw[ch] > 0.f ? gcol[ch] : 0.f;
-        float w[15];
-#pragma unroll
-        for (int k = 0; k < 15; ++k) w[k] = f[k][0] * gcol[0] + f[k][1] * gcol[1] + f[k][2] * gcol[2];
-        const float3 gd = sh_basis_vjp(deg, d.x, d.y, d.z, w);
-        const float gdd = gd.x * d.x + gd.y * d.y + gd.z * d.z;
-        const float idist = 1.f / dist;
-        const float3 gmu_sh =
-            make_float3((gd.x - gdd * d.x) * idist, (gd.y - gdd * d.y) * idist, (gd.z - gdd * d.z) * idist);
 
-        // ---- conic -> 2D covariance (step 1), compensation (step 2)
-        const float id2 = 1.f / (g.det * g.det);
-        float ga = (-g.c * g.c * gA + g.b * g.c * gB - g.b * g.b * gC) * id2;
-        float gb = (2.f * g.b * g.c * gA - (g.a * g.c + g.b * g.b) * gB + 2.f * g.a * g.b * gC) * id2;
-        float gc = (-g.b * g.b * gA + g.a * g.b * gB - g.a * g.a * gC) * id2;
-        if (aa_grad) {
-            const float rr = go * g.o * g.c3 * 0.5f / g.c2;
-            ga += rr * (g.c0 * g.det - g.det0 * g.c) * id2;
-            gc += rr * (g.a0 * g.det - g.det0 * g.a) * id2;
-            gb += rr * (-2.f * g.b * (g.det - g.det0)) * id2;
+        // ---- geometry: recompute the projection (visible in the forward, so no cull fires).
+        const float gmx = g2d[v], gmy = g2d[(size_t)v_cap + v];
+        const float go = g2d[5 * (size_t)v_cap + v];
+        Proj g;
+        project(p, mu, cam, flags, s_fp.eps2d, log_scale, quat, opacity, filter3d, g);
+
+        // conic -> 2D covariance (step 1), compensation (step 2), opacity
+        float ga, gb, gc;
+        {
+            const float gA = g2d[2 * (size_t)v_cap + v], gB = g2d[3 * (size_t)v_cap + v];
+            const float gC = g2d[4 * (size_t)v_cap + v];
+            const float id2 = 1.f / (g.det * g.det);
+            ga = (-g.c * g.c * gA + g.b * g.c * gB - g.b * g.b * gC) * id2;
+            gb = (2.f * g.b * g.c * gA - (g.a * g.c + g.b * g.b) * gB + 2.f * g.a * g.b * gC) * id2;
+            gc = (-g.b * g.b * gA + g.a * g.b * gB - g.a * g.a * gC) * id2;
+            if ((flags & FLAG_AA) && (flags & FLAG_AA_GRAD)) {
+                const float rr = go * g.o * g.c3 * 0.5f / g.c2;
+                ga += rr * (g.c0 * g.det - g.det0 * g.c) * id2;
+                gc += rr * (g.a0 * g.det - g.det0 * g.a) * id2;
+                gb += rr * (-2.f * g.b * (g.det - g.det0)) * id2;
+            }
+            if (write) sink_put(grad_opacity, p, go * g.c2 * g.c3 * g.o * (1.f - g.o), o_op);
         }
-        const float g_ohat = go * g.c2 * g.c3 * g.o * (1.f - g.o);
 
-        // ---- Sigma2 = T diag(sf2) T^T (steps 3, 6)
-        float gsf2[3], dT[6];
+        // Sigma2 = T diag(sf2) T^T (steps 3, 6): scales, then dT
+        float dT[6];
 #pragma unroll
         for (int k = 0; k < 3; ++k) {
             const float t1 = g.T[k], t2 = g.T[3 + k];
-            gsf2[k] = ga * t1 * t1 + gb * t1 * t2 + gc * t2 * t2;
+            float gs = 2.f * g.s2[k] * (ga * t1 * t1 + gb * t1 * t2 + gc * t2 * t2);
+            if (g.v3 > 0.f) gs += go * g.oeff * g.v3 / g.sf2[k];
+            if (write) sink_put(grad_log_scale, 3 * (size_t)p + k, gs, o_scale);
             dT[k] = 2.f * g.sf2[k] * (ga * t1 + 0.5f * gb * t2);
             dT[3 + k] = 2.f * g.sf2[k] * (0.5f * gb * t1 + gc * t2);
         }
-        // T = M R_q: dR_q = M^T dT, dM = dT R_q^T
-        float dRq[9], dM[6];
+        // T = M R_q: dM = dT R_q^T, then dR_q = M^T dT -> quaternion (step 7)
+        float dM[6];
+        {
+            float Rq[9];
+            quat_to_rotmat(g.qn[0], g.qn[1], g.qn[2], g.qn[3], Rq);
 #pragma unroll
-        for (int j = 0; j < 3; ++j) {
+            for (int r = 0; r < 2; ++r) {
 #pragma unroll
-            for (int k = 0; k < 3; ++k) dRq[3 * j + k] = g.M[j] * dT[k] + g.M[3 + j] * dT[3 + k];
+                for (int j = 0; j < 3; ++j)
+                    dM[3 * r + j] = dT[3 * r] * Rq[3 * j] + dT[3 * r + 1] * Rq[3 * j + 1] + dT[3 * r + 2] * Rq[3 * j + 2];
+            }
         }
+        {
+            float dRq[9];
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
+            for (int j = 0; j < 3; ++j) {
 #pragma unroll
-            for (int j = 0; j < 3; ++j)
-                dM[3 * r + j] = dT[3 * r] * g.Rq[3 * j] + dT[3 * r + 1] * g.Rq[3 * j + 1] + dT[3 * r + 2] * g.Rq[3 * j + 2];
+                for (int k = 0; k < 3; ++k) dRq[3 * j + k] = g.M[j] * dT[k] + g.M[3 + j] * dT[3 + k];
+            }
+            const float4 gqu = quat_to_rotmat_vjp(g.qn[0], g.qn[1], g.qn[2], g.qn[3], dRq);
+            const float gdot = gqu.x * g.qn[0] + gqu.y * g.qn[1] + gqu.z * g.qn[2] + gqu.w * g.qn[3];
+            const float4 gq = make_float4((gqu.x - gdot * g.qn[0]) * g.qinv, (gqu.y - gdot * g.qn[1]) * g.qinv,
+                                          (gqu.z - gdot * g.qn[2]) * g.qinv, (gqu.w - gdot * g.qn[3]) * g.qinv);
+            if (write) {
+                float4* gq4 = (float4*)grad_quat + p;
+                if (o_rot) {
+                    *gq4 = gq;
+                } else {
+                    const float4 old = *gq4;
+                    *gq4 = make_float4(old.x + gq.x, old.y + gq.y, old.z + gq.z, old.w + gq.w);
+                }
+            }
         }
         // M = J R_cam: dJ = dM R_cam^T (step 4)
         const float* R = cam.R;
@@ -568,61 +662,22 @@ extern "C" __global__ void __launch_bounds__(PRE_THREADS)
                 dJ[3 * r + i] = dM[3 * r] * R[3 * i] + dM[3 * r + 1] * R[3 * i + 1] + dM[3 * r + 2] * R[3 * i + 2];
         }
 
-        // ---- J and mean2d -> camera-space mean (step 5)
+        // J and mean2d -> camera-space mean (step 5), then the world mean
         const float fx = cam.fx, fy = cam.fy, rz = g.rz, rz2 = rz * rz;
+        const float gz_extra = (EXTRA_CH > 0 && g2d_extra) ? g2d_extra[v] : 0.f;
         float3 gp;
         gp.x = fx * rz * gmx - (g.in_x ? fx * rz2 * dJ[2] : 0.f);
         gp.y = fy * rz * gmy - (g.in_y ? fy * rz2 * dJ[5] : 0.f);
         gp.z = -fx * g.x * rz * gmx - fy * g.y * rz * gmy - fx * rz2 * dJ[0] - fy * rz2 * dJ[4] +
                (g.in_x ? 2.f : 1.f) * fx * g.xc * rz2 * dJ[2] + (g.in_y ? 2.f : 1.f) * fy * g.yc * rz2 * dJ[5] +
                gz_extra;
-        float3 gmu;
-        gmu.x = R[0] * gp.x + R[3] * gp.y + R[6] * gp.z + gmu_sh.x;
-        gmu.y = R[1] * gp.x + R[4] * gp.y + R[7] * gp.z + gmu_sh.y;
-        gmu.z = R[2] * gp.x + R[5] * gp.y + R[8] * gp.z + gmu_sh.z;
-
-        // ---- scales (step 6) and quaternion (step 7)
-        float gs[3];
-#pragma unroll
-        for (int k = 0; k < 3; ++k) {
-            gs[k] = 2.f * g.s2[k] * gsf2[k];
-            if (g.v3 > 0.f) gs[k] += go * g.oeff * g.v3 / g.sf2[k];
-        }
-        const float4 gqu = quat_to_rotmat_vjp(g.qn[0], g.qn[1], g.qn[2], g.qn[3], dRq);
-        const float gdot = gqu.x * g.qn[0] + gqu.y * g.qn[1] + gqu.z * g.qn[2] + gqu.w * g.qn[3];
-        const float4 gq = make_float4((gqu.x - gdot * g.qn[0]) * g.qinv, (gqu.y - gdot * g.qn[1]) * g.qinv,
-                                      (gqu.z - gdot * g.qn[2]) * g.qinv, (gqu.w - gdot * g.qn[3]) * g.qinv);
-
-        // ---- sink
-        if (sink == SINK_WRITE) {
-            // Bits of AdamIterPlan.overwrite_mask: GROUP_* order of adam.cuh.
-            const bool o_mean = ow & 1u, o_scale = ow & 2u, o_rot = ow & 4u, o_op = ow & 8u;
-            const bool o_dc = ow & 16u, o_rest = ow & 32u;
-            sink_put(grad_mean, 3 * (size_t)p, gmu.x, o_mean);
-            sink_put(grad_mean, 3 * (size_t)p + 1, gmu.y, o_mean);
-            sink_put(grad_mean, 3 * (size_t)p + 2, gmu.z, o_mean);
-#pragma unroll
-            for (int k = 0; k < 3; ++k) sink_put(grad_log_scale, 3 * (size_t)p + k, gs[k], o_scale);
-            if (o_rot) {
-                ((float4*)grad_quat)[p] = gq;
-            } else {
-                float4 old = ((float4*)grad_quat)[p];
-                ((float4*)grad_quat)[p] = make_float4(old.x + gq.x, old.y + gq.y, old.z + gq.z, old.w + gq.w);
-            }
-            sink_put(grad_opacity, p, g_ohat, o_op);
-#pragma unroll
-            for (int ch = 0; ch < 3; ++ch) sink_put(grad_sh_dc, 3 * (size_t)p + ch, SH_C0 * gcol[ch], o_dc);
-#pragma unroll
-            for (int k = 0; k < 15; ++k) {
-                if ((uint32_t)k < n_rest || o_rest) {
-#pragma unroll
-                    for (int ch = 0; ch < 3; ++ch)
-                        sink_put(grad_sh_rest, (size_t)(3 * k + ch) * n_cap + p, Y[k] * gcol[ch], o_rest);
-                }
-            }
+        if (write) {
+            sink_put(grad_mean, 3 * (size_t)p, R[0] * gp.x + R[3] * gp.y + R[6] * gp.z + gmu_sh.x, o_mean);
+            sink_put(grad_mean, 3 * (size_t)p + 1, R[1] * gp.x + R[4] * gp.y + R[7] * gp.z + gmu_sh.y, o_mean);
+            sink_put(grad_mean, 3 * (size_t)p + 2, R[2] * gp.x + R[5] * gp.y + R[8] * gp.z + gmu_sh.z, o_mean);
         }
 
-        // ---- densification statistics (spec-raster 5.5, NDC units)
+        // densification statistics (spec-raster 5.5, NDC units)
         if (want_stats) {
             const float hw = 0.5f * (float)cam.width, hh = 0.5f * (float)cam.height;
             stat_vis_count[p] += 1.f;
@@ -633,7 +688,7 @@ extern "C" __global__ void __launch_bounds__(PRE_THREADS)
             }
         }
 
-        // ---- camera pose and intrinsics (spec-raster 5.4)
+        // camera pose and intrinsics (spec-raster 5.4)
         if (want_cam) {
             // rho: camera-space mean plus the SH path through the camera centre.
             acc[0] += gp.x + R[0] * gmu_sh.x + R[1] * gmu_sh.y + R[2] * gmu_sh.z;
@@ -659,13 +714,13 @@ extern "C" __global__ void __launch_bounds__(PRE_THREADS)
 #pragma unroll
         for (int i = 0; i < CAM_GRAD_N; ++i) {
             const float s = warp_sum(acc[i]);
-            if (lane == 0) s_cam[warp][i] = s;
+            if (lane == 0) s_red[warp][i] = s;
         }
         __syncthreads();
         if (threadIdx.x < CAM_GRAD_N) {
             float s = 0.f;
 #pragma unroll
-            for (int w2 = 0; w2 < PRE_THREADS / 32; ++w2) s += s_cam[w2][threadIdx.x];
+            for (int w2 = 0; w2 < PRE_THREADS / 32; ++w2) s += s_red[w2][threadIdx.x];
             cam_partial[(size_t)blockIdx.x * CAM_GRAD_N + threadIdx.x] = s;
         }
     }
