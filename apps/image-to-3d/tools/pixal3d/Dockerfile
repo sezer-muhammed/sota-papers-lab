@@ -19,10 +19,12 @@ ENV PIP_NO_CACHE_DIR=1 \
 # Extension wheels built on the host (FlexGEMM, CuMesh, o-voxel, nvdiffrast).
 COPY wheels/ /tmp/wheels/
 
-RUN pip install /tmp/wheels/*.whl \
+RUN pip install --no-deps /tmp/wheels/*.whl \
+ && pip install \
       https://github.com/SHI-Labs/NATTEN/releases/download/v0.21.5/natten-0.21.5+torch290cu128-cp311-cp311-linux_x86_64.whl \
       https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl \
       "transformers>=4.56" easydict trimesh opencv-python-headless imageio zstandard kornia timm safetensors \
+      diffusers accelerate plyfile tqdm huggingface_hub scipy \
  && rm -rf /tmp/wheels
 
 # Pixal3D code (sparse checkout: code only, no hdri/assets).

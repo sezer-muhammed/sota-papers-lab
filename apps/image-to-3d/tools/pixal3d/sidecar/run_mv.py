@@ -18,6 +18,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 
@@ -51,111 +52,89 @@ def main():
 
     t0 = time.time()
     stage_times = []
-    peak_vram = 0.0
 
     input_dir = Path(args.input_dir)
     weights_dir = Path(args.weights_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    transforms = json.loads((input_dir / "transforms.json").read_text())
+    glb_path = str(output_dir / "output.glb")
 
     progress("loading", 0.0)
 
-    # Set up Pixal3D paths.
     sys.path.insert(0, "/opt/pixal3d")
-    os.environ["ATTN_BACKEND"] = "sdpa"
-    os.environ["SPARSE_ATTN_BACKEND"] = "sdpa"
+    os.environ.setdefault("ATTN_BACKEND", "sdpa")
+    os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
+    os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = "/tmp/autotune_cache.json"
+    os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = "1"
 
-    # Import Pixal3D pipeline.
-    from pixal3d.pipelines import Pixal3DMVImageTo3DPipeline
+    from inference_mv import init_pipeline, load_views, check_main_view
+    import o_voxel
 
     progress("loading_pipeline", 0.05)
 
-    # Load pipeline from weights directory.
-    pipeline = Pixal3DMVImageTo3DPipeline.from_pretrained(
-        str(weights_dir),
+    pipeline = init_pipeline(
+        model_path=str(weights_dir),
+        config_file="pipeline_mv.json",
+        device="cuda",
         low_vram=args.low_vram,
     )
-    pipeline.to("cuda")
 
     torch.cuda.reset_peak_memory_stats()
     t_load = time.time() - t0
     stage_times.append({"name": "load", "seconds": t_load})
     progress("loaded", 0.1, vram_mb=torch.cuda.max_memory_allocated() / 1e6)
 
-    # Load images from transforms.json.
-    from PIL import Image
-    images = []
-    c2ws = []
-    fovs = []
+    progress("preprocessing", 0.15)
+    views = load_views(str(input_dir), rembg=None)
+    check_main_view(views)
+    n_views = views["transform_matrix"].shape[1]
+    progress("views_loaded", 0.2, views=n_views)
 
-    for frame in transforms["frames"]:
-        img_path = input_dir / frame["file_path"]
-        img = Image.open(img_path).convert("RGBA")
-        images.append(img)
-        c2ws.append(frame["transform_matrix"])
-        fovs.append(frame.get("camera_angle_x", 0.8))
-
-    n_views = len(images)
-    progress("preprocessing", 0.15, views=n_views)
-
-    # Prepare camera input for the pipeline.
-    import numpy as np
-    c2w_matrices = [np.array(c, dtype=np.float32) for c in c2ws]
-
-    # Run the pipeline.
     t_run = time.time()
+    torch.manual_seed(args.seed)
 
-    try:
-        outputs = pipeline(
-            images,
-            camera_c2ws=c2w_matrices,
-            camera_fovs=fovs,
-            seed=args.seed,
-            steps=12,
-            cfg_strength=7.5,
-            max_num_tokens=args.max_tokens,
-        )
-    except Exception as e:
-        # If the multi-view API is different, try the inference_mv approach.
-        sys.stderr.write(f"Pipeline call failed: {e}\nTrying inference_mv...\n")
-        progress("inference_mv_fallback", 0.2)
-        outputs = run_inference_mv(
-            images, c2w_matrices, fovs, weights_dir, args, progress
-        )
+    pipeline_type = f"{args.resolution}_cascade"
+    progress("inference", 0.25, pipeline_type=pipeline_type)
+
+    mesh_list, (shape_slat, tex_slat, res) = pipeline.run_mv(
+        views,
+        seed=args.seed,
+        return_latent=True,
+        pipeline_type=pipeline_type,
+        max_num_tokens=args.max_tokens,
+    )
 
     t_inference = time.time() - t_run
     stage_times.append({"name": "inference", "seconds": t_inference})
     progress("postprocessing", 0.85)
 
-    # Post-process to GLB.
     t_post = time.time()
-    glb_path = str(output_dir / "output.glb")
+    mesh = mesh_list[0]
 
-    if hasattr(outputs, "meshes") and outputs.meshes:
-        mesh = outputs.meshes[0]
-        if hasattr(mesh, "export"):
-            mesh.export(glb_path)
-        else:
-            # Use o-voxel postprocessing.
-            from o_voxel.postprocess import to_glb
-            to_glb(mesh, glb_path)
-    elif isinstance(outputs, dict) and "mesh" in outputs:
-        mesh = outputs["mesh"]
-        if hasattr(mesh, "export"):
-            mesh.export(glb_path)
-    elif isinstance(outputs, dict) and "glb" in outputs:
-        with open(glb_path, "wb") as f:
-            f.write(outputs["glb"])
-    else:
-        # Try extracting from pipeline output.
-        try:
-            from o_voxel.postprocess import to_glb
-            to_glb(outputs, glb_path, texture_size=2048)
-        except Exception as e2:
-            sys.stderr.write(f"Could not export GLB: {e2}\n")
-            raise
+    glb = o_voxel.postprocess.to_glb(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        attr_volume=mesh.attrs,
+        coords=mesh.coords,
+        attr_layout=pipeline.pbr_attr_layout,
+        grid_size=res,
+        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        decimation_target=1000000,
+        texture_size=4096,
+        remesh=True,
+        remesh_band=1,
+        remesh_project=0,
+        use_tqdm=True,
+    )
+
+    rot = np.array([
+        [-1,  0,  0,  0],
+        [ 0,  0, -1,  0],
+        [ 0, -1,  0,  0],
+        [ 0,  0,  0,  1],
+    ], dtype=np.float64)
+    glb.apply_transform(rot)
+    glb.export(glb_path, extension_webp=True)
 
     t_postprocess = time.time() - t_post
     stage_times.append({"name": "postprocess", "seconds": t_postprocess})
@@ -165,61 +144,6 @@ def main():
 
     progress("done", 1.0, vram_mb=peak_vram)
     result(glb_path, stage_times, peak_vram, total_s)
-
-
-def run_inference_mv(images, c2w_matrices, fovs, weights_dir, args, progress_fn):
-    """Fallback: use inference_mv.py directly."""
-    import tempfile
-    import subprocess
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        # Save images.
-        for i, img in enumerate(images):
-            img.save(tmpdir / f"view_{i:04d}.png")
-
-        # Write transforms.
-        transforms = {
-            "mesh_scale": 1.0,
-            "frames": [
-                {
-                    "file_path": f"view_{i:04d}.png",
-                    "transform_matrix": c2w_matrices[i].tolist()
-                    if hasattr(c2w_matrices[i], "tolist")
-                    else c2w_matrices[i],
-                    "camera_angle_x": fovs[i],
-                }
-                for i in range(len(images))
-            ],
-        }
-        (tmpdir / "transforms.json").write_text(json.dumps(transforms))
-
-        # Call inference_mv.py.
-        cmd = [
-            sys.executable,
-            "/opt/pixal3d/inference_mv.py",
-            "--input_dir", str(tmpdir),
-            "--output_dir", str(tmpdir / "out"),
-            "--pretrained_model_name_or_path", str(weights_dir),
-            "--resolution", str(args.resolution),
-            "--seed", str(args.seed),
-        ]
-        if args.low_vram:
-            cmd.append("--low_vram")
-
-        progress_fn("inference_mv", 0.3)
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            sys.stderr.write(proc.stderr)
-            raise RuntimeError(f"inference_mv.py failed: {proc.returncode}")
-
-        # Find GLB.
-        out_dir = tmpdir / "out"
-        glbs = list(out_dir.glob("**/*.glb"))
-        if not glbs:
-            raise RuntimeError("No GLB produced by inference_mv.py")
-
-        return {"glb": glbs[0].read_bytes()}
 
 
 if __name__ == "__main__":

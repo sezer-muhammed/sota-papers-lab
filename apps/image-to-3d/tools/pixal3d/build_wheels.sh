@@ -34,11 +34,8 @@ clone_if_missing "JeffreyXiang/FlexGEMM" "$SRC/FlexGEMM"
 clone_if_missing "microsoft/TRELLIS.2" "$SRC/TRELLIS.2"
 clone_if_missing "NVlabs/nvdiffrast" "$SRC/nvdiffrast" "v0.4.0"
 
-# CuMesh: submodule of TRELLIS.2 or Pixal3D.
-if [ ! -d "$SRC/CuMesh" ]; then
-  clone_if_missing "xczz/CuMesh" "$SRC/CuMesh"
-  (cd "$SRC/CuMesh" && git submodule update --init --recursive 2>/dev/null || true)
-fi
+# CuMesh: CUDA mesh operations (by JeffreyXiang, same author as TRELLIS.2).
+clone_if_missing "JeffreyXiang/CuMesh" "$SRC/CuMesh"
 
 # Eigen for o-voxel.
 if [ ! -d "$SRC/TRELLIS.2/o-voxel/third_party/eigen" ]; then
@@ -53,8 +50,11 @@ docker run --rm --gpus all \
   -v "$WHEELS:/wheels" \
   -e TORCH_CUDA_ARCH_LIST=8.9 \
   -e MAX_JOBS=8 \
+  -e CUDA_HOME=/usr/local/cuda \
   pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime \
   bash -c '
+    export PATH=/usr/local/cuda/bin:$PATH
+    apt-get update -qq && apt-get install -y -qq gcc g++ git >/dev/null 2>&1
     pip install ninja setuptools wheel
     for pkg in /src/FlexGEMM /src/CuMesh /src/TRELLIS.2/o-voxel /src/nvdiffrast; do
       echo "--- Building $(basename $pkg) ---"

@@ -121,7 +121,7 @@ def fetch_naf():
     hf_hub_download("valeoai/NAF", "naf_release.pth",
                     local_dir=str(naf_dir), local_dir_use_symlinks=False)
 
-# Pipeline config.
+# Pipeline config (strip rembg_model — we supply our own alpha masks).
 def fetch_pipeline():
     cfg_path = out / "pipeline_mv.json"
     if cfg_path.exists():
@@ -130,6 +130,13 @@ def fetch_pipeline():
     print("[dl] pipeline_mv.json ...")
     hf_hub_download(REPO, "pipeline_mv.json",
                     local_dir=str(out), local_dir_use_symlinks=False)
+    with open(str(cfg_path)) as f:
+        cfg = json.load(f)
+    if "rembg_model" in cfg.get("args", {}):
+        del cfg["args"]["rembg_model"]
+        with open(str(cfg_path), "w") as f:
+            json.dump(cfg, f, indent=2)
+        print("[patch] removed rembg_model from pipeline_mv.json (own masks)")
 
 print(f"=== Fetching Pixal3D-mv weights ({profile}) ===")
 for name in MV_DITS:

@@ -4,7 +4,7 @@
 PIXAL3D=f7cf384      # TencentARC/Pixal3D@master, MIT
 TRELLIS2=main         # microsoft/TRELLIS.2 (o-voxel + Eigen), MIT
 FLEXGEMM=main         # JeffreyXiang/FlexGEMM, MIT
-CUMESH=main           # recursive, MIT
+CUMESH=main           # JeffreyXiang/CuMesh, MIT
 NVDIFFRAST=v0.4.0     # NVlabs/nvdiffrast, NVIDIA non-commercial (sidecar only)
 NATTEN=0.21.5         # SHI-Labs/NATTEN prebuilt wheel, MIT
 
