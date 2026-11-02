@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::ensure;
+use kiddo::SquaredEuclidean;
 use rayon::prelude::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,6 @@ use spl_core::{Context, Result, bail};
 use ts_rs::TS;
 
 use super::colmap::{ColmapModel, model_name};
-use crate::gpu::not_implemented;
 use crate::model::GaussiansHost;
 
 /// Where the principal point comes from (spec-train 8.3).
@@ -287,14 +287,83 @@ pub enum InitKind {
     Mcmc,
 }
 
+/// SH zeroth-order normalization constant: `1 / (2·sqrt(π))`.
+const C0: f32 = 0.282_094_79;
+
 /// Point cloud → Gaussians: SH0 from colour, log scale from the mean squared
-/// distance to the 3 nearest neighbours (exact kNN), identity rotation,
-/// opacity logit(0.1) (MCMC: 0.5 and scales × 0.1). STUB (E7): needs the kNN.
-pub fn init_gaussians(_points: &InitPoints, _kind: InitKind) -> Result<GaussiansHost> {
-    Err(not_implemented(
-        "init_gaussians (kNN scales)",
-        "trainer (E7)",
-    ))
+/// distance to the 3 nearest neighbours (exact kNN with `kiddo`), identity
+/// rotation, opacity logit(0.1) (MCMC: 0.5 and scales × 0.1).
+pub fn init_gaussians(points: &InitPoints, kind: InitKind) -> Result<GaussiansHost> {
+    let n = points.xyz.len();
+    ensure!(n > 0, "point cloud is empty");
+
+    let tree: kiddo::KdTree<f32, 3> = (&points.xyz).into();
+
+    let dist2: Vec<f32> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let q = points.xyz[i];
+            let nn = tree.nearest_n::<SquaredEuclidean>(&q, 4);
+            let mut sum = 0.0f32;
+            let mut count = 0u32;
+            for entry in &nn {
+                if entry.distance > 0.0 {
+                    sum += entry.distance;
+                    count += 1;
+                    if count == 3 {
+                        break;
+                    }
+                }
+            }
+            if count > 0 { sum / count as f32 } else { 1e-7 }
+        })
+        .collect();
+
+    let mut means = Vec::with_capacity(n * 3);
+    let mut sh0 = Vec::with_capacity(n * 3);
+    let mut scales = Vec::with_capacity(n * 3);
+    let mut rotations = Vec::with_capacity(n * 4);
+    let mut opacities = Vec::with_capacity(n);
+
+    let logit_01 = (0.1f32 / 0.9).ln();
+    let logit_05 = 0.0f32;
+    let logit_o = match kind {
+        InitKind::Standard => logit_01,
+        InitKind::Mcmc => logit_05,
+    };
+    let mcmc_scale_factor = match kind {
+        InitKind::Standard => 0.0,
+        InitKind::Mcmc => (0.1f32).ln(),
+    };
+
+    for (i, (&xyz, &rgb)) in points.xyz.iter().zip(&points.rgb).enumerate() {
+        means.extend_from_slice(&xyz);
+
+        let [r, g, b] = rgb;
+        sh0.push((r as f32 / 255.0 - 0.5) / C0);
+        sh0.push((g as f32 / 255.0 - 0.5) / C0);
+        sh0.push((b as f32 / 255.0 - 0.5) / C0);
+
+        let s = (dist2[i].max(1e-7).sqrt()).ln() + mcmc_scale_factor;
+        scales.extend_from_slice(&[s, s, s]);
+
+        rotations.extend_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+
+        opacities.push(logit_o);
+    }
+
+    let g = GaussiansHost {
+        means,
+        scales,
+        rotations,
+        opacities,
+        sh0,
+        sh_rest: vec![0.0; n * 45],
+        sh_degree: 3,
+        antialiased: false,
+    };
+    g.validate()?;
+    Ok(g)
 }
 
 #[cfg(test)]
@@ -426,5 +495,95 @@ mod tests {
         };
         let err = load_colmap_scene(dir.path(), &opts).unwrap_err();
         assert!(format!("{err:#}").contains("image_undistorter"), "{err:#}");
+    }
+
+    #[test]
+    fn init_gaussians_standard() {
+        let points = InitPoints {
+            xyz: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [2.0, 0.0, 0.0],
+            ],
+            rgb: vec![
+                [255, 0, 0],
+                [0, 255, 0],
+                [0, 0, 255],
+                [128, 128, 128],
+                [255, 255, 255],
+            ],
+        };
+        let g = init_gaussians(&points, InitKind::Standard).unwrap();
+        assert_eq!(g.len(), 5);
+        g.validate().unwrap();
+
+        // Means match input positions
+        for i in 0..5 {
+            for a in 0..3 {
+                assert_eq!(g.means[i * 3 + a], points.xyz[i][a]);
+            }
+        }
+        // SH0 from colour: (r/255 - 0.5) / C0
+        let expected_sh0_r = (255.0 / 255.0 - 0.5) / C0;
+        assert!(
+            (g.sh0[0] - expected_sh0_r).abs() < 1e-5,
+            "sh0[0]={}",
+            g.sh0[0]
+        );
+        // SH rest is zero
+        assert!(g.sh_rest.iter().all(|&x| x == 0.0));
+        // Rotation is identity
+        for i in 0..5 {
+            assert_eq!(g.rotations[i * 4], 1.0);
+            assert_eq!(g.rotations[i * 4 + 1], 0.0);
+        }
+        // Opacity is logit(0.1)
+        let logit_01 = (0.1f32 / 0.9).ln();
+        for i in 0..5 {
+            assert!((g.opacities[i] - logit_01).abs() < 1e-5);
+        }
+        // Scales are finite and negative (small Gaussians)
+        for &s in &g.scales {
+            assert!(s.is_finite() && s < 2.0, "scale {s}");
+        }
+    }
+
+    #[test]
+    fn init_gaussians_mcmc_differs() {
+        let points = InitPoints {
+            xyz: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            rgb: vec![[100; 3]; 3],
+        };
+        let std = init_gaussians(&points, InitKind::Standard).unwrap();
+        let mcmc = init_gaussians(&points, InitKind::Mcmc).unwrap();
+        // MCMC: opacity logit(0.5) = 0
+        assert!((mcmc.opacities[0]).abs() < 1e-5, "mcmc opacity should be 0");
+        // MCMC scales are smaller (× 0.1 → ln(0.1) offset)
+        assert!(
+            mcmc.scales[0] < std.scales[0],
+            "mcmc scale {} should be < std {}",
+            mcmc.scales[0],
+            std.scales[0]
+        );
+    }
+
+    #[test]
+    fn init_gaussians_single_point() {
+        let points = InitPoints {
+            xyz: vec![[5.0, 3.0, -1.0]],
+            rgb: vec![[0, 0, 0]],
+        };
+        let g = init_gaussians(&points, InitKind::Standard).unwrap();
+        assert_eq!(g.len(), 1);
+        // With only one point, kNN returns no neighbours → d² = 1e-7
+        let expected_scale = (1e-7f32).sqrt().ln();
+        assert!(
+            (g.scales[0] - expected_scale).abs() < 1e-3,
+            "scale {} expected {}",
+            g.scales[0],
+            expected_scale
+        );
     }
 }
