@@ -415,6 +415,13 @@ fn gpu_bench_scaling() {
         let chosen: Vec<PathBuf> = pick.iter().map(|&i| files[i].clone()).collect();
         let p = e.preprocess(&decode_all(&chosen)).unwrap();
         let plan = e.plan(p.geom).unwrap();
+        // Our own allocations (other processes on a shared card distort the
+        // free-memory figure): weights, the workspace, and the trunk's and
+        // heads' buffers as the planner counts them.
+        let trunk = trunk::Trunk::scratch_bytes(&super::trunk_geom(&p.geom));
+        let accounted = e.weights.device_bytes()
+            + plan.device_bytes
+            + if plan.release_trunk { 0 } else { trunk };
         let reps = if n <= 50 { 10 } else { 3 };
         let mut t = Vec::new();
         let mut min_free = usize::MAX;
@@ -428,7 +435,7 @@ fn gpu_bench_scaling() {
         t.sort_by(|a, b| a.0.total_cmp(&b.0));
         let (med, st) = &t[t.len() / 2];
         println!(
-            "scaling N={n} {}x{}: median {med:.1} ms (min {:.1}, {reps} runs) trunk {:.1} camera {:.1} dense {:.1} wall {:.1} graph {} offload {} chunk {}; engine {:.0} MiB, card {:.0} MiB of {:.0}",
+            "scaling N={n} {}x{}: median {med:.1} ms (min {:.1}, {reps} runs) trunk {:.1} camera {:.1} dense {:.1} wall {:.1} graph {} offload {} release {} chunk {}; accounted {:.0} MiB, engine {:.0} MiB (free-memory delta), card {:.0} MiB of {:.0}",
             p.geom.width,
             p.geom.height,
             t[0].0,
@@ -438,7 +445,9 @@ fn gpu_bench_scaling() {
             st.wall_ms,
             st.graph,
             plan.offload,
+            plan.release_trunk,
             plan.dense_chunk,
+            accounted as f64 / 1048576.0,
             (free0 - min_free) as f64 / 1048576.0,
             (total - min_free) as f64 / 1048576.0,
             total as f64 / 1048576.0
