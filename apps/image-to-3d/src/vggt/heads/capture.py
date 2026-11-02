@@ -6,7 +6,7 @@ captures the aggregator layers the heads read and every head intermediate,
 and writes:
 
   <out>/heads_n2.npz   2 frames: L_4/L_11/L_17/L_23 (fp32, [N,T,2048]),
-                       camera + dense intermediates (fp16), pose_enc,
+                       camera + dense intermediates (fp16 bits as uint16, `<name>_f16`), pose_enc,
                        extrinsics, intrinsics, depth, depth_conf, world_points
                        (fp32), and the same heads run on bf16-rounded inputs
                        (`*_bf16in`, the noise floor of a bf16 layer cache)
@@ -31,6 +31,7 @@ import torch
 from safetensors.torch import save_file
 
 LAYERS = (4, 11, 17, 23)
+DEV = "cuda"
 
 
 def bf16_bits(x: torch.Tensor) -> np.ndarray:
@@ -60,7 +61,9 @@ def run_heads(model, layers, images, patch_start, tap: dict | None):
 
         def save(name):
             def f(_m, _i, o):
-                tap[name] = o.detach().float().cpu().numpy().astype(np.float16)
+                # fp16 stored as raw uint16 bits under `<name>_f16` (the Rust npz
+                # reader has no <f2).
+                tap[f"{name}_f16"] = o.detach().float().cpu().numpy().astype(np.float16).view(np.uint16)
             return f
 
         hooks.append(ch.token_norm.register_forward_hook(save("cam_token_norm")))
@@ -78,7 +81,7 @@ def run_heads(model, layers, images, patch_start, tap: dict | None):
     full = [None] * 24
     for i, x in zip(LAYERS, layers):
         full[i] = x
-    with torch.inference_mode(), torch.autocast(device_type="cuda", enabled=False):
+    with torch.inference_mode(), torch.autocast(device_type=DEV, enabled=False):
         pose_enc = model.camera_head(full, patch_token_start=patch_start)
         depth, conf = model.dense_head(full, images=images, patch_token_start=patch_start)
     for h in hooks:
@@ -100,8 +103,8 @@ def capture(model, paths, n, out: Path, full_dump: bool):
     from vggt_omega.utils.load_fn import load_and_preprocess_images
 
     images = load_and_preprocess_images(paths[:n], mode="max_size", image_resolution=512, patch_size=16)
-    images = images.cuda()[None]
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    images = images.to(DEV)[None]
+    with torch.inference_mode(), torch.autocast(device_type=DEV, dtype=torch.bfloat16):
         tokens, patch_start = model.aggregator(images)
     layers = [tokens[i].float() for i in LAYERS]
     assert patch_start == 17
@@ -143,14 +146,18 @@ def main() -> int:
     ap.add_argument("--images", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--weights", default=None)
+    ap.add_argument("--device", default="cuda", help="cuda or cpu (aggregator in CPU bf16 autocast)")
     args = ap.parse_args()
+    global DEV
+    DEV = args.device
+    torch.set_num_threads(16)
 
     from vggt_omega.models import VGGTOmega
 
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     model = VGGTOmega()
     model.load_state_dict(state, strict=True)
-    model = model.eval().cuda()
+    model = model.eval().to(DEV)
 
     if args.weights:
         save_heads(state, args.weights)

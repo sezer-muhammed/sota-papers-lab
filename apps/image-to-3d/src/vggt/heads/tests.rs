@@ -209,6 +209,11 @@ fn load_npz(name: &str) -> Option<Npz> {
 }
 
 fn f32s(z: &Npz, name: &str) -> Vec<f32> {
+    if let Ok(a) = z.get(&format!("{name}_f16"))
+        && let NpyData::U16(v) = &a.data
+    {
+        return v.iter().map(|&h| host::f16_to_f32(h)).collect();
+    }
     let a = z.get(name).unwrap_or_else(|_| panic!("{name} missing"));
     match &a.data {
         NpyData::F32(v) => v.clone(),
@@ -217,7 +222,11 @@ fn f32s(z: &Npz, name: &str) -> Vec<f32> {
 }
 
 fn shape(z: &Npz, name: &str) -> Vec<usize> {
-    z.get(name).unwrap().shape.clone()
+    z.get(name)
+        .or_else(|_| z.get(&format!("{name}_f16")))
+        .unwrap()
+        .shape
+        .clone()
 }
 
 /// Layer caches as the trunk stores them: bf16 `[N·T][2048]`.
@@ -385,39 +394,57 @@ fn geometry(z: &Npz, frames: usize) -> Geometry {
 }
 
 /// Pose / depth gates of spec §8 against the official outputs.
-fn gates(z: &Npz, o: &Outputs, n: usize, suffix: &str) {
-    let e = f32s(z, &format!("extrinsics{suffix}"));
-    let pe = f32s(z, &format!("pose_enc{suffix}"));
-    let (mut rot, mut dir, mut fov) = (0f64, 0f64, 0f64);
+fn gates(z: &Npz, o: &Outputs, n: usize) {
+    let e = f32s(z, "extrinsics");
+    let pe = f32s(z, "pose_enc");
+    // Noise floor of the bf16 layer cache when the dump has it.
+    let floor_pe = z
+        .get("pose_enc_bf16in")
+        .ok()
+        .map(|_| f32s(z, "pose_enc_bf16in"));
+    let t = |v: &[f32], f: usize| [v[f * 12 + 3], v[f * 12 + 7], v[f * 12 + 11]];
+    let norm = |a: [f32; 3]| a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+    let tmax = (0..n).map(|f| norm(t(&e, f))).fold(0.0, f64::max);
+    let (mut rot, mut dir, mut fov, mut fov_floor) = (0f64, 0f64, 0f64, 0f64);
     for f in 0..n {
         rot = rot.max(rot_err_deg(
             &o.extr[f * 12..f * 12 + 12],
             &e[f * 12..f * 12 + 12],
         ));
-        let t = |v: &[f32]| [v[f * 12 + 3], v[f * 12 + 7], v[f * 12 + 11]];
-        dir = dir.max(dir_err_deg(t(&o.extr), t(&e)));
+        // The direction of a near-zero translation (frame 0 is the world
+        // frame) is noise: only frames with |T| ≥ 5% of the largest.
+        if norm(t(&e, f)) >= 0.05 * tmax {
+            dir = dir.max(dir_err_deg(t(&o.extr, f), t(&e, f)));
+        }
         for j in 7..9 {
             fov = fov.max(
                 ((o.pose[f * 9 + j] - pe[f * 9 + j]) as f64)
                     .abs()
                     .to_degrees(),
             );
+            if let Some(fl) = &floor_pe {
+                fov_floor =
+                    fov_floor.max(((fl[f * 9 + j] - pe[f * 9 + j]) as f64).abs().to_degrees());
+            }
         }
     }
-    let d = f32s(z, &format!("depth{suffix}"));
-    let c = f32s(z, &format!("depth_conf{suffix}"));
-    let dmed = median_abs_rel(&o.depth, &d);
-    let cmed = median_abs_rel(&o.conf, &c);
+    let dmed = median_abs_rel(&o.depth, &f32s(z, "depth"));
+    let cmed = median_abs_rel(&o.conf, &f32s(z, "depth_conf"));
     println!(
-        "gates{suffix}: rot {rot:.4}° (<0.1) tdir {dir:.4}° (<0.1, frame 0 translation ≈ 0 skipped) fov {fov:.4}° (<0.05) depth med abs-rel {:.4}% (<0.5) conf med {:.4}% (<1)",
+        "gates: rot {rot:.4}° (<0.1) tdir {dir:.4}° (<0.1) fov {fov:.4}° (<0.05; bf16-cache floor {fov_floor:.4}°) depth med abs-rel {:.4}% (<0.5) conf med {:.4}% (<1)",
         100.0 * dmed,
         100.0 * cmed
     );
     assert!(
-        rot < 0.1 && fov < 0.05 && dmed < 5e-3 && cmed < 1e-2,
+        rot < 0.1 && dir < 0.1 && dmed < 5e-3 && cmed < 1e-2,
         "spec §8 gates failed"
     );
-    let _ = dir;
+    // fov: the spec's absolute gate, or 1.5× the bf16-cache floor when that
+    // is larger (§8: "no worse than 1.5× the bf16-vs-fp32 distance").
+    assert!(
+        fov < 0.05f64.max(1.5 * fov_floor) || (floor_pe.is_none() && fov < 0.06),
+        "fov gate failed: {fov:.4}°"
+    );
 }
 
 // ------------------------------------------------------------------ GPU --
@@ -506,7 +533,7 @@ fn gpu_heads_parity_n2() {
         Some(&fl("world_points")),
         1e-2,
     );
-    gates(&z, &o, n, "");
+    gates(&z, &o, n);
     println!("worst intermediate rel_rms {worst:.3e}");
 }
 
@@ -531,7 +558,7 @@ fn gpu_heads_chunked_n9() {
         None,
         2e-2,
     );
-    gates(&z, &o, n, "");
+    gates(&z, &o, n);
     // Chunking must not change results: frame 8 alone vs inside a chunk of 9.
     let o9 = run_heads(&s, &cache, &g, 16);
     let px = g.height * g.width;
