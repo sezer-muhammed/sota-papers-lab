@@ -7,6 +7,11 @@
 # compiled by NVRTC when an op first runs. Only the final stage carries CUDA
 # libraries. Switch the build stage to nvidia/cuda:*-devel once an app
 # compiles kernels ahead of time with nvcc.
+#
+# The cuda:*-runtime base provides: NVRTC (runtime kernel compilation),
+# cuBLAS / cuBLASLt (VGGT-Ω engine GEMMs), and the CUDA runtime.
+# Kernels use no #include (types and PTX wrappers are inlined in common.cuh),
+# so the devel image's headers are not needed.
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU=ubuntu24.04
 
@@ -34,6 +39,10 @@ RUN --mount=type=cache,id=spl-cargo-registry,target=/usr/local/cargo/registry \
  && cp target/release/spl /usr/local/bin/spl
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU}
+# ffmpeg/ffprobe: video frame extraction for image-to-3d (Phase 4).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=rust /usr/local/bin/spl /usr/local/bin/spl
 COPY --from=web /src/web/shell/dist /opt/spl/web
 COPY deploy/config /etc/spl

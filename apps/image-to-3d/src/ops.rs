@@ -12,7 +12,9 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::ensure;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use spl_core::{ArtifactKind, ArtifactRef, Context, DataDir, Op, Result, RunCx, anyhow, bail};
+use spl_core::{
+    ArtifactKind, ArtifactRef, Context, DataDir, GpuUse, Op, Result, RunCx, anyhow, bail,
+};
 use ts_rs::TS;
 
 use crate::eval::{ImageMetrics, evaluate};
@@ -143,6 +145,7 @@ impl Op for Train {
     const ID: &'static str = "image_to_3d.train";
     const SUMMARY: &'static str =
         "Train Gaussian splats on a COLMAP-posed dataset (folder or uploaded zip)";
+    const GPU: GpuUse = GpuUse::Exclusive;
 
     type Input = TrainInput;
     type Output = TrainOutput;
@@ -347,6 +350,7 @@ pub struct Render;
 impl Op for Render {
     const ID: &'static str = "image_to_3d.render";
     const SUMMARY: &'static str = "Render one view of a trained splat";
+    const GPU: GpuUse = GpuUse::Exclusive;
 
     type Input = RenderInput;
     type Output = RenderOutput;
