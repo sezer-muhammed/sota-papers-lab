@@ -10,6 +10,8 @@
 //! | [`norm`] | LayerNorm fused with FP8 quantisation (per token or static), optionally preceded by the LayerScale residual update; the row epilogue (scales, bias, GELU, re-quantisation) for GEMM outputs |
 //! | [`qkv`] | QKV prologue: split, QK-norm, 2D RoPE (VGGT and DINOv3 layouts), head-major layout for attention |
 //! | [`attention`] | FlashAttention-2-style bf16 attention (`mma.sync` m16n8k16, `ldmatrix`, `cp.async` double buffering, swizzled shared memory, exp2 online softmax), batched over frames or over one long global sequence; an fp16-P·V variant runs at twice the tensor rate on GeForce Ada |
+//! | [`conv`] | NHWC image ops for dense heads: implicit-GEMM convolution (fused input ReLU, bias, residuals), depth-to-space, bilinear resize, table add |
+//! | [`rowops`] | in-place activation; head-dim-128 attention on short sequences |
 //! | [`residual`] | LayerScale, bias and residual add in one pass |
 //! | [`host`] | bf16/FP8 conversions and CPU reference implementations (test oracles) |
 //!
@@ -19,15 +21,18 @@
 //! [`Nn`] stream and returns without synchronising.
 
 pub mod attention;
+pub mod conv;
 pub mod gemm;
 pub mod host;
 pub mod norm;
 pub mod qkv;
 pub mod residual;
-/// SageAttention-style quantised global attention: INT8 QKᵀ, FP8 PV,
-/// smoothing and KV merging.
+pub mod rowops;
+/// Quantised global attention (SageAttention2: INT8 QKᵀ, FP8 PV, KV merge).
 pub mod sage;
 
+#[cfg(test)]
+mod conv_tests;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]

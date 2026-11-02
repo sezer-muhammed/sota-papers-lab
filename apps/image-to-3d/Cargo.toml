@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 flate2 = "1"
+memmap2 = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 kiddo = "4"
 mozjpeg = { version = "0.10", default-features = false, features = ["parallel"] }
@@ -18,11 +19,15 @@ serde.workspace = true
 serde_json.workspace = true
 spl-core.workspace = true
 spl-gpu.workspace = true
+spl-nn.workspace = true
 tempfile = "3"
 tokio.workspace = true
 tracing.workspace = true
 ts-rs.workspace = true
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+spl-data.workspace = true
 
 [lints]
 workspace = true
