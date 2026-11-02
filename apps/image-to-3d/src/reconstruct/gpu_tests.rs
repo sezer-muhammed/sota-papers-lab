@@ -10,7 +10,7 @@
 //! | `SPL_RECON_CONFIG` | none | `PipelineConfig` JSON patch, or an array of patches run one after another on the same ingest (ablations; tags get `-<i>`) |
 //! | `SPL_RECON_HOLDOUT` | 8 | every n-th frame held out (0 = none) |
 //! | `SPL_RECON_TTR` | 200 | test-time pose refinement iterations per view |
-//! | `SPL_RECON_TTR_LR` | 3e-3 | its rotation LR (translation: same × extent); bicycle Fast: 1e-3 21.47 dB, 3e-3 22.25, 1e-2 20.06 |
+//! | `SPL_RECON_TTR_LR` | 1e-3 | its rotation LR (translation: same × extent). 3e-3: bicycle Fast +0.4-0.8 dB, garden Quality -0.6 dB; 1e-2 worse |
 //! | `SPL_RECON_MAX_FRAMES` | all | frames (video keyframes) |
 //! | `SPL_RECON_TAG` | `<scene>-<preset>` | output folder name |
 //! | `SPL_VGGT_WEIGHTS` | — | engine weights |
@@ -146,7 +146,7 @@ fn run_one(
 ) {
     let holdout: usize = env("SPL_RECON_HOLDOUT", "8").parse().unwrap();
     let ttr: u32 = env("SPL_RECON_TTR", "200").parse().unwrap();
-    let ttr_lr: f32 = env("SPL_RECON_TTR_LR", "3e-3").parse().unwrap();
+    let ttr_lr: f32 = env("SPL_RECON_TTR_LR", "1e-3").parse().unwrap();
     let out = PathBuf::from("/out/image-to-3d/reconstruct").join(tag);
     std::fs::create_dir_all(&out).unwrap();
     let weights = PathBuf::from(env(

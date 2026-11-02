@@ -33,22 +33,31 @@ in `~/spl-work/out/image-to-3d/reconstruct/<tag>/` and
 - PSNR / SSIM: our CPU metrics on the 8-bit renders (3DGS convention).
   LPIPS-VGG via `gs-metrics` where listed.
 
-## Results (defaults at commit 71ba782; `C-*` runs)
+## Results (defaults at commit 71ba782; test-time refinement LR 1e-3)
 
-| Scene | Preset | End to end | Held-out PSNR before → after TTR | SSIM after | Training views PSNR | Gaussians |
-|---|---|---|---|---|---|---|
-| garden | Fast | 94.3 s | 19.88 → **24.68** | 0.713 | 25.31 | 432k |
-| garden | Quality | 294.7 s | 19.60 → **26.09** | 0.812 | 28.57 | 1.66M |
-| bicycle | Fast | BICF_E2E | BICF_B → **BICF_A** | BICF_S | BICF_T | BICF_N |
-| bicycle | Quality | BICQ_E2E | BICQ_B → **BICQ_A** | BICQ_S | BICQ_T | BICQ_N |
-| truck | Fast | TRF_E2E | TRF_B → **TRF_A** | TRF_S | TRF_T | TRF_N |
-| truck | Quality | TRQ_E2E | TRQ_B → **TRQ_A** | TRQ_S | TRQ_T | TRQ_N |
-| train ¹ | Fast | 80.8 s | 16.06 → **19.81** | 0.689 | 21.46 | 104k |
-| train ¹ | Quality | 168.0 s | 15.70 → **20.61** | 0.749 | 24.44 | 565k |
-| room ¹ | Quality | 242.9 s | 22.55 → **30.28** | 0.898 | 32.76 | 672k |
+| Scene | Preset | End to end | Held-out PSNR before → after TTR | SSIM / LPIPS-VGG after | Training views PSNR | Gaussians | Run |
+|---|---|---|---|---|---|---|---|
+| garden | Fast | 94.3 s | 19.88 → **24.68** | 0.713 / 0.284 | 25.31 | 432k | C |
+| garden | Quality | 294.7 s | 19.60 → **26.09** | 0.812 / 0.156 | 28.57 | 1.66M | C |
+| bicycle | Fast | 84.9 s | 16.81 → **21.47** | 0.492 / 0.437 | 21.78 | 385k | C |
+| bicycle | Quality | 314.5 s | 16.31 → **20.48** | 0.458 / 0.358 | 25.04 | 2.60M | C |
+| room | Quality | 242.2 s | 21.73 → **29.98** | 0.895 / 0.243 | 32.76 | 672k | F |
+| truck | Fast | 83.5 s | 17.56 → **22.79** | 0.806 / 0.238 | 23.74 | 192k | C |
+| truck | Quality | 174.6 s | 17.49 → **23.21** | 0.838 / 0.172 | 26.03 | 728k | C |
+| train | Fast | 80.8 s | 15.80 → **19.55** | 0.685 / 0.372 | 20.99 | 103k | F |
+| train | Quality | 167.6 s | 15.49 → **20.15** | 0.745 / 0.265 | 24.16 | 563k | F |
 
-¹ `B-*` runs: 300 of the scene's frames (the harness then capped image folders
-at 300; train has 301, room 311), same code otherwise.
+SSIM and LPIPS-VGG from `gs-metrics` (3DGS convention) on the saved renders;
+its PSNR equals ours to the third decimal. Engine time: 19-21 s for 185-194
+frames in one pass; 33.5 s (truck, 251) / 33.6 s (train, 301) / 43.3 s (room,
+311) in two registered chunks; weight load 7.1 s each run (page cache warm,
+fresh process). Run-to-run spread of identical configs: up to ±0.4 dB
+(bicycle Fast 21.47 / 21.87 / 22.25 with TTR LR 1e-3 / 3e-3 / 3e-3).
+
+With test-time refinement LR 3e-3 (`E-*`, `D-*`): garden 24.63 / 25.45,
+bicycle 21.87-22.25 / 20.89, truck 22.62 / 23.10, train — / 20.05 (another
+agent's unlocked 5 GB job started during this run), room — / 29.93 (Fast /
+Quality). 1e-3 stays the default.
 
 Phone-video stand-in (`B-video-garden`): the 185 garden `images_4` frames as a
 62 s 1280×828 H.264 30 fps clip with a slow brightness (±4 %) and saturation
@@ -62,19 +71,24 @@ and 87 s. Held-out keyframes (every 8th): 21.11 → 23.57 dB.
 
 | Target (Report §9) | Measured | Met |
 |---|---|---|
-| Mip360 ≥ 27.4 dB in ≤ 5 min end to end | garden 26.09 dB in 295 s; bicycle BICQ_A dB in BICQ_E2E; room 30.28 dB in 243 s | time yes; PSNR no (garden −1.3 dB) |
-| Fast ≥ 26.5 dB in ≤ 90 s | garden 24.68 dB in 94 s | no |
-| T&T ≥ 24.9 dB | truck TRQ_A, train 20.61 | no |
+| Mip360 ≥ 27.4 dB in ≤ 5 min end to end | garden 26.09 dB in 295 s; bicycle 20.48 dB in 315 s; room 29.98 dB in 242 s | time: garden and room yes, bicycle 15 s over; PSNR no (garden −1.3 dB) |
+| Fast ≥ 26.5 dB in ≤ 90 s | garden 24.68 dB in 94 s; bicycle 21.47 dB in 85 s; truck 22.79 dB in 84 s | time: bicycle and truck yes, garden 4 s over; PSNR no |
+| T&T ≥ 24.9 dB | truck 23.21, train 20.15 (Quality) | no |
 | 60 s phone video → clean splat | 62 s clip → 90 s, 23.6 dB held-out keyframes | yes (stand-in video) |
 
 - No VGGT-X or InstantSplat row finished in `~/spl-work/bench/results.jsonl`
   on this GPU (all four attempts `failed`), so the comparison is with the
   **published** VGGT-X Mip-NeRF 360 figure of 26.40 dB (paper, different
   hardware, its own protocol details): garden Quality is 0.31 dB below that
-  number, bicycle and the T&T scenes further.
-- Same GPU, COLMAP poses (`w/integrate3d` trainer, this build): garden Fast
-  26.43 dB, 49.9 s training (`mvp-colmap-fast`); garden Quality 27.61 dB.
-  The COLMAP time itself is not included there.
+  number, bicycle, room and the T&T scenes further below their COLMAP-pose
+  numbers.
+- Same GPU, COLMAP poses (`w/integrate3d` trainer; the COLMAP run time is
+  not included): garden Fast 26.43 dB with 49.9 s of training
+  (`mvp-colmap-fast`, this build); Quality garden 27.61, bicycle 25.15, room
+  32.14 dB (ledger). FastGS garden 27.30 dB in 265 s, bicycle 24.82 dB in
+  190 s; Brush room 32.42 dB in 722 s (`results.jsonl`). Our COLMAP-free
+  numbers are 1.5 (garden) to 4.7 (bicycle) dB below the COLMAP-pose trainer,
+  but need no SfM: garden goes from JPEG files to `.spz` in 295 s.
 
 ## Where the gap comes from (garden, Fast)
 

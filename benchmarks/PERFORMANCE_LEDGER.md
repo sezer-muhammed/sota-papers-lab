@@ -44,6 +44,17 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-02 | flowers (images_4) | 21.07 dB in 201 s | FastGS: 21.35 dB in 182 s | -0.28 dB (FastGS wins here) | quality verified | opt-train, 76404de |
 | 2026-11-02 | Mip-NeRF 360, all 9 scenes, Quality preset | mean 27.59 dB, 144–380 s per scene | (no rival measured on all 9 yet) | — | quality verified | opt-train, 76404de |
 
+### End-to-end COLMAP-free reconstruction (`image_to_3d.reconstruct`: JPEG files → native VGGT-Ω poses → splat → `.spz` on disk; nvs-colmapfree protocol, every 8th view held out, 200-iteration test-time pose refinement; GPU lock held, card idle at start)
+
+| Date | Scene | Ours (held-out after test-time refinement) | Baseline | Result | Status | Source |
+|---|---|---|---|---|---|---|
+| 2026-11-02 | garden (images_4), Quality | 26.09 dB / SSIM 0.812 / LPIPS 0.156, 295 s end to end (before refinement 19.60 dB) | VGGT-X published Mip-NeRF 360: 26.40 dB (paper, other hardware); our trainer on COLMAP poses: 27.61 dB (SfM time excluded) | -0.31 dB vs VGGT-X's published number; -1.5 dB vs COLMAP poses, no SfM needed | verified (lock held, idle card); misses the 27.4 dB target | mvp-pipeline, 71ba782 |
+| 2026-11-02 | garden (images_4), Fast | 24.68 dB / 0.713 / 0.284 in 94 s end to end | our trainer on COLMAP poses, Fast: 26.43 dB (50 s training, SfM excluded) | -1.75 dB | verified; misses the 26.5 dB / 90 s target | mvp-pipeline, 71ba782 |
+| 2026-11-02 | room (images_2, 311 frames), Quality | 29.98 dB / 0.895 / 0.243 in 242 s | COLMAP poses: ours 32.14 dB; Brush 32.42 dB in 722 s | -2.2 dB vs COLMAP poses | verified | mvp-pipeline, 71ba782 |
+| 2026-11-02 | bicycle (images_4), Quality / Fast | 20.48 dB in 315 s / 21.47 dB in 85 s | COLMAP poses: ours 25.15 dB; FastGS 24.82 dB | -4.7 dB (held-out poses not recovered) | verified; do not market | mvp-pipeline, 71ba782 |
+| 2026-11-02 | T&T truck / train, Quality | 23.21 dB in 175 s / 20.15 dB in 168 s (Fast: 22.79 in 84 s / 19.55 in 81 s) | target 24.9 dB | below target | verified | mvp-pipeline, 71ba782 |
+| 2026-11-02 | 62 s phone-style video (garden frames, H.264, exposure drift), Fast + PPISP | 90 s from video file to `.spz` (617 frames decoded, 150 keyframes); cameras and points shown at 24 s, splat previews every 8 s; held-out keyframes 23.57 dB | — | end-to-end path works | verified (stand-in video, not a real phone capture) | mvp-pipeline, 71ba782 |
+
 Not a win (do not market): Morton re-sort from random order is slower than Faster-GS (8.94 vs 6.21 ms at 1M; 96.1 vs 49.4 ms at 6M).
 
 Not yet marketable: attention with 4×4 key merging runs in 33–38 ms (vs 1047 ms FlashAttention-2), but the approximation error is too high on some layers (up to 56% rel. L1) until the Phase 2 per-layer schedule search shows which layers can use it.
