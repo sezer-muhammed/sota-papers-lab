@@ -83,4 +83,18 @@ keep_engine: boolean,
 /**
  * Trainer overrides (ablations).
  */
-overrides: PresetOverrides, };
+overrides: PresetOverrides, 
+/**
+ * Geometric pose refinement before training ([`geom::refine_poses`]):
+ * Jacobi iterations (0 = off), samples per frame, per-frame depth scale.
+ */
+geo_iters: number, geo_samples: number, geo_scale: boolean, 
+/**
+ * Above 0: init points must agree with this many neighbour depth maps
+ * ([`geom::consistent_points`]); 0 = every confident pixel.
+ */
+init_min_views: number, 
+/**
+ * Relative depth tolerance of that check.
+ */
+init_tau: number, };
