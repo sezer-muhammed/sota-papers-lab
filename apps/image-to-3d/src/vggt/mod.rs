@@ -300,6 +300,7 @@ impl VggtEngine {
                     tg,
                     &images,
                     [&mut c0, &mut c1, &mut c2, &mut c3],
+                    None,
                     &sched,
                     &mut trunk::NoTap,
                 )
