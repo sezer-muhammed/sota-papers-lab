@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Usage: gs-metrics RENDERS GT [--test-every 8] [--out metrics.json] [--quiet]
+# PSNR / SSIM / LPIPS-VGG as 3DGS computes them (plus gsplat's SSIM and LPIPS-alex).
+exec "$(dirname "$(realpath "$0")")/gs-ref" --entry /opt/spl-bench/metrics.py "$@"

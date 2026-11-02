@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -9,12 +11,15 @@ use crate::host::{lock, now_ms};
 /// The artifact store one run's op sees. Every artifact the op stores also
 /// gets its database row and an `output` link to the run (`out-0`, `out-1`,
 /// ... in the order first stored), so lineage needs no help from the op.
+/// Ops cannot delete through it.
 pub(crate) struct RecordingStore {
     inner: Arc<dyn ArtifactStore>,
     store: Arc<dyn Store>,
     run_id: String,
     /// Ids already linked, in slot order: storing the same bytes twice links once.
     linked: Mutex<Vec<String>>,
+    /// Ids this run recorded first: only these may be pruned as snapshots.
+    created: Mutex<HashSet<String>>,
 }
 
 impl RecordingStore {
@@ -28,20 +33,26 @@ impl RecordingStore {
             store,
             run_id,
             linked: Mutex::default(),
+            created: Mutex::default(),
         }
     }
-}
 
-#[async_trait]
-impl ArtifactStore for RecordingStore {
-    async fn put(
-        &self,
-        bytes: Vec<u8>,
-        kind: ArtifactKind,
-        media_type: &str,
-    ) -> Result<ArtifactRef> {
-        let artifact = self.inner.put(bytes, kind, media_type).await?;
-        let record = artifact_record(&artifact, self.inner.uri(&artifact.id), None);
+    /// The artifacts this run stored that no record existed for before.
+    pub(crate) fn created(&self) -> HashSet<String> {
+        lock(&self.created).clone()
+    }
+
+    async fn record(&self, artifact: &ArtifactRef) -> Result<()> {
+        let known = self
+            .store
+            .get_artifact(&artifact.id)
+            .await
+            .context("look up artifact")?
+            .is_some();
+        if !known {
+            lock(&self.created).insert(artifact.id.clone());
+        }
+        let record = artifact_record(artifact, self.inner.uri(&artifact.id), None);
         self.store
             .put_artifact(&record)
             .await
@@ -62,11 +73,40 @@ impl ArtifactStore for RecordingStore {
                 .await
                 .context("link artifact to its run")?;
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ArtifactStore for RecordingStore {
+    async fn put(
+        &self,
+        bytes: Vec<u8>,
+        kind: ArtifactKind,
+        media_type: &str,
+    ) -> Result<ArtifactRef> {
+        let artifact = self.inner.put(bytes, kind, media_type).await?;
+        self.record(&artifact).await?;
+        Ok(artifact)
+    }
+
+    async fn put_file(
+        &self,
+        path: &Path,
+        kind: ArtifactKind,
+        media_type: &str,
+    ) -> Result<ArtifactRef> {
+        let artifact = self.inner.put_file(path, kind, media_type).await?;
+        self.record(&artifact).await?;
         Ok(artifact)
     }
 
     async fn get(&self, id: &str) -> Result<Vec<u8>> {
         self.inner.get(id).await
+    }
+
+    fn local_path(&self, id: &str) -> Option<PathBuf> {
+        self.inner.local_path(id)
     }
 
     fn uri(&self, id: &str) -> String {
