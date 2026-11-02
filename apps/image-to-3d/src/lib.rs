@@ -24,6 +24,7 @@ pub mod eval;
 pub mod export;
 pub mod frame;
 pub mod gpu;
+pub mod init;
 pub mod io;
 pub mod kernels;
 pub mod model;
