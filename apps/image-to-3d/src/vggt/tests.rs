@@ -796,3 +796,61 @@ fn gpu_pose_outputs_on_truck() {
     assert!(off < 0.05);
     assert!(pts.len() > 100_000);
 }
+
+/// The FP8 companion file loads into the same arena; its per-channel
+/// scales reproduce the BF16 weights to FP8 precision.
+#[test]
+#[ignore]
+fn gpu_fp8_weights_load() {
+    let nn = Nn::open().unwrap();
+    let main = weights_file();
+    let fp8 = super::weights::fp8_companion(&main);
+    let w = Weights::load(&nn, &[main, fp8]).unwrap();
+    let name = "aggregator.frame_blocks.7.mlp.fc1.weight";
+    let (q, sc) = w.fp8(name).unwrap();
+    let q: Vec<u8> = nn.stream.clone_dtoh(&q).unwrap();
+    let sc: Vec<f32> = nn.stream.clone_dtoh(&sc).unwrap();
+    let want = w.host_f32(name).unwrap();
+    let k = want.len() / sc.len();
+    let deq: Vec<f32> = q
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| spl_nn::host::fp8_to_f32(b) * sc[i / k])
+        .collect();
+    let (e, _) = rel(&deq, &want);
+    println!(
+        "fp8 arena: {:.3} GB, upload {:.2} s, {name} rel {e:.3e}",
+        w.device_bytes() as f64 / 1e9,
+        w.upload_seconds()
+    );
+    assert!(e < 0.04, "{e}");
+}
+
+/// Offloading levels 0..3 to pinned memory changes nothing in the output.
+#[test]
+#[ignore]
+fn gpu_offload_matches_device_cache() {
+    let nn = Arc::new(Nn::open().unwrap());
+    let p = prepared_from_oracle("g8");
+    let cancel = CancellationToken::new();
+    let mut outs = Vec::new();
+    for offload in [false, true] {
+        let cfg = VggtConfig {
+            offload: Some(offload),
+            dense_chunk: 3,
+            graph_max_frames: 0,
+            ..Default::default()
+        };
+        let mut e = VggtEngine::load(nn.clone(), &weights_file(), cfg).unwrap();
+        let c = e.run(&p, &cancel, &mut |_, _| {}).unwrap();
+        let d = e.download(&p.geom).unwrap();
+        let ws = e.workspace_of(&p.geom).unwrap();
+        assert_eq!(ws.plan.offload, offload);
+        println!("offload {offload}: {:.1} ms", e.times.total_ms);
+        outs.push((c.pose_enc, d.depth, d.conf));
+        // Second run on the same workspace re-allocates the freed levels.
+        e.run(&p, &cancel, &mut |_, _| {}).unwrap();
+        assert_eq!(e.download(&p.geom).unwrap().depth, outs.last().unwrap().1);
+    }
+    assert_eq!(outs[0], outs[1]);
+}

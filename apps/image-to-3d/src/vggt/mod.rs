@@ -92,6 +92,9 @@ pub struct VggtConfig {
     pub graph_max_frames: usize,
     /// Also load `<weights>_fp8.safetensors` into the arena (Phase 2).
     pub fp8: bool,
+    /// Force (or forbid) moving levels 0..3 to pinned host memory between
+    /// the trunk and the dense head; `None` lets the planner decide.
+    pub offload: Option<bool>,
 }
 
 impl Default for VggtConfig {
@@ -103,6 +106,7 @@ impl Default for VggtConfig {
             schedule: AttnSchedule::dense(),
             graph_max_frames: 32,
             fp8: false,
+            offload: None,
         }
     }
 }
@@ -231,7 +235,10 @@ impl VggtEngine {
 
     fn workspace(&mut self, geom: Geometry) -> Result<&mut Workspace> {
         if !self.workspaces.contains_key(&geom) {
-            let plan = self.plan(geom)?;
+            let mut plan = self.plan(geom)?;
+            if let Some(o) = self.cfg.offload {
+                plan.offload = o;
+            }
             // One geometry at a time: a new size frees the old buffers.
             self.workspaces.clear();
             self.graphs.clear();
