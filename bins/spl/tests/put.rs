@@ -47,11 +47,25 @@ async fn put_stores_a_file_and_records_its_name() {
     assert_eq!(stored["kind"], "blob");
     assert_eq!(stored["media_type"], "image/x-sony-arw");
     assert_eq!(stored["size_bytes"], 14);
+    assert!(raw.exists(), "the original stays");
     let overridden = artifact(&spl_put(
         dir.path(),
         &[notes.to_str().unwrap(), "--media-type", "text/plain"],
     ));
     assert_eq!(overridden["media_type"], "text/plain");
+    let scene = dir.path().join("scene.SPZ");
+    std::fs::write(&scene, b"splats").unwrap();
+    let splat = artifact(&spl_put(
+        dir.path(),
+        &[scene.to_str().unwrap(), "--kind", "splat"],
+    ));
+    assert_eq!(splat["kind"], "splat");
+    assert_eq!(splat["media_type"], "application/x-spz");
+    let wrong = spl_put(dir.path(), &[scene.to_str().unwrap(), "--kind", "nope"]);
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("splat"));
+    let staging = std::fs::read_dir(dir.path().join("staging")).unwrap();
+    assert_eq!(staging.count(), 0, "no copies left behind");
 
     let host = Host::open(&config(dir.path()), Registry::new())
         .await
