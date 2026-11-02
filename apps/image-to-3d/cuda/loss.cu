@@ -50,6 +50,12 @@ SPL_INLINE float ssim_pixel(float mx, float my, float mxx, float myy, float mxy,
     return S;
 }
 
+// 4-byte global -> shared async copy; writes 0 when !valid (src-size 0, nothing read).
+SPL_INLINE void cp_async4_zfill(float* smem, const float* gmem, bool valid) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(smem_u32(smem)), "l"(gmem), "r"(valid ? 4 : 0)
+                 : "memory");
+}
+
 SPL_INLINE float sgn(float x) { return x > 0.f ? 1.f : (x < 0.f ? -1.f : 0.f); }
 
 // Block sum of two values; thread 0 of the block adds them (times scale) into the f64
@@ -271,7 +277,8 @@ extern "C" __global__ void ssim_bwd(const IterParams* __restrict__ params, const
 #define F_HB_SEGS 11      // ceil(F_TW / 3) column triples in phase 4
 #define F_HB_W (3 * F_HB_SEGS)
 
-// Shared memory, reused across phases (45.2 KB static):
+// Shared memory, reused across phases (46.2 KB static; one padding row of hs, and A's
+// slack after pa, keep the register-blocked loops free of index clamps):
 //   A: input x, y [2][F_IH][F_IW]          -> partials a, b, d [3][F_RH][F_RW]
 //   B: horizontal sums [5][F_IH][F_RW]     -> horizontal partial sums [3][F_RH][F_HB_W]
 struct FusedSmem {
@@ -280,7 +287,7 @@ struct FusedSmem {
         float pa[3][F_RH][F_RW];
     } a;
     union {
-        float hs[5][F_IH][F_RW];
+        float hs[5][F_IH + 1][F_RW];
         float hb[3][F_RH][F_HB_W];
     } b;
 };
@@ -299,15 +306,19 @@ SPL_INLINE void ssim_fused_body(const IterParams* __restrict__ params, const flo
     const int tid = threadIdx.y * F_TW + threadIdx.x;
     const int ox = bx - 10, oy = by - 10;  // input tile origin
 
-    // 1. Input tile with zero padding.
+    // 1. Input tile with zero padding, as 4-byte cp.async copies (src-size 0 zero-fills
+    //    outside the image): every load of the tile is in flight at once instead of one
+    //    load-store round trip per loop iteration.
     for (int i = tid; i < F_IH * F_IW; i += F_THREADS) {
         int r = i / F_IW, c = i - r * F_IW;
         int gx = ox + c, gy = oy + r;
         bool in = gx >= 0 && gx < W && gy >= 0 && gy < H;
-        size_t o = (size_t)gy * W + gx;
-        sm.a.in[0][r][c] = in ? X[o] : 0.f;
-        sm.a.in[1][r][c] = in ? Y[o] : 0.f;
+        size_t o = in ? (size_t)gy * W + gx : 0;
+        cp_async4_zfill(&sm.a.in[0][r][c], X + o, in);
+        cp_async4_zfill(&sm.a.in[1][r][c], Y + o, in);
     }
+    cp_async_commit();
+    cp_async_wait<0>();
     __syncthreads();
 
     // 2. Horizontal sums over the region's columns, 3 columns per thread (13 input
@@ -325,6 +336,8 @@ SPL_INLINE void ssim_fused_body(const IterParams* __restrict__ params, const flo
             float a = 0.f, b = 0.f, aa = 0.f, bb = 0.f, ab = 0.f;
 #pragma unroll
             for (int d = 0; d < 11; ++d) {
+                // fma(w u, u) keeps u^2 unrounded: the variance m2 - mu^2 cancels in flat
+                // regions, and a rounded u^2 costs 1e-5 of the gradient there.
                 float w = c_gauss[d], uu = u[o + d], vv = v[o + d];
                 float wu = w * uu, wv = w * vv;
                 a += wu;
@@ -358,7 +371,7 @@ SPL_INLINE void ssim_fused_body(const IterParams* __restrict__ params, const flo
             for (int q = 0; q < 5; ++q) m[o][q] = 0.f;
 #pragma unroll
         for (int j = 0; j < 13; ++j) {
-            const int rr = min(r0 + j, F_IH - 1);
+            const int rr = r0 + j;  // row F_IH is padding, read only for discarded outputs
             float h[5];
 #pragma unroll
             for (int q = 0; q < 5; ++q) h[q] = sm.b.hs[q][rr][c];
@@ -423,7 +436,7 @@ SPL_INLINE void ssim_fused_body(const IterParams* __restrict__ params, const flo
         for (int q = 0; q < 3; ++q) {
             float u[13];
 #pragma unroll
-            for (int j = 0; j < 13; ++j) u[j] = sm.a.pa[q][r][min(c0 + j, F_RW - 1)];
+            for (int j = 0; j < 13; ++j) u[j] = (&sm.a.pa[q][r][0])[c0 + j];  // index F_RW: next row, discarded
 #pragma unroll
             for (int o = 0; o < 3; ++o) {
                 float acc = 0.f;

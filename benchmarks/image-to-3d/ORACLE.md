@@ -226,3 +226,54 @@ Read these as the tolerance a float32 kernel can meet: aim for errors against
 float64 no worse than gsplat's, not for bitwise equality with gsplat. Discrete
 outputs (radii, tile lists, intersection ids) should match exactly; a mismatch
 there almost always means a different rounding or bound formula.
+
+## Our kernels against the oracle
+
+Results of our GPU tests against the staged oracle cases (`/out/image-to-3d/oracle`,
+`gs-oracle batch`), RTX 4070 SUPER, 2026-11-01. Each test prints its numbers and
+asserts the tolerance in the last column.
+
+### Loss: fused L1 + D-SSIM (`kernels::loss`, owner E4)
+
+`gpu_ssim_matches_fused_ssim_oracle` stages `ssim` cases (noise 37x29, smooth
+pairs 131x77 and 1297x840) and compares our `forward_backward` (v1 two-pass and
+v2 fused) with fused-ssim: `v_img1_loss` against our dL/dx, `ssim` against our
+mean S. `gpu_ssim_matches_f64_reference` compares with our own f64 reference
+(`kernels::loss::reference_loss`, itself checked by central differences).
+
+| Case | Mean S: ours / fused-ssim / f64 | dL/dx vs fused-ssim (max abs, max abs of the gradient) | Tolerance |
+|---|---|---|---|
+| 37x29 noise | 0.141104793 / 0.141104937 / 0.141104791 | 3.5e-10 (7.2e-4) | grad < 1e-8, S < 2e-7 |
+| 131x77 smooth | 0.980286912 / 0.980286956 / 0.980286839 | 7.8e-9 (1.3e-4) | same |
+| 1297x840 smooth | 0.977860935 / 0.977861047 / 0.977860922 | 9.7e-11 (1.3e-6) | same |
+
+Our mean S is 1e-8 from the f64 value; fused-ssim's own f32 error is
+1.1-1.5e-7, so spec-train 3.3's `|ΔS| < 1e-7` against fused-ssim cannot hold
+for any kernel more accurate than fused-ssim; the test asserts 2e-7 against
+fused-ssim instead and 1e-5 relative against f64 (measured ≤ 2e-7). Against
+the f64 reference on 4 sizes x 2 kinds: S ≤ 2.0e-7 relative, L1 ≤ 2.4e-7,
+gradient ≤ 4.3e-5 of max |g| (smooth pairs; ≤ 4e-7 on noise). v2 equals v1
+bit for bit. The loss accumulator is f64 (with f32 atomics the 1297x840 mean S
+was 9.5e-7 off).
+
+### Adam (`kernels::adam`, owner E5)
+
+`gpu_adam_matches_torch_oracle` stages one `adam` step (1000x3, step 7 → 8,
+lr 1e-3, eps 1e-15) and runs the same step through our kernel (means group):
+
+| Output | max abs diff / max abs of torch's | Tolerance |
+|---|---|---|
+| param_out | 6.0e-8 | 1e-6 |
+| exp_avg_out | 6.2e-8 (torch updates m with `lerp`, we with `fma`) | 1e-6 |
+| exp_avg_sq_out | 0 | 1e-6 |
+
+`gpu_adam_matches_f64_reference` drives 100 iterations of raster-style gradient
+writes (Overwrite / Accumulate per the plan, 60% visible, a block hidden for 40
+iterations, main groups every 1 then every 4, SH rest every 16, n = 3001) and
+compares each step with an f64 step from the same device state: params ≤ 2.4e-7
+relative to max(|p|, 1) (≤ 2 ulp), m ≤ 2.3e-7 and v ≤ 3.3e-7 of the group max,
+in Dense and VisibleOnly. `gpu_lazy_catchup_equals_dense`: LazyCatchUp after a
+flush is within 5.4e-6 (params, f32 drift over 100 steps) and 6.2e-7 (moments)
+of Dense, while VisibleOnly is 0.21 away. `gpu_bf16_stochastic_rounding_tracks_f32`:
+over 10k steps of a constant gradient, the mean of v is 9.999549e-7 with
+bf16-SR moments, 9.999455e-7 with f32, 9.999548e-7 exact.
