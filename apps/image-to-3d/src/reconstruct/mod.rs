@@ -3,7 +3,7 @@
 //!
 //! Stages: A0 ingest ([`crate::ingest`]: decode, EXIF, video keyframes) →
 //! A VGGT-Ω engine ([`crate::vggt`]: poses, intrinsics, depth, confidence)
-//! → B Stage B init ([`crate::init`]: confidence filter, voxel downsample)
+//! → bundle adjustment on KLT tracks ([`ba`]) → B Stage B init ([`crate::init`]: confidence filter, voxel downsample)
 //! and the prune-first pass ([`prune`]) → C joint optimization ([`joint`]:
 //! the Phase 3 trainer plus per-image SE(3) and shared-focal refinement,
 //! PPISP, the SSI depth prior) → exports (`.spz`, `.ply`, `cameras.json`,
