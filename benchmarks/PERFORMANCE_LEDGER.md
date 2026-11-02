@@ -31,6 +31,15 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-02 | Native VGGT-Ω, full model (trunk + heads), bf16, 1 / 2 / 8 / 32 frames at 512 px | 26.8 / 47.3 / 236 / 1084 ms | official PyTorch VGGT-Ω bf16: 58.5 / 81.1 / 367 / 1668 ms | 2.2x / 1.7x / 1.56x / 1.54x | depth within 0.11–0.14% (median abs-rel) of official; trunk error within 1.0–1.1x of the official bf16-vs-fp32 noise; camera angles still 2–3x the official noise (gate not yet met) | speed verified (median of 10, GPU lock held); accuracy partly pending | eng-runtime aba2270, eng-trunk b3ce06c |
 | 2026-11-02 | VGGT-Ω weight load (1.8 GB bf16 arena) | 0.65 s | our first version without pinned staging: 1.47 s | 2.3x | — | verified | eng-runtime, aba2270 |
 
+### End-to-end training (COLMAP poses, Quality preset, Mip-NeRF 360 protocol, metrics with the Inria evaluation)
+
+| Date | Scene | Ours | Baseline (same GPU) | Result | Status | Source |
+|---|---|---|---|---|---|---|
+| 2026-11-02 | garden (images_4) | 27.61 dB / SSIM 0.863 / LPIPS 0.121 in 185 s | FastGS: 27.30 dB in 265 s | +0.31 dB and 1.43x faster | quality verified; times preliminary (baseline run may have shared the GPU; quiet re-run pending) | integrate3d, 152a2dc |
+| 2026-11-02 | bicycle (images_4) | 25.15 dB in 201 s | FastGS: 24.82 dB in 190 s. Faster-GS (fused): 25.27 dB in 619 s | +0.33 dB vs FastGS at similar time; 3.1x faster than Faster-GS at -0.12 dB | as above | integrate3d, 152a2dc |
+| 2026-11-02 | room (images_2) | 32.14 dB in 148 s | Brush: 32.42 dB in 722 s | 4.9x faster at -0.28 dB | as above | integrate3d, 152a2dc |
+| 2026-11-02 | garden, Fast preset | 26.40 dB in 50 s | — | — | quality verified | integrate3d, 152a2dc |
+
 Not a win (do not market): Morton re-sort from random order is slower than Faster-GS (8.94 vs 6.21 ms at 1M; 96.1 vs 49.4 ms at 6M).
 
 Not yet marketable: attention with 4×4 key merging runs in 33–38 ms (vs 1047 ms FlashAttention-2), but the approximation error is too high on some layers (up to 56% rel. L1) until the Phase 2 per-layer schedule search shows which layers can use it.
