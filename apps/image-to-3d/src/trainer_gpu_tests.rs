@@ -9,6 +9,7 @@
 //! | `SPL_TRAIN_ITERS` | preset | iteration override |
 //! | `SPL_TRAIN_EAGER` | 0 | 1 = no CUDA graphs |
 //! | `SPL_TRAIN_MAX_GAUSSIANS` | VRAM | capacity ceiling |
+//! | `SPL_TRAIN_OVERRIDES` | none | `PresetOverrides` JSON (ablations) |
 //! | `SPL_TRAIN_TAG` | `<scene>-<preset>` | output folder name |
 //!
 //! Writes `/out/image-to-3d/train/<tag>/`: `renders/<view>.png` (test views,
@@ -75,7 +76,10 @@ fn gpu_train_dataset() {
             .map(|v| v.parse().expect("SPL_TRAIN_MAX_GAUSSIANS")),
         overrides: PresetOverrides {
             scene: Some(short.clone()),
-            ..Default::default()
+            ..std::env::var("SPL_TRAIN_OVERRIDES")
+                .ok()
+                .map(|v| serde_json::from_str(&v).expect("SPL_TRAIN_OVERRIDES"))
+                .unwrap_or_default()
         },
         ..Default::default()
     };
