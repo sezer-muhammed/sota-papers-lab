@@ -151,6 +151,14 @@ fn fastgs_plans() -> (StepPlan, StepPlan) {
 /// FastGS `highfeature_lr` code default.
 pub const FASTGS_HIGHFEATURE_LR: f32 = 0.005;
 
+/// Adam with bf16 stochastic-rounding moments (Quality and Fast).
+fn bf16_adam() -> AdamConfig {
+    AdamConfig {
+        moments: MomentPrecision::Bf16Stochastic,
+        ..AdamConfig::default()
+    }
+}
+
 impl Preset {
     /// The preset at T = 30k (spec-train 6.1-6.2).
     pub fn new(name: PresetName) -> Self {
@@ -200,6 +208,8 @@ impl Preset {
                     ..FastGsConfig::big()
                 }),
                 groups: groups(0.025, 0.02 / 20.0, main, sh),
+                // bf16-SR moments: garden 178 s / 27.490 dB vs f32 193 s / 27.491 (opt-train).
+                adam: bf16_adam(),
                 compact_box_beta: 0.5,
                 ..base
             },
@@ -207,6 +217,7 @@ impl Preset {
             PresetName::Fast => Self {
                 densify: DensifyPreset::FastGs(FastGsConfig::default()),
                 groups: groups(0.025, FASTGS_HIGHFEATURE_LR / 20.0, main, sh),
+                adam: bf16_adam(),
                 compact_box_beta: 0.5,
                 warmup: true,
                 ..base
