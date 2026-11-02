@@ -10,6 +10,7 @@ publish.workspace = true
 anyhow.workspace = true
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+kiddo = "4"
 mozjpeg = { version = "0.10", default-features = false, features = ["parallel"] }
 rayon = "1"
 schemars.workspace = true

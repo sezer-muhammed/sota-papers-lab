@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use super::colmap::ColmapModel;
 use super::images::{ImageCache, decode_bytes_image_crate, decode_file, load_views};
-use super::scene::{LoadOptions, find_sparse_dir, load_colmap_scene};
+use super::scene::{InitKind, LoadOptions, find_sparse_dir, init_gaussians, load_colmap_scene};
+use crate::export::{colmap as colmap_export, ply, spz};
 use crate::gpu::Gpu;
 use crate::testkit::npz::{NpyData, Npz};
 use crate::testkit::{datasets_dir, mip360_scene, out_dir};
@@ -206,4 +207,88 @@ fn gpu_garden_image_cache() {
     }
     let e = cache.entry(s.train[1]).unwrap();
     assert_eq!(e.offset, images[0].data.len() as u64);
+}
+
+/// Initializes Gaussians from garden's COLMAP points and exports PLY, SPZ, COLMAP.
+#[test]
+#[ignore]
+fn garden_init_and_export() {
+    let Some(root) = mip360_scene("garden") else {
+        eprintln!("skipped: no mipnerf360/garden dataset");
+        return;
+    };
+    let s = load_colmap_scene(&root, &opts("images_4")).unwrap();
+    let started = Instant::now();
+    let g = init_gaussians(&s.points, InitKind::Standard).unwrap();
+    let init_ms = started.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "garden init: {} Gaussians from {} points in {init_ms:.1} ms; scale range [{:.3}, {:.3}]",
+        g.len(),
+        s.points.xyz.len(),
+        g.scales.iter().cloned().fold(f32::INFINITY, f32::min),
+        g.scales.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+    );
+    g.validate().unwrap();
+    assert_eq!(g.len(), s.points.xyz.len());
+
+    let out = out_dir("exports");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // PLY
+    let ply_path = out.join("garden.ply");
+    {
+        let mut f = std::fs::File::create(&ply_path).unwrap();
+        ply::write_inria_ply(&g, &mut f).unwrap();
+    }
+    let ply_bytes = std::fs::read(&ply_path).unwrap();
+    let back = ply::read_inria_ply(&ply_bytes).unwrap();
+    assert_eq!(back.len(), g.len());
+    println!("  PLY: {} bytes, round-trip OK", ply_bytes.len());
+
+    // SPZ v3
+    let spz_path = out.join("garden.spz");
+    let spz_bytes = spz::write_spz(&g, &spz::SpzOptions::default()).unwrap();
+    std::fs::write(&spz_path, &spz_bytes).unwrap();
+    let spz_back = spz::read_spz(&spz_bytes).unwrap();
+    assert_eq!(spz_back.len(), g.len());
+    println!("  SPZ v3: {} bytes, round-trip OK", spz_bytes.len());
+
+    // SPZ v4
+    let spz4_bytes = spz::write_spz(
+        &g,
+        &spz::SpzOptions {
+            version: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let spz4_path = out.join("garden_v4.spz");
+    std::fs::write(&spz4_path, &spz4_bytes).unwrap();
+    let spz4_back = spz::read_spz(&spz4_bytes).unwrap();
+    assert_eq!(spz4_back.len(), g.len());
+    println!("  SPZ v4: {} bytes, round-trip OK", spz4_bytes.len());
+
+    // COLMAP export
+    let colmap_dir = out.join("colmap_bin");
+    colmap_export::write_colmap(&s.views, &g, &colmap_dir, false).unwrap();
+    let model = ColmapModel::read_bin(&colmap_dir).unwrap();
+    assert!(!model.cameras.is_empty());
+    assert_eq!(model.images.len(), s.views.len());
+    println!(
+        "  COLMAP bin: {} cameras, {} images, {} points",
+        model.cameras.len(),
+        model.images.len(),
+        model.points.len()
+    );
+
+    // transforms.json
+    let json_path = out.join("transforms.json");
+    {
+        let mut f = std::fs::File::create(&json_path).unwrap();
+        colmap_export::write_transforms_json(&s.views, &mut f).unwrap();
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+    assert_eq!(json["frames"].as_array().unwrap().len(), s.views.len());
+    println!("  transforms.json: {} frames", s.views.len());
 }
