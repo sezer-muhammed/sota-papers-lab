@@ -26,6 +26,7 @@ pub mod frame;
 pub mod gpu;
 pub mod io;
 pub mod kernels;
+pub mod mesh;
 pub mod model;
 pub mod ops;
 pub mod presets;
