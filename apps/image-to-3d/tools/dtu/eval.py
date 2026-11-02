@@ -4,7 +4,7 @@ with scale_mat, sample the surface at 0.2 mm, downsample, then the official
 DTU distances (ObsMask / ground-plane filtering, 20 mm cap) as in
 DTUeval-python. Our own implementation of that protocol.
 
-usage: python -I eval.py <mesh.ply> <dataset_dir> <gt_dir> <scan> [out.json]
+usage: [DTU_MASK_DIR=mask_idr] python -I eval.py <mesh.ply> <dataset_dir> <gt_dir> <scan> [out.json]
 """
 import json, os, sys
 
@@ -24,7 +24,12 @@ F = np.asarray(mesh.faces)
 # --- cull (normalised frame): keep vertices inside every dilated mask or outside the frame
 cams = np.load(os.path.join(ds, "cameras_hd.npz")) if os.path.exists(os.path.join(ds, "cameras_hd.npz")) else None
 names = sorted(os.listdir(os.path.join(ds, "image_hd")))
-masks = sorted(os.listdir(os.path.join(ds, "mask_hd")))
+# Cull masks: DTU_MASK_DIR (e.g. "mask_idr", the IDR/2DGS object silhouettes)
+# else mask_hd. The MVSDF mask_hd are depth-validity masks with holes inside
+# the object (roofs on scan24), which cull correct surface and inflate
+# completeness; the 2DGS protocol culls with the IDR silhouettes.
+mask_dir = os.environ.get("DTU_MASK_DIR", "mask_hd")
+masks = sorted(os.listdir(os.path.join(ds, mask_dir)))
 # Cameras from the COLMAP text written by convert.py.
 Ks, Rt = {}, {}
 for line in open(os.path.join(ds, "sparse/0/cameras.txt")):
@@ -42,7 +47,7 @@ for a in imgs:
                   [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]])
     t = np.array(list(map(float, a[5:8])))
     K = Ks[int(a[8])]
-    m = cv2.imread(os.path.join(ds, "mask_hd", masks[names.index(a[9])]))[:, :, 0] > 127
+    m = cv2.imread(os.path.join(ds, mask_dir, masks[names.index(a[9])]))[:, :, 0] > 127
     m = binary_dilation(m, disk)
     H, W = m.shape
     c = (K @ (R @ V.T + t[:, None])).T
