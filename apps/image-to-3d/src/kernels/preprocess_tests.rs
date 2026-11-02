@@ -475,6 +475,25 @@ fn exact_tiles(
     out
 }
 
+/// Conics compared relative to their scale max(|A|, |C|) per Gaussian
+/// (spec-raster 6.4 "conic rel ≤ 1e-5"; the off-diagonal B alone is often ~0).
+const CONIC_SCALED: Tol = Tol {
+    max_abs: Some(1e-5),
+    ..Tol::NONE
+};
+
+/// (ours, reference) conics `[A, B, C]...` divided by the reference's max(|A|, |C|).
+fn scaled_conics(ours: &[f32], reference: &[f64]) -> (Vec<f32>, Vec<f64>) {
+    let mut a = Vec::with_capacity(ours.len());
+    let mut b = Vec::with_capacity(ours.len());
+    for (o, r) in ours.chunks(3).zip(reference.chunks(3)) {
+        let s = r[0].abs().max(r[2].abs()).max(1e-30);
+        a.extend(o.iter().map(|x| (*x as f64 / s) as f32));
+        b.extend(r.iter().map(|x| x / s));
+    }
+    (a, b)
+}
+
 /// The record's ellipse in f64 (A, B, C from the stored pre-scaled conic).
 fn rec_conic(r: &SplatRec) -> [f64; 3] {
     [
@@ -940,12 +959,18 @@ fn check_forward(
             continue;
         };
         refs.push(rf);
-        m2.0.extend([r.mx, r.my]);
-        m2.1.extend([rf.mx, rf.my]);
+        // Mean error in units of max(1e-4 px, 1e-6 |m|) (spec-raster 6.4).
+        for (a, b) in [(r.mx, rf.mx), (r.my, rf.my)] {
+            let unit = (1e-6 * b.abs()).max(1e-4);
+            m2.0.push((a as f64 / unit) as f32);
+            m2.1.push(b / unit);
+        }
         z.0.push(r.z);
         z.1.push(rf.z);
-        conic.0.extend(rec_conic(&r).map(|x| x as f32));
-        conic.1.extend(rf.conic);
+        // Conic error relative to the conic's scale (B alone is often ~0).
+        let sc = rf.conic[0].abs().max(rf.conic[2].abs());
+        conic.0.extend(rec_conic(&r).map(|x| (x / sc) as f32));
+        conic.1.extend(rf.conic.map(|x| x / sc));
         oeff.0.push(r.o);
         oeff.1.push(rf.oeff);
         col.0.extend([r.r, r.g, r.b]);
@@ -988,11 +1013,11 @@ fn check_forward(
     }
     let report = |d: Diff| println!("  {d}");
     let mean_tol = Tol {
-        max_abs: Some(1e-4),
+        max_abs: Some(1.0),
         ..Tol::NONE
     };
     for (label, (a, b), tol) in [
-        ("means2d", m2, mean_tol),
+        ("means2d/unit", m2, mean_tol),
         (
             "depth",
             z,
@@ -1001,7 +1026,7 @@ fn check_forward(
                 ..Tol::NONE
             },
         ),
-        ("conic", conic, Tol::CONIC),
+        ("conic/scale", conic, CONIC_SCALED),
         ("opacity_eff", oeff, Tol::CONIC),
         (
             "colour",
@@ -1359,7 +1384,7 @@ fn gpu_preprocess_is_deterministic() {
         None,
         None,
     );
-    let params = iter_params(n, 2, 3, FLAG_AA | FLAG_CAM_GRAD, 0.3);
+    let params = iter_params(n, 2, 3, FLAG_AA | FLAG_CAM_GRAD | FLAG_DENSIFY_STATS, 0.3);
     let a = rig.forward(&params);
     let b = rig.forward(&params);
     assert_eq!(a.vis_idx, b.vis_idx);
@@ -1534,7 +1559,8 @@ fn gpu_preprocess_edge_cases() {
         ),
         (
             "tiny_scale",
-            [0.1, 0.1, 3.0],
+            // On a pixel centre: the dilated footprint reaches no other one.
+            [0.099, 0.1005, 3.0],
             -15.0,
             [1.0, 0.0, 0.0, 0.0],
             2.0,
@@ -1901,9 +1927,17 @@ fn gpu_preprocess_matches_gsplat_oracle() {
             ),
             (
                 "conics".into(),
-                pick32(&con, 3),
-                pick(&gs.get("conics").unwrap().to_f64(), 3),
-                Tol::CONIC,
+                scaled_conics(
+                    &pick32(&con, 3),
+                    &pick(&gs.get("conics").unwrap().to_f64(), 3),
+                )
+                .0,
+                scaled_conics(
+                    &pick32(&con, 3),
+                    &pick(&gs.get("conics").unwrap().to_f64(), 3),
+                )
+                .1,
+                CONIC_SCALED,
             ),
         ];
         if aa {
