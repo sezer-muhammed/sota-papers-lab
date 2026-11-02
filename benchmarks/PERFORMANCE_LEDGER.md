@@ -51,7 +51,8 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 
 | Date | Benchmark | Ours | Reference | Note | Status | Source |
 |---|---|---|---|---|---|---|
-| 2026-11-02 | DTU Chamfer, scans 24/37/40/55/63 | mean 1.23 mm; training 109–197 s plus 3–4 s meshing per scan | published, not run by us: 3DGS 2.18 mm (11.2 min), 2DGS 0.64 (10.9 min), GOF 0.64 (2 h), PGSR 0.48 (0.5 h) | better than 3DGS; behind 2DGS/GOF/PGSR in accuracy; do not claim SOTA mesh accuracy | verified for ours (GPU lock held for training) | mesh-mode, 5eeb283 |
+| 2026-11-02 | DTU Chamfer, scans 24/37/40/55/63 | mean 1.23 mm; training 109–197 s plus 3–4 s meshing per scan | published, not run by us: 3DGS 2.18 mm (11.2 min), 2DGS 0.64 (10.9 min), GOF 0.64 (2 h), PGSR 0.48 (0.5 h) | better than 3DGS; behind 2DGS/GOF/PGSR in accuracy; do not claim SOTA mesh accuracy | superseded: this round used depth-validity masks instead of the standard IDR silhouettes, so it is not comparable to published numbers | mesh-mode, 5eeb283 |
+| 2026-11-02 | DTU Chamfer, scans 24/37/40/55/63, standard evaluation (IDR silhouette culling as in 2DGS) | mean 0.563 mm (0.474 / 0.787 / 0.350 / 0.395 / 0.809); training 96–256 s plus 2.4–3.0 s meshing per scan | published, not run by us: 2DGS 0.64 mm in 10.9 min; PGSR 0.48 mm in 30 min | more accurate than published 2DGS while training ~3–7x shorter; PGSR is still more accurate (0.48) | verified for ours; times for scans 37 and 55 preliminary (lock timed out) | mesh-mode-2, 9543d3f |
 
 Not a win (do not market): Morton re-sort from random order is slower than Faster-GS (8.94 vs 6.21 ms at 1M; 96.1 vs 49.4 ms at 6M).
 
