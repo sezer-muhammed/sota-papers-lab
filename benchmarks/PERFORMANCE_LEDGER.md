@@ -88,6 +88,12 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-02 | T&T truck / train, Quality | 25.68 dB in 159 s / 19.41 dB in 158 s (Fast: 24.27 in 83 s / 19.03 in 84 s) | mvp-pipeline: 23.21 / 20.15 dB; target 24.9 dB | truck meets 24.9; train below (−0.7 dB vs before) | verified (lock held) | mvp-quality-2, a42a973 |
 | 2026-11-02 | Training-pose accuracy vs COLMAP (median relative rotation error) | garden 0.05-0.06°, bicycle 0.16-0.17°, truck 0.19-0.21°, room 0.29-0.31°, train 0.55-0.60° | engine + photometric refinement only: garden 0.64-0.89° | 10x better on garden | verified | mvp-quality-2, a42a973 |
 
+### Object generation from 1-4 photos (Pixal3D multi-view, 1024 cascade, our sidecar)
+
+| Date | Input | Ours | Baseline (same GPU) | Note | Status | Source |
+|---|---|---|---|---|---|---|
+| 2026-11-02 | 1 / 2 / 4 views (synthetic sphere and torus) | 508 / 380 / 368 s; peak 10.5 / 9.7 / 9.8 GB; GLBs valid (Khronos 0 errors) | official Pixal3D inference_mv.py with --low_vram: out of memory after ~240 s on the same 12 GB card | runs where the official code cannot (grouped low-memory NAF upsampler, cache release before CuMesh); quality only on simple synthetic shapes so far | verified (GPU lock held, idle card) | pixal3d-eval-2, a875ceb |
+
 Not a win (do not market): Morton re-sort from random order is slower than Faster-GS (8.94 vs 6.21 ms at 1M; 96.1 vs 49.4 ms at 6M).
 
 Not yet marketable: attention with 4×4 key merging runs in 33–38 ms (vs 1047 ms FlashAttention-2), but the approximation error is too high on some layers (up to 56% rel. L1) until the Phase 2 per-layer schedule search shows which layers can use it.
