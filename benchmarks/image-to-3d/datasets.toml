@@ -1,0 +1,189 @@
+# Image-to-3D benchmark datasets (Phase 0 manifest).
+#
+# fetch_datasets.py reads this file. It downloads only what the protocol uses,
+# verifies it, and writes <root>/<dataset dir>/<scene>/SHA256SUMS.
+#
+# Hashes
+# - archives.*.md5: the object MD5 the server reports (GCS x-goog-hash / ETag).
+#   Checked against the HEAD response before anything is fetched.
+# - archives.*.sha256: sha256 of the whole archive, checked when it is
+#   downloaded in full (fetch = "full").
+# - scenes.*.sha256_tree: sha256 of the scene's SHA256SUMS listing (one
+#   "<sha256>  <relative path>" line per kept file, sorted by path, LF endings).
+#   It covers exactly the kept files, so it is the check that matters for
+#   range-fetched archives. Every zip member is also CRC32-checked on extraction.
+#
+# Protocol (3DGS / gsplat convention, used by every baseline and by our app):
+# - `images` is the folder both training and ground truth come from, used as
+#   is: Mip-NeRF 360 images_4 outdoor (about 1237x822) and images_2 indoor
+#   (about 1557x1038); T&T (979x546, 980x545) and Deep Blending (1264x832,
+#   1332x876) as packaged by 3DGS. All are under 1600 px wide, so 3DGS's
+#   automatic 1600 px rescale never applies and every tool sees these pixels.
+# - Test views: sort image file names, hold out index % test_every == 0.
+
+schema = 1
+root = "~/spl-work/datasets"
+
+[archives.mipnerf360_v2]
+url = "https://storage.googleapis.com/gresearch/refraw360/360_v2.zip"
+bytes = 12535427936
+md5 = "cef2ef3aeaf0c062dbe65130bc249870"
+fetch = "ranges"  # only the kept members are fetched, with HTTP range requests
+dest = "mipnerf360"
+
+[archives.mipnerf360_extra]
+url = "https://storage.googleapis.com/gresearch/refraw360/360_extra_scenes.zip"
+bytes = 4488140217
+md5 = "44f434fc32391c2d0be9bcd15f22bd6a"
+fetch = "ranges"
+dest = "mipnerf360"
+
+[archives.tandt_db]
+url = "https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip"
+bytes = 682628995
+sha256 = "816e62f22a161abbfe841d2a6b10cdf036e297c9fa289b3bfeee9c6ec526d7e1"
+fetch = "full"
+dest = ""  # the archive already has tandt/ and db/ at its top level
+
+[datasets.mipnerf360]
+title = "Mip-NeRF 360"
+citation = "Barron et al., Mip-NeRF 360: Unbounded Anti-Aliased Neural Radiance Fields, CVPR 2022"
+homepage = "https://jonbarron.info/mipnerf360/"
+licence = "No licence stated by the authors; treated as research use only. Do not redistribute."
+
+[datasets.tandt]
+title = "Tanks and Temples (3DGS COLMAP package)"
+citation = "Knapitsch et al., Tanks and Temples, SIGGRAPH 2017; COLMAP reconstructions from Kerbl et al., 3D Gaussian Splatting, SIGGRAPH 2023"
+homepage = "https://www.tanksandtemples.org/"
+licence = "CC BY 4.0, with a licence grant limited to non-commercial scientific research (tanksandtemples.org/license)"
+
+[datasets.db]
+title = "Deep Blending (3DGS COLMAP package)"
+citation = "Hedman et al., Deep Blending for Free-Viewpoint Image-Based Rendering, SIGGRAPH Asia 2018; package from Kerbl et al. 2023"
+homepage = "http://visual.cs.ucl.ac.uk/pubs/deepblending/"
+licence = "Research use only (no explicit licence in the 3DGS package). Do not redistribute."
+
+# Mip-NeRF 360: outdoor scenes use images_4, indoor scenes images_2.
+
+[scenes.bicycle]
+dataset = "mipnerf360"
+archive = "mipnerf360_v2"
+src = "bicycle/"
+keep = ["images_4/", "sparse/0/", "poses_bounds.npy"]
+images = "images_4"
+outdoor = true
+sha256_tree = "9edfa4fe739cb3d872af55800a895531b843718ee90ef31d5f9a9b1f00528941"
+
+[scenes.flowers]
+dataset = "mipnerf360"
+archive = "mipnerf360_extra"
+src = "flowers/"
+keep = ["images_4/", "sparse/0/", "poses_bounds.npy"]
+images = "images_4"
+outdoor = true
+sha256_tree = "35a04b62881583a7b983b89f40ad7bb7e0e002c1fd43c28053250114d5ec78c6"
+
+[scenes.garden]
+dataset = "mipnerf360"
+archive = "mipnerf360_v2"
+src = "garden/"
+keep = ["images_4/", "sparse/0/", "poses_bounds.npy"]
+images = "images_4"
+outdoor = true
+sha256_tree = "f2a8df0e45541de244c2fa50fd52f547c8e803c174fd89a54e83ca0b620fcf0a"
+
+[scenes.stump]
+dataset = "mipnerf360"
+archive = "mipnerf360_v2"
+src = "stump/"
+keep = ["images_4/", "sparse/0/", "poses_bounds.npy"]
+images = "images_4"
+outdoor = true
+sha256_tree = "28e35a3c54ec805acfa2fb0a744d4633ab5d09bb2b893d3459497575c63ea1e7"
+
+[scenes.treehill]
+dataset = "mipnerf360"
+archive = "mipnerf360_extra"
+src = "treehill/"
+keep = ["images_4/", "sparse/0/", "poses_bounds.npy"]
+images = "images_4"
+outdoor = true
+sha256_tree = "cbe5646a997406dd4de7828f46485ff74f493bc998b55782c07684431ec915e4"
+
+[scenes.room]
+dataset = "mipnerf360"
+archive = "mipnerf360_v2"
+src = "room/"
+keep = ["images_2/", "sparse/0/", "poses_bounds.npy"]
+images = "images_2"
+outdoor = false
+sha256_tree = "7c72ed8c99638dc6ec0beb53ee929eaaba70f43a26f359ab275dd04dbe40dfde"
+
+[scenes.counter]
+dataset = "mipnerf360"
+archive = "mipnerf360_v2"
+src = "counter/"
+keep = ["images_2/", "sparse/0/", "poses_bounds.npy"]
+images = "images_2"
+outdoor = false
+sha256_tree = "a979fcdb2739e6c4faebd267f887afd0d3678086d289abc050d888c6d7b9a8af"
+
+[scenes.kitchen]
+dataset = "mipnerf360"
+archive = "mipnerf360_v2"
+src = "kitchen/"
+keep = ["images_2/", "sparse/0/", "poses_bounds.npy"]
+images = "images_2"
+outdoor = false
+sha256_tree = "b66745c03f77dbfddfbe650dd5756dca003199b4922c421ce33fef2f40f2ed7f"
+
+[scenes.bonsai]
+dataset = "mipnerf360"
+archive = "mipnerf360_v2"
+src = "bonsai/"
+keep = ["images_2/", "sparse/0/", "poses_bounds.npy"]
+images = "images_2"
+outdoor = false
+sha256_tree = "944e6d7977f4fdbd815b08e8251d72b89042281f2d71552ab1091d6dc16326c4"
+
+# Tanks and Temples and Deep Blending: the 3DGS package (images already at the
+# resolution 3DGS trains on).
+
+[scenes.truck]
+dataset = "tandt"
+archive = "tandt_db"
+src = "tandt/truck/"
+keep = ["images/", "sparse/0/"]
+images = "images"
+outdoor = true
+sha256_tree = "5992f35724777d9bde5bb64bad092a5d8625db7b5036f228b103b254803f63c8"
+
+[scenes.train]
+dataset = "tandt"
+archive = "tandt_db"
+src = "tandt/train/"
+keep = ["images/", "sparse/0/"]
+images = "images"
+outdoor = true
+sha256_tree = "6e4a89c9720912191d08b8339f72669c49e9f7b24bbe99597f821a8fc5d11f63"
+
+[scenes.playroom]
+dataset = "db"
+archive = "tandt_db"
+src = "db/playroom/"
+keep = ["images/", "sparse/0/"]
+images = "images"
+outdoor = false
+sha256_tree = "dc55234f208ffc7a1cd9ba7824ce07eb7bce3d18600d72bcd4bef1d58818467c"
+
+[scenes.drjohnson]
+dataset = "db"
+archive = "tandt_db"
+src = "db/drjohnson/"
+keep = ["images/", "sparse/0/"]
+images = "images"
+outdoor = false
+sha256_tree = "c3d2eb9d15b70ac9ffceb639bf824bd42c1128a30a7421aaabe851868de864c5"
+
+[protocol]
+test_every = 8
