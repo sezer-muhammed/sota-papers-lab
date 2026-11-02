@@ -26,6 +26,10 @@ depth_max?: number,
  */
 bounds?: [number, number, number, number, number, number], 
 /**
+ * Samples observed by fewer views are not meshed (drops floaters seen once).
+ */
+min_weight: number, 
+/**
  * Keep the largest this many connected pieces (0 = all).
  */
 keep_components: number, 

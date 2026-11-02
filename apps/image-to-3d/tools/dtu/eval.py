@@ -110,14 +110,19 @@ g = np.around((data_in - BB[:1]) / Res).astype(np.int32)
 gin = ((g >= 0) & (g < np.expand_dims(ObsMask.shape, 0))).sum(-1) == 3
 data_obs = data_in[gin][ObsMask[g[gin, 0], g[gin, 1], g[gin, 2]].astype(bool)]
 stl = trimesh.load(os.path.join(gt, f"stl{scan:03}_total.ply")).vertices
-d2s = cKDTree(stl).query(data_obs, workers=-1)[0]
+d2s, nn = cKDTree(stl).query(data_obs, workers=-1)
+near = d2s < 3
+offset = (stl[nn[near]] - data_obs[near]).mean(0)
 plane = scipy.io.loadmat(os.path.join(gt, f"Plane{scan}.mat"))["P"].reshape(-1)
 stl_above = stl[(np.concatenate([stl, np.ones((len(stl), 1))], 1) * plane).sum(-1) > 0]
 s2d = cKDTree(data_in).query(stl_above, workers=-1)[0]
 md = 20
 acc, comp = d2s[d2s < md].mean(), s2d[s2d < md].mean()
 res = {"scan": scan, "accuracy": float(acc), "completeness": float(comp), "chamfer": float((acc + comp) / 2),
-       "kept_faces": int(len(F)), "data_points": int(len(data_obs))}
+       "kept_faces": int(len(F)), "data_points": int(len(data_obs)),
+       "acc_p50": float(np.median(d2s)), "acc_p90": float(np.percentile(d2s, 90)),
+       "offset_mm": [round(float(x), 3) for x in offset],
+       "comp_p50": float(np.median(s2d)), "comp_p90": float(np.percentile(s2d, 90))}
 print(json.dumps(res))
 if out_json:
     json.dump(res, open(out_json, "w"), indent=1)

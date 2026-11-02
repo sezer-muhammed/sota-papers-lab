@@ -13,11 +13,11 @@ import numpy as np
 
 raw, out = sys.argv[1], sys.argv[2]
 cams = np.load(os.path.join(raw, "cameras_hd.npz"))
-names = sorted(os.listdir(os.path.join(raw, "image_hd")))
 os.makedirs(os.path.join(out, "sparse", "0"), exist_ok=True)
 for d in ("image_hd", "mask_hd"):
     if not os.path.isdir(os.path.join(out, d)):
         shutil.move(os.path.join(raw, d), os.path.join(out, d))
+names = sorted(os.listdir(os.path.join(out, "image_hd")))
 h, w = cv2.imread(os.path.join(out, "image_hd", names[0])).shape[:2]
 
 
@@ -45,7 +45,8 @@ with open(os.path.join(out, "sparse/0/cameras.txt"), "w") as fc, open(os.path.jo
         K = K / K[2, 2]
         C = (C[:3] / C[3]).reshape(3)
         t = -R @ C
-        fc.write(f"{i + 1} PINHOLE {w} {h} {K[0, 0]:.10f} {K[1, 1]:.10f} {K[0, 2]:.10f} {K[1, 2]:.10f}\n")
+        # OpenCV/IDR pixel centres sit at integers, COLMAP's at +0.5.
+        fc.write(f"{i + 1} PINHOLE {w} {h} {K[0, 0]:.10f} {K[1, 1]:.10f} {K[0, 2] + 0.5:.10f} {K[1, 2] + 0.5:.10f}\n")
         q = rotmat_to_qvec(R)
         fi.write(f"{i + 1} {' '.join(f'{x:.12f}' for x in q)} {' '.join(f'{x:.12f}' for x in t)} {i + 1} {name}\n\n")
 rng = np.random.default_rng(0)

@@ -196,7 +196,12 @@ impl Preset {
             // Generic thresholds: FastGS-Big medians as the starting point (6.2).
             PresetName::Quality | PresetName::Geometry => Self {
                 densify: DensifyPreset::FastGs(FastGsConfig {
-                    grad_abs_thresh: 4e-4,
+                    // Geometry: denser (DTU scan24 Chamfer 1.84 -> 1.64 mm at 2e-4).
+                    grad_abs_thresh: if name == PresetName::Geometry {
+                        2e-4
+                    } else {
+                        4e-4
+                    },
                     dense: 0.001,
                     loss_thresh: 0.1,
                     ..FastGsConfig::big()

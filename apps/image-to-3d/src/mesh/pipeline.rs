@@ -46,6 +46,9 @@ fn d_bake_views() -> u32 {
 fn d_chart_max() -> u32 {
     30_000
 }
+fn d_min_weight() -> f32 {
+    3.0
+}
 fn d_keep() -> u32 {
     50
 }
@@ -76,6 +79,9 @@ pub struct MeshConfig {
     #[serde(default)]
     #[ts(optional)]
     pub bounds: Option<[f32; 6]>,
+    /// Samples observed by fewer views are not meshed (drops floaters seen once).
+    #[serde(default = "d_min_weight")]
+    pub min_weight: f32,
     /// Keep the largest this many connected pieces (0 = all).
     #[serde(default = "d_keep")]
     pub keep_components: u32,
@@ -104,6 +110,7 @@ impl Default for MeshConfig {
             trunc_voxels: d_trunc(),
             depth_max: None,
             bounds: None,
+            min_weight: d_min_weight(),
             keep_components: d_keep(),
             target_triangles: d_target(),
             texture: true,
@@ -198,6 +205,18 @@ pub fn auto_bounds(cloud: &GaussiansHost) -> [f32; 6] {
     b
 }
 
+/// glTF requires unit normals: degenerate faces leave zero vectors.
+pub fn unit_normals(normals: &mut [[f32; 3]]) {
+    for n in normals {
+        let l = (n[0] as f64).hypot(n[1] as f64).hypot(n[2] as f64);
+        *n = if l > 1e-6 {
+            n.map(|x| (x as f64 / l) as f32)
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+    }
+}
+
 /// Drops all but the `keep` largest edge-connected pieces (by face count).
 pub fn keep_largest(mesh: &mut Mesh, keep: usize) {
     if keep == 0 || mesh.faces.is_empty() {
@@ -249,6 +268,19 @@ pub fn fuse(
     views: &[View],
     cfg: &MeshConfig,
     summary: &mut MeshSummary,
+) -> Result<TsdfVolume> {
+    fuse_with(gpu, cloud, views, cfg, summary, &mut |_, _| Ok(()))
+}
+
+/// [`fuse`], calling `on_view(i, buffers)` after each view's geometry render
+/// (diagnostics: depth and normal maps).
+pub fn fuse_with(
+    gpu: &Gpu,
+    cloud: &GaussiansHost,
+    views: &[View],
+    cfg: &MeshConfig,
+    summary: &mut MeshSummary,
+    on_view: &mut dyn FnMut(usize, &GeomBuffers) -> Result<()>,
 ) -> Result<TsdfVolume> {
     let n = cloud.len();
     ensure!(n > 0, "the splat is empty");
@@ -353,6 +385,7 @@ pub fn fuse(
             )?;
         }
         vol.integrate_device(&buf.out, &depth_camera(v))?;
+        on_view(i, &buf)?;
     }
     gpu.sync()?;
     summary.views_fused = views.len() as u32;
@@ -374,7 +407,10 @@ pub fn build(
     let mut summary = MeshSummary::default();
     let vol = fuse(gpu, cloud, views, cfg, &mut summary)?;
     let t = Instant::now();
-    let mut raw = vol.extract(ExtractOptions::default())?;
+    let mut raw = vol.extract(ExtractOptions {
+        min_weight: cfg.min_weight,
+        ..Default::default()
+    })?;
     drop(vol);
     summary.extract_ms = t.elapsed().as_secs_f64() * 1e3;
     summary.raw_triangles = raw.faces.len() as u32;
@@ -397,6 +433,8 @@ pub fn build(
         super::fastuv::grid_atlas(&tri, cfg.atlas_size)?
     };
     summary.uv_ms = ms;
+    let mut uv = uv;
+    unit_normals(&mut uv.normals);
     let atlas = if cfg.texture && !views.is_empty() {
         let k = (cfg.bake_views.max(1) as usize).min(views.len());
         let picks: Vec<usize> = (0..k).map(|i| i * views.len() / k).collect();

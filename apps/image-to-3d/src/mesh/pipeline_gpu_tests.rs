@@ -10,6 +10,7 @@
 //! | `SPL_TRAIN_PRESET` | `geometry` | preset |
 //! | `SPL_TRAIN_ITERS` | preset | iteration override |
 //! | `SPL_TRAIN_GEOM` | default | `GeometryConfig` JSON override |
+//! | `SPL_TRAIN_OVERRIDES` | `{}` | `PresetOverrides` JSON |
 //! | `SPL_TRAIN_MESH` | 2DGS DTU settings | `MeshConfig` JSON |
 //! | `SPL_TRAIN_SPLAT` | none | mesh this PLY instead of training |
 //! | `SPL_TRAIN_TAG` | `<scene>-<preset>` | output folder |
@@ -98,6 +99,8 @@ fn gpu_mesh_dataset() {
             .ok()
             .map(|v| v.parse().unwrap()),
         geometry,
+        overrides: serde_json::from_str(&env("SPL_TRAIN_OVERRIDES", "{}"))
+            .expect("SPL_TRAIN_OVERRIDES"),
         ..Default::default()
     };
     eprintln!(
@@ -142,6 +145,40 @@ fn gpu_mesh_dataset() {
         }
     };
     eprintln!("train {train_s:.1}s, {} Gaussians", cloud.len());
+    // Normal (camera space, RGB = (1 − n)/2) and median-depth maps of 3 views.
+    let mut dump = |i: usize, b: &super::super::geom::GeomBuffers| -> spl_core::Result<()> {
+        if !i.is_multiple_of(16) {
+            return Ok(());
+        }
+        let v = &views[i];
+        let p = (v.width * v.height) as usize;
+        let out_h = gpu.stream.clone_dtoh(&b.out.slice(0..8 * p)).unwrap();
+        let mut nimg = crate::io::images::Rgb8Image::new(v.width, v.height);
+        let mut dimg = crate::io::images::Rgb8Image::new(v.width, v.height);
+        let zs: Vec<f32> = out_h[..p].iter().cloned().filter(|&z| z > 0.0).collect();
+        let (zlo, zhi) = zs
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &z| (a.min(z), b.max(z)));
+        for k in 0..p {
+            let a = out_h[p + k].max(1e-6);
+            for c in 0..3 {
+                nimg.data[3 * k + c] =
+                    ((1.0 - out_h[(4 + c) * p + k] / a) * 127.5).clamp(0.0, 255.0) as u8;
+            }
+            let z = out_h[k];
+            let g = if z > 0.0 {
+                255.0 * (1.0 - (z - zlo) / (zhi - zlo).max(1e-6))
+            } else {
+                0.0
+            };
+            dimg.data[3 * k..3 * k + 3].fill(g as u8);
+        }
+        nimg.save_png(&out.join(format!("normal_{i:03}.png")))?;
+        dimg.save_png(&out.join(format!("depth_{i:03}.png")))?;
+        Ok(())
+    };
+    let mut sum = MeshSummary::default();
+    drop(fuse_with(&gpu, &cloud, &views, &mesh_cfg, &mut sum, &mut dump).unwrap());
     let t = Instant::now();
     let res = build(&gpu, &cloud, &views, &mesh_cfg).unwrap();
     let mesh_s = t.elapsed().as_secs_f64();
