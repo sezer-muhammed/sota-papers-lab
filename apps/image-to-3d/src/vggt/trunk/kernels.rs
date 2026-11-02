@@ -38,6 +38,7 @@ pub(crate) struct TrunkKernels {
     copy_rows: CudaFunction,
     ln_rows_f32: CudaFunction,
     to_cache: CudaFunction,
+    rows_to_wide: CudaFunction,
     sms: u32,
 }
 
@@ -75,6 +76,7 @@ impl TrunkKernels {
             copy_rows: f("copy_rows")?,
             ln_rows_f32: f("ln_rows_f32")?,
             to_cache: f("to_cache")?,
+            rows_to_wide: f("rows_to_wide")?,
             sms: nn.multiprocessors(),
         })
     }
@@ -251,6 +253,44 @@ impl TrunkKernels {
         // SAFETY: as above.
         unsafe { b.launch(grid(self.sms, rows * DIM / 8)) }
             .map_err(|e| anyhow!("to_cache: {e:?}"))?;
+        Ok(())
+    }
+}
+
+impl TrunkKernels {
+    /// `count` rows per frame at `sm` → f32 columns `col..col + 1024` of
+    /// packed `[n · count][ld]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rows_to_wide(
+        &self,
+        nn: &Nn,
+        x: &dyn DevicePtr<f32>,
+        out: &mut dyn DevicePtrMut<f32>,
+        n: usize,
+        count: usize,
+        sm: RowMap,
+        ld: usize,
+        col: usize,
+    ) -> Result<()> {
+        check(x.len(), rows_needed(n, count, sm) * DIM, "rows_to_wide x")?;
+        check(out.len(), n * count * ld, "rows_to_wide out")?;
+        if col + DIM > ld || !col.is_multiple_of(4) || !ld.is_multiple_of(4) {
+            bail!("rows_to_wide: column {col} / ld {ld} out of range");
+        }
+        let (xp, _g1) = x.device_ptr(&nn.stream);
+        let (op, _g2) = out.device_ptr_mut(&nn.stream);
+        let (ni, ci, l, c) = (n as i32, count as i32, ld as i32, col as i32);
+        let mut b = nn.stream.launch_builder(&self.rows_to_wide);
+        b.arg(&xp)
+            .arg(&op)
+            .arg(&ni)
+            .arg(&ci)
+            .arg(&sm)
+            .arg(&l)
+            .arg(&c);
+        // SAFETY: argument types match the kernel; sizes checked above.
+        unsafe { b.launch(grid(self.sms, n * count * DIM / 4)) }
+            .map_err(|e| anyhow!("rows_to_wide: {e:?}"))?;
         Ok(())
     }
 }

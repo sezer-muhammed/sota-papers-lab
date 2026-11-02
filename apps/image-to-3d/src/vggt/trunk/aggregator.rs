@@ -34,6 +34,7 @@ pub(crate) fn run(
     rope: &CudaSlice<f32>,
     global: &dyn InterAttention,
     cache: [&mut CudaViewMut<'_, u16>; 4],
+    mut cam_tokens: Option<&mut CudaViewMut<'_, f32>>,
     sched: &[InterKind; DEPTH],
     tap: &mut dyn TapSink,
 ) -> Result<()> {
@@ -71,6 +72,12 @@ pub(crate) fn run(
         let slot = CACHED.iter().position(|&c| c == i);
         if let Some(k) = slot {
             ops.k.to_cache(nn, &*x, &mut *cache[k], rows, 2 * DIM, 0)?;
+        }
+        if i == DEPTH - 1
+            && let Some(c) = cam_tokens.as_deref_mut()
+        {
+            let tm = RowMap::new(t, 0);
+            ops.k.rows_to_wide(nn, &*x, c, n, SPECIAL, tm, 2 * DIM, 0)?;
         }
         if tap.wants(Tap::Frame(i)) {
             tap.take(nn, Tap::Frame(i), x, g)?;

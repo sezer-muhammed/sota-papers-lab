@@ -141,3 +141,17 @@ extern "C" __global__ void to_cache(const float* __restrict__ x, bf16* __restric
         *(uint4*)(cache + r * ld + col + c8 * 8) = pack8(v);
     }
 }
+
+// The 17 special rows of every frame (f32, rows at `src`) -> columns
+// `col..col + 1024` of `out` f32 [n * count][ld]: the camera head's fp32 input.
+extern "C" __global__ void rows_to_wide(const float* __restrict__ x, float* __restrict__ out,
+                                        int n, int count, RowMap sm, int ld, int col) {
+    long long total = (long long)n * count * (C / 4);
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < total;
+         i += (long long)gridDim.x * blockDim.x) {
+        int c4 = (int)(i % (C / 4));
+        long long r = i / (C / 4);
+        int p = (int)(r % count), f = (int)(r / count);
+        ((float4*)(out + r * ld + col))[c4] = ((const float4*)(x + map_row(sm, f, p) * C))[c4];
+    }
+}

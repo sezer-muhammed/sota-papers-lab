@@ -329,7 +329,9 @@ impl Trunk {
 
     /// Runs the trunk on `images` (normalised f32 `[N][3][H][W]`, H = 16 h,
     /// W = 16 w) and writes `cache[k]` = bf16 `[N · T][2048]` rows
-    /// `[F_i | G_i]` for i = [`CACHED`]`[k]`. Enqueues work; does not
+    /// `[F_i | G_i]` for i = [`CACHED`]`[k]`. With `cam_tokens`, also
+    /// writes f32 `[N · 17][2048]` = `[F_23 | G_23]` of the special tokens
+    /// (frame-major) for the camera head, which is sensitive to bf16 there. Enqueues work; does not
     /// synchronise unless a tap asks for data.
     #[allow(clippy::too_many_arguments)]
     pub fn run(
@@ -339,9 +341,18 @@ impl Trunk {
         geom: TrunkGeom,
         images: &CudaView<'_, f32>,
         cache: [&mut CudaViewMut<'_, u16>; 4],
+        cam_tokens: Option<&mut CudaViewMut<'_, f32>>,
         sched: &[InterKind; DEPTH],
         tap: &mut dyn TapSink,
     ) -> Result<()> {
+        if let Some(c) = &cam_tokens
+            && c.len() < geom.frames * SPECIAL * 2 * DIM
+        {
+            bail!(
+                "trunk: cam_tokens holds {} values, needs N · 17 · 2048",
+                c.len()
+            );
+        }
         if geom.frames == 0 || geom.grid_h == 0 || geom.grid_w == 0 {
             bail!("trunk: empty geometry {geom:?}");
         }
@@ -390,6 +401,7 @@ impl Trunk {
             agg_rope,
             self.global.as_ref(),
             cache,
+            cam_tokens,
             sched,
             tap,
         )
