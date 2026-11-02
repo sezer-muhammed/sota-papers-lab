@@ -36,7 +36,6 @@ fn engine_with(schedule: AttnSchedule) -> VggtEngine {
     let nn = Arc::new(Nn::open().expect("CUDA"));
     let cfg = VggtConfig {
         schedule,
-        fp8: true,
         fp8_blocks: fp8_blocks(),
         sage_pv16: pv16(),
         ..VggtConfig::default()
@@ -54,6 +53,7 @@ fn pv16() -> bool {
 fn fp8_blocks() -> trunk::Fp8Blocks {
     match std::env::var("SPL_P2_FP8").as_deref() {
         Ok("all") => trunk::Fp8Blocks((1 << 48) - 1),
+        Ok("late") => P2_FP8_BLOCKS,
         Ok(h) if !h.is_empty() => {
             trunk::Fp8Blocks(u64::from_str_radix(h.trim_start_matches("0x"), 16).unwrap())
         }
@@ -276,11 +276,13 @@ fn gpu_p2_bench() {
         .collect();
     let scene = std::env::var("SPL_P2_SCENE").unwrap_or("mipnerf360/kitchen".into());
     let files = image_files(&scene_images(&datasets().join(&scene)));
-    let total = spl_nn::cudarc::driver::result::mem_get_info().unwrap().1;
+    // Holds the CUDA context for the free-memory queries below.
+    let _ctx = Nn::open().expect("CUDA");
     let cancel = CancellationToken::new();
     for (name, sched) in schedules() {
         let free0 = free_bytes();
         let mut e = engine_with(sched);
+        let total = spl_nn::cudarc::driver::result::mem_get_info().unwrap().1;
         for &n in &ns {
             let pick: Vec<PathBuf> = pose::sample_indices(files.len(), n)
                 .iter()
@@ -335,7 +337,17 @@ fn gpu_p2_fp8_sensitivity() {
         "mipnerf360/bicycle,mipnerf360/garden,mipnerf360/stump,mipnerf360/kitchen".into(),
     );
     let (name, sched) = schedules().pop().unwrap();
-    let mut e = engine_with(sched);
+    // Loads the FP8 copies: every masked run needs them.
+    let mut e = {
+        let nn = Arc::new(Nn::open().expect("CUDA"));
+        let cfg = VggtConfig {
+            schedule: sched,
+            fp8: true,
+            sage_pv16: pv16(),
+            ..VggtConfig::default()
+        };
+        VggtEngine::load(nn, &weights_file(), cfg).expect("load engine")
+    };
     let cancel = CancellationToken::new();
     let inputs: Vec<Prepared> = scenes
         .split(',')

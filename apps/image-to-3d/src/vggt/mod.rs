@@ -137,6 +137,12 @@ impl AttnSchedule {
     }
 }
 
+/// Blocks whose GEMMs the Phase 2 configuration runs in FP8: frame and
+/// inter-frame blocks 16..23 (register blocks stay bf16). Per-block FP8
+/// error on the calibration scenes is 3-4.8e-3 (pose encoding) for every
+/// block below 16 and 0.7-1.7e-3 from 16 on (`tools/vggt/PHASE2.md`).
+pub const P2_FP8_BLOCKS: trunk::Fp8Blocks = trunk::Fp8Blocks(0xff_0000 | 0xff << 40);
+
 impl Default for AttnSchedule {
     fn default() -> Self {
         Self::dense()
