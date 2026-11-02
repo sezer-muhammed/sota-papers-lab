@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Usage: gs-ref <command...>              run a command in the spl-gs-ref image on the GPU, as you
+#        gs-ref --entry SCRIPT <args...>  run `python SCRIPT args...` (gs-oracle and gs-metrics use this)
+#
+# Host paths among the arguments (absolute, ./ or ../, *.npz / *.json / *.png /
+# *.jpg names, or relative paths with a slash whose directory exists) are made
+# absolute and their nearest existing directory is mounted at the same path.
+# ~/spl-work is always mounted read-write. Paths under /opt and /usr are left
+# alone (they live in the image). HOME=/tmp inside.
+# Env: SPL_GS_REF_IMAGE (default spl-gs-ref), SPL_WORK (default ~/spl-work).
+set -euo pipefail
+image=${SPL_GS_REF_IMAGE:-spl-gs-ref}
+work=$(realpath -m "${SPL_WORK:-$HOME/spl-work}")
+mounts=(-v "$work:$work")
+declare -A seen=(["$work"]=1)
+
+mount_for() {
+  local d=$1
+  [[ -d $d ]] || d=$(dirname "$d")
+  while [[ ! -d $d ]]; do d=$(dirname "$d"); done
+  case "$d/" in "$work"/*) return ;; esac
+  [[ -n ${seen[$d]:-} ]] && return
+  seen[$d]=1
+  mounts+=(-v "$d:$d")
+}
+
+is_path() {
+  local a=$1
+  [[ $a == /opt/* || $a == /usr/* || $a == -* ]] && return 1
+  [[ $a == /* || $a == ./* || $a == ../* || $a == . || $a == .. ]] && return 0
+  [[ $a == *.npz || $a == *.json || $a == *.png || $a == *.jpg || $a == *.JPG ]] && return 0
+  [[ $a == */* ]] && [[ -e $a || -d $(dirname "$a") ]]
+}
+
+cmd=()
+if [[ ${1:-} == --entry ]]; then
+  cmd=(python "$2")
+  shift 2
+fi
+for a in "$@"; do
+  if is_path "$a"; then
+    p=$(realpath -m -- "$a")
+    mount_for "$p"
+    cmd+=("$p")
+  else
+    cmd+=("$a")
+  fi
+done
+[[ ${#cmd[@]} -gt 0 ]] || { sed -n '2,10p' "$0"; exit 2; }
+
+exec docker run --rm --gpus all --ipc=host --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp -e TQDM_MININTERVAL=15 "${mounts[@]}" -w /tmp \
+  --entrypoint "" "$image" "${cmd[@]}"

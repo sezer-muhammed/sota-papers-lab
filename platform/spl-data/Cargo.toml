@@ -8,9 +8,13 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-blake3.workspace = true
+# rayon: large files (phone videos, splat exports) hash on every core.
+blake3 = { workspace = true, features = ["rayon"] }
 spl-core.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
