@@ -22,6 +22,7 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-01 | Fused LayerNorm → FP8 quantisation | 465 GB/s (92% of the card's 504 GB/s) | PyTorch eager: 67 GB/s | ~7x | 11 of 1.41M FP8 values one step off PyTorch | verified | nn-dense, 0b6b112 |
 | 2026-11-01 | Video keyframe ingest (60 s 4K HEVC 50 Mbps, 300 sharpest keyframes, GPU sharpness scoring) | 17.4 s (3.45x real time) | ffmpeg decode alone: 19.1 s | faster than plain decoding (frames are sampled, then the sharpest per time bin kept) | GPU sharpness = CPU reference within 1e-4 | preliminary (GPU 97-98% busy with other work) | ingest, 1ea00bd |
 | 2026-11-01 | Splat file size, SPZ export (garden init, 138k Gaussians, SH3) | 1.5 MB | INRIA PLY: 33 MB | 22x smaller | round-trip within quantisation; validated with the reference reader | verified | io-export, 8f82b7a |
+| 2026-11-01 | Splat rasterizer, forward and backward (garden 1/4 res, 1.86M visible Gaussians, 3.45M tile entries) | forward 1.41 ms, backward 17.5 ms | gsplat: forward 5.85 ms, backward 20.3 ms | 4.1x forward, 1.16x backward | images within 1.1e-6 of gsplat; gradients within 3e-6 of float64 (gsplat's own error 1.4e-4 to 3e-4) | preliminary (GPU 98% busy; earlier kernel version; locked re-run pending) | k-raster, 1a2b1ab |
 
 Not yet marketable: attention with 4×4 key merging runs in 33–38 ms (vs 1047 ms FlashAttention-2), but the approximation error is too high on some layers (up to 56% rel. L1) until the Phase 2 per-layer schedule search shows which layers can use it.
 
