@@ -328,6 +328,9 @@ pub fn fuse_with(
     tp.max_blocks = ((free / 3) / 4108).clamp(1 << 14, 1 << 21) as u32;
     tp.hash_slots = (2 * tp.max_blocks).next_power_of_two();
     let mut vol = TsdfVolume::new(gpu, tp)?;
+    // Fuse only surface points inside the bounds (plus the truncation band).
+    let clip_lo = [0, 1, 2].map(|k| b[k] - tp.trunc);
+    let clip_hi = [0, 1, 2].map(|k| b[3 + k] + tp.trunc);
     summary.voxel = tp.voxel;
 
     let gp = GeomParams {
@@ -366,6 +369,7 @@ pub fn fuse_with(
             let st = raster.frame.iter.read_status(gpu)?;
             if st.overflow == 0 {
                 geom::render(gpu, &kernels, &raster, &g, &mut buf, gp)?;
+                geom::clip_depth(gpu, &kernels, &raster, &mut buf, clip_lo, clip_hi)?;
                 gpu.sync()?;
                 depth_s += t0.elapsed().as_secs_f64();
                 break;

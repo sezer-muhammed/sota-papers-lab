@@ -39,6 +39,7 @@ pub const SOURCE: KernelSource = KernelSource {
         "geom_pixel",
         "geom_bwd",
         "geom_post",
+        "geom_clip_depth",
     ],
 };
 
@@ -135,6 +136,7 @@ pub struct GeomKernels {
     pixel: CudaFunction,
     bwd: CudaFunction,
     post: CudaFunction,
+    clip: CudaFunction,
     tile_px: u32,
 }
 
@@ -147,6 +149,7 @@ impl GeomKernels {
             pixel: k.get("geom_pixel")?,
             bwd: k.get("geom_bwd")?,
             post: k.get("geom_post")?,
+            clip: k.get("geom_clip_depth")?,
             tile_px: v.tile_pixels(),
         })
     }
@@ -268,6 +271,28 @@ pub fn render(
     // SAFETY: arguments match `geom_fwd`; tiles and the image size come from
     // the device FrameCam (≤ cap.tiles, cap.pixels), records v < v_cap.
     unsafe { l.launch(cfg) }.cuda("geom_fwd")?;
+    Ok(())
+}
+
+/// Zeroes the median depth of pixels whose point is outside `lo..hi`
+/// (after [`render`] of the same frame).
+pub fn clip_depth(
+    gpu: &Gpu,
+    k: &GeomKernels,
+    raster: &GpuRaster,
+    b: &mut GeomBuffers,
+    lo: [f32; 3],
+    hi: [f32; 3],
+) -> Result<()> {
+    let f = &raster.frame;
+    let mut l = gpu.stream.launch_builder(&k.clip);
+    l.arg(&f.iter.cam).arg(&mut b.out);
+    for v in lo.iter().chain(hi.iter()) {
+        l.arg(v);
+    }
+    l.arg(&f.iter.status);
+    // SAFETY: arguments match `geom_clip_depth`; pixels < width·height ≤ cap.pixels.
+    unsafe { l.launch(grid_stride(f.cap.pixels)) }.cuda("geom_clip_depth")?;
     Ok(())
 }
 

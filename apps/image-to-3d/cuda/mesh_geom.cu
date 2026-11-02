@@ -427,3 +427,25 @@ extern "C" __global__ void geom_post(const IterParams* __restrict__ params, cons
         for (int c = 0; c < 4; ++c) atomicAdd(&grad_quat[4 * (size_t)p + c], (g4[c] - q[c] * dot) * inv);
     }
 }
+
+// Mesh renders: zero the median depth (channel 0) of pixels whose surface point lies
+// outside the world AABB lo..hi (already padded by the truncation), so the TSDF neither
+// allocates nor carves outside the meshed region.
+extern "C" __global__ void geom_clip_depth(const FrameCam* __restrict__ cam, float* __restrict__ out, float lo_x,
+                                           float lo_y, float lo_z, float hi_x, float hi_y, float hi_z,
+                                           const uint32_t* __restrict__ status) {
+    if (status[ST_OVERFLOW]) return;
+    const uint32_t W = cam->width, P = W * cam->height;
+    const float* R = cam->R;
+    for (uint32_t pix = blockIdx.x * blockDim.x + threadIdx.x; pix < P; pix += gridDim.x * blockDim.x) {
+        const float z = out[pix];
+        if (z <= 0.f) continue;
+        const float c[3] = {((float)(pix % W) + 0.5f - cam->cx) / cam->fx * z - cam->t[0],
+                            ((float)(pix / W) + 0.5f - cam->cy) / cam->fy * z - cam->t[1], z - cam->t[2]};
+        // x_world = R^T (x_cam - t)
+        const float x = R[0] * c[0] + R[3] * c[1] + R[6] * c[2];
+        const float y = R[1] * c[0] + R[4] * c[1] + R[7] * c[2];
+        const float w = R[2] * c[0] + R[5] * c[1] + R[8] * c[2];
+        if (x < lo_x || y < lo_y || w < lo_z || x > hi_x || y > hi_y || w > hi_z) out[pix] = 0.f;
+    }
+}

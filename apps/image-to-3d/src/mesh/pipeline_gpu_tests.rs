@@ -83,10 +83,12 @@ fn gpu_mesh_dataset() {
         .iter()
         .map(|&i| scene.views[i].clone())
         .collect();
-    // 2DGS DTU: voxel 0.004, sdf_trunc 0.016, depth_trunc 3 (normalised frame).
+    // 2DGS DTU: voxel 0.004, sdf_trunc 0.016 (normalised frame). Its
+    // depth_trunc 3 cuts scan 63's whole object (cameras ~3.2 away): the
+    // bounds crop instead.
     let mesh_cfg: MeshConfig = serde_json::from_str(&env(
         "SPL_TRAIN_MESH",
-        r#"{"voxel": 0.004, "trunc_voxels": 4, "depth_max": 3.0,
+        r#"{"voxel": 0.004, "trunc_voxels": 4,
             "bounds": [-1.1, -1.1, -1.1, 1.1, 1.1, 1.1]}"#,
     ))
     .unwrap();
