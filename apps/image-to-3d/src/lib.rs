@@ -7,7 +7,8 @@
 //! `apps/image-to-3d/DESIGN.md`.
 //!
 //! Ops ([`ops`]): `image_to_3d.train` (COLMAP-posed dataset → splats) and
-//! `image_to_3d.render` (one view of a trained splat).
+//! `image_to_3d.render` (one view of a trained splat); [`pose`]:
+//! `image_to_3d.pose` (photos or video → cameras and points, native VGGT-Ω).
 //!
 //! Module owners (one per file; the header of each file names it):
 //! - preprocess (E1): `kernels/{mod,layout,preprocess,selftest}.rs`,
@@ -28,6 +29,7 @@ pub mod io;
 pub mod kernels;
 pub mod model;
 pub mod ops;
+pub mod pose;
 pub mod presets;
 pub mod reference;
 pub mod refine;
@@ -39,5 +41,5 @@ pub mod vggt;
 use spl_core::Registry;
 
 pub fn register(registry: &mut Registry) {
-    registry.op(ops::Train).op(ops::Render);
+    registry.op(ops::Train).op(ops::Render).op(pose::Pose);
 }

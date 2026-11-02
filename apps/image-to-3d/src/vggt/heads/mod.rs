@@ -52,40 +52,8 @@ pub trait HeadSource {
     fn shape(&self, name: &str) -> Result<Vec<usize>>;
 }
 
-/// Frame count and preprocessed resolution (`height`, `width` in pixels,
-/// multiples of 16).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Geometry {
-    pub frames: usize,
-    pub height: usize,
-    pub width: usize,
-    pub grid_h: usize,
-    pub grid_w: usize,
-}
-
-impl Geometry {
-    pub fn new(frames: usize, height: usize, width: usize) -> Self {
-        Self {
-            frames,
-            height,
-            width,
-            grid_h: height / 16,
-            grid_w: width / 16,
-        }
-    }
-
-    pub fn patches(&self) -> usize {
-        self.grid_h * self.grid_w
-    }
-
-    pub fn tokens(&self) -> usize {
-        SPECIAL + self.patches()
-    }
-
-    pub fn with_frames(&self, frames: usize) -> Self {
-        Self { frames, ..*self }
-    }
-}
+/// Frame count and preprocessed resolution (shared with the runtime).
+pub use super::workspace::Geometry;
 
 /// Cameras on the device, written by [`camera::CameraHead::run`] and read by
 /// the dense head's unprojection.
