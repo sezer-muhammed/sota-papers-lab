@@ -27,6 +27,7 @@
 
 pub mod bench;
 pub mod dash;
+pub mod engine;
 pub mod eval;
 pub mod export;
 pub mod frame;

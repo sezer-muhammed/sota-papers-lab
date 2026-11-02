@@ -11,8 +11,20 @@ width: number, height: number, cameras: ArtifactRef, colmap: ArtifactRef, points
  * What the run gave up because other processes held GPU memory
  * (fewer frames per engine pass); empty on the quality path.
  */
-gpu_memory: Array<string>, 
+gpu_memory: Array<string>,
 /**
  * Seconds spent waiting for GPU memory.
  */
-gpu_wait_s: number, };
+gpu_wait_s: number,
+/**
+ * The front end that ran (`vggt-omega-1b-512`, `da3-base`).
+ */
+engine: string,
+/**
+ * Licence of its weights (SPDX id or name).
+ */
+licence: string,
+/**
+ * SHA-256 of the source weights, when the engine records it.
+ */
+weights_sha256?: string, };

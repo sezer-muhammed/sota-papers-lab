@@ -18,6 +18,7 @@ spl-data = { path = "platform/spl-data" }
 spl-db = { path = "platform/spl-db" }
 spl-host = { path = "platform/spl-host" }
 spl-nn = { path = "platform/spl-nn" }
+spl-ort = { path = "platform/spl-ort" }
 spl-catalog = { path = "catalog", default-features = false }
 
 # apps
