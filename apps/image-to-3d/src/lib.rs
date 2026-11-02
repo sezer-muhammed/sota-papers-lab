@@ -23,6 +23,7 @@
 //! - ingest (A0): `ingest/*`, `cuda/ingest.cu`
 //! - reconstruct (mvp-pipeline): `reconstruct/*`, `cuda/reconstruct.cu`
 
+pub mod bench;
 pub mod eval;
 pub mod export;
 pub mod frame;
@@ -51,5 +52,6 @@ pub fn register(registry: &mut Registry) {
         .op(ops::Train)
         .op(ops::Render)
         .op(pose::Pose)
-        .op(reconstruct::Reconstruct);
+        .op(reconstruct::Reconstruct)
+        .op(bench::Bench);
 }

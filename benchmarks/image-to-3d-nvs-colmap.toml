@@ -1,0 +1,82 @@
+# NVS on COLMAP poses: pure trainer comparison.
+#
+# Every baseline and our trainer see the same COLMAP sparse model and images.
+# Protocol follows 3DGS / gsplat convention: images_4 outdoor, images_2 indoor
+# for Mip-NeRF 360; T&T and Deep Blending as packaged by 3DGS.
+# Test views: sort image names, hold out index % test_every == 0.
+
+[suite]
+name = "nvs-colmap"
+description = "Novel view synthesis quality and speed on COLMAP-posed datasets"
+app = "image-to-3d"
+op = "image_to_3d.bench"
+
+[protocol]
+test_every = 8
+metrics = ["psnr", "ssim", "lpips_vgg", "train_time", "peak_vram", "num_gaussians"]
+preset = "quality"
+datasets_toml = "benchmarks/image-to-3d/datasets.toml"
+
+[baselines]
+results_jsonl = "~/spl-work/bench/results.jsonl"
+paper_toml = "apps/image-to-3d/paper.toml"
+
+# Mip-NeRF 360 outdoor (images_4)
+
+[[scenes]]
+name = "bicycle"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "flowers"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "garden"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "stump"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "treehill"
+dataset = "mipnerf360"
+
+# Mip-NeRF 360 indoor (images_2)
+
+[[scenes]]
+name = "room"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "counter"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "kitchen"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "bonsai"
+dataset = "mipnerf360"
+
+# Tanks and Temples
+
+[[scenes]]
+name = "truck"
+dataset = "tandt"
+
+[[scenes]]
+name = "train"
+dataset = "tandt"
+
+# Deep Blending
+
+[[scenes]]
+name = "playroom"
+dataset = "db"
+
+[[scenes]]
+name = "drjohnson"
+dataset = "db"

@@ -5,6 +5,7 @@ import { ButtonLink } from "@spl/ui";
 import type { Loaded } from "../api";
 import { PageIntro } from "../components/page-intro";
 import { RunPanel } from "../splat/panels";
+import { BenchPage } from "../splat/bench";
 import { DEFAULT_RECONSTRUCT, type ReconstructOptions } from "../splat/reconstruct";
 import { NewScenePanel } from "../splat/reconstruct-panels";
 import { useReconstruct } from "../splat/use-reconstruct";
@@ -13,10 +14,11 @@ import { SplatViewer, type SplatSource } from "../splat/viewer";
 
 /* #/3d: photos or a phone video in (image_to_3d.reconstruct, no poses
    needed), or a COLMAP dataset (image_to_3d.train); Gaussian splats out,
-   viewed here while they form. #/3d/<run> follows (or re-opens) one run. */
+   viewed here while they form. #/3d/<run> follows (or re-opens) one run.
+   #/3d/bench shows the benchmark comparison table. */
 export function SplatPage({ health, runId }: { health: Loaded<Health>; runId?: string }) {
+  if (runId === "bench") return <BenchPage />;
   const run = useReconstruct(runId);
-  // Only starts COLMAP runs; `run` watches every run.
   const zip = useTrain(undefined);
   const [options, setOptions] = useState<ReconstructOptions>(DEFAULT_RECONSTRUCT);
   const [trainOptions, setTrainOptions] = useState<TrainOptions>(DEFAULT_OPTIONS);
@@ -33,11 +35,14 @@ export function SplatPage({ health, runId }: { health: Loaded<Health>; runId?: s
         title="Image to 3D"
         lead="Photos or a phone video in, 3D Gaussian splats out, on this GPU. Cameras and a point cloud show within seconds, then the scene sharpens as it trains. Orbit it, compare any view with its photo, and download .spz, .ply or the cameras."
         action={
-          runId ? (
-            <ButtonLink icon={Plus} href="#/3d">
-              New scene
-            </ButtonLink>
-          ) : null
+          <>
+            <ButtonLink href="#/3d/bench">Bench</ButtonLink>
+            {runId ? (
+              <ButtonLink icon={Plus} href="#/3d">
+                New scene
+              </ButtonLink>
+            ) : null}
+          </>
         }
       />
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">

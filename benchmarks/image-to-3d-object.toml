@@ -1,0 +1,89 @@
+# Object reconstruction from sparse views (1/2/4/8 images).
+#
+# All datasets are placeholders — manifests to be added when the object
+# benchmark is first run.
+
+[suite]
+name = "object"
+description = "Object reconstruction quality from sparse unposed views"
+app = "image-to-3d"
+op = "image_to_3d.bench"
+
+[protocol]
+view_counts = [1, 2, 4, 8]
+metrics = ["chamfer_distance", "f_score", "normal_psnr", "normal_lpips", "train_time", "peak_vram"]
+datasets_toml = "benchmarks/image-to-3d/datasets.toml"
+
+[baselines]
+results_jsonl = "~/spl-work/bench/results.jsonl"
+paper_toml = "apps/image-to-3d/paper.toml"
+
+# DoraBench (placeholder)
+
+[[scenes]]
+name = "backpack"
+dataset = "dorabench"
+
+[[scenes]]
+name = "chair"
+dataset = "dorabench"
+
+[[scenes]]
+name = "drum"
+dataset = "dorabench"
+
+[[scenes]]
+name = "ficus"
+dataset = "dorabench"
+
+[[scenes]]
+name = "hotdog"
+dataset = "dorabench"
+
+[[scenes]]
+name = "lego"
+dataset = "dorabench"
+
+[[scenes]]
+name = "materials"
+dataset = "dorabench"
+
+[[scenes]]
+name = "mic"
+dataset = "dorabench"
+
+# Toys4K (placeholder)
+
+[[scenes]]
+name = "airplane"
+dataset = "toys4k"
+
+[[scenes]]
+name = "car"
+dataset = "toys4k"
+
+[[scenes]]
+name = "guitar"
+dataset = "toys4k"
+
+[[scenes]]
+name = "helmet"
+dataset = "toys4k"
+
+# GSO (placeholder)
+
+[[scenes]]
+name = "bunny"
+dataset = "gso"
+
+[[scenes]]
+name = "dragon"
+dataset = "gso"
+
+[[scenes]]
+name = "teapot"
+dataset = "gso"
+
+[[scenes]]
+name = "armadillo"
+dataset = "gso"

@@ -1,0 +1,83 @@
+# COLMAP-free NVS: VGGT-Ω poses → trainer → eval.
+#
+# Same scenes as nvs-colmap. Test images go through Stage A (pose estimation)
+# but are not trained on; 200-iteration test-time pose refinement applies.
+# Reports both before- and after-refinement numbers.
+
+[suite]
+name = "nvs-colmapfree"
+description = "Novel view synthesis without COLMAP: VGGT-Ω poses + splat trainer"
+app = "image-to-3d"
+op = "image_to_3d.bench"
+
+[protocol]
+test_every = 8
+colmap_free = true
+pose_refine_iters = 200
+metrics = ["psnr", "ssim", "lpips_vgg", "train_time", "peak_vram", "num_gaussians", "pose_time", "total_time"]
+preset = "quality"
+datasets_toml = "benchmarks/image-to-3d/datasets.toml"
+
+[baselines]
+results_jsonl = "~/spl-work/bench/results.jsonl"
+paper_toml = "apps/image-to-3d/paper.toml"
+
+# Mip-NeRF 360 outdoor
+
+[[scenes]]
+name = "bicycle"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "flowers"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "garden"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "stump"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "treehill"
+dataset = "mipnerf360"
+
+# Mip-NeRF 360 indoor
+
+[[scenes]]
+name = "room"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "counter"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "kitchen"
+dataset = "mipnerf360"
+
+[[scenes]]
+name = "bonsai"
+dataset = "mipnerf360"
+
+# Tanks and Temples
+
+[[scenes]]
+name = "truck"
+dataset = "tandt"
+
+[[scenes]]
+name = "train"
+dataset = "tandt"
+
+# Deep Blending
+
+[[scenes]]
+name = "playroom"
+dataset = "db"
+
+[[scenes]]
+name = "drjohnson"
+dataset = "db"
