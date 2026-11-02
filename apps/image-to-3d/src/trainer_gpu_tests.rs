@@ -8,6 +8,7 @@
 //! | `SPL_TRAIN_PRESET` | `quality` | preset name (snake case) |
 //! | `SPL_TRAIN_ITERS` | preset | iteration override |
 //! | `SPL_TRAIN_EAGER` | 0 | 1 = no CUDA graphs |
+//! | `SPL_TRAIN_MAX_GAUSSIANS` | VRAM | capacity ceiling |
 //! | `SPL_TRAIN_TAG` | `<scene>-<preset>` | output folder name |
 //!
 //! Writes `/out/image-to-3d/train/<tag>/`: `renders/<view>.png` (test views,
@@ -69,6 +70,9 @@ fn gpu_train_dataset() {
     let cfg = TrainConfig {
         preset,
         iterations,
+        max_gaussians: std::env::var("SPL_TRAIN_MAX_GAUSSIANS")
+            .ok()
+            .map(|v| v.parse().expect("SPL_TRAIN_MAX_GAUSSIANS")),
         overrides: PresetOverrides {
             scene: Some(short.clone()),
             ..Default::default()
@@ -76,9 +80,16 @@ fn gpu_train_dataset() {
         ..Default::default()
     };
     let gpu = Gpu::open().unwrap();
+    let (free, _) = gpu.mem_info().unwrap();
+    eprintln!("free VRAM at start: {} MiB", free >> 20);
     let t1 = Instant::now();
     let mut trainer = Trainer::new(&gpu, scene, cfg).unwrap();
     let setup_s = t1.elapsed().as_secs_f64();
+    eprintln!(
+        "capacity {} Gaussians, raster {:?}, setup {setup_s:.1}s",
+        trainer.g.cap,
+        trainer.raster.as_ref().unwrap().capacity()
+    );
     trainer.eager = env("SPL_TRAIN_EAGER", "0") == "1";
     let mut last_log = 0u32;
     let summary = trainer
@@ -144,7 +155,8 @@ fn write_profile(path: &Path, v: &serde_json::Value) {
 }
 
 /// Mean ms per stage over `n` eager training iterations at full resolution
-/// and degree 3 on the current model (events between the stage functions).
+/// and degree 3 on the current model (events between the stage functions),
+/// with an early-phase optimizer plan (every group due: the dense worst case).
 /// The iterations really step the model (the run is over anyway).
 fn profile_iterations(tr: &mut Trainer, n: u32) -> std::collections::BTreeMap<String, f64> {
     const STAGES: [&str; 10] = [
@@ -176,7 +188,8 @@ fn profile_iterations(tr: &mut Trainer, n: u32) -> std::collections::BTreeMap<St
     for i in 0..n + 3 {
         let t = t_end + 1 + i;
         let view = tr.order.next_view();
-        let plan = tr.adam.plan(t);
+        let plan = tr.adam.plan(16);
+        assert_eq!(plan.due_mask, 0x3f, "profile wants every group due");
         let params = tr.iter_params(t, view, 3, 1, plan);
         tr.ring.push(&params).unwrap();
         let raster = tr.raster.as_mut().unwrap();

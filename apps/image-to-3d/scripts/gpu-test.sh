@@ -37,10 +37,13 @@ mounts=(-v "$dir:$dir" -v "$HOME/spl-work/out:/out")
 [ -d "$datasets" ] && mounts+=(-v "$datasets:/datasets:ro")
 lock=()
 [ "${SPL_GPU_LOCK:-0}" = 1 ] && lock=(flock -x "$HOME/spl-work/gpu.lock")
+# Forward the training driver's settings (trainer_gpu_tests.rs).
+train_env=()
+for v in $(compgen -e | grep '^SPL_TRAIN_' || true); do train_env+=(-e "$v=${!v}"); done
 for b in $bins; do
   "${lock[@]}" docker run --rm --gpus all --user "$(id -u):$(id -g)" \
     -e HOME=/tmp -e RUST_BACKTRACE=1 -e SPL_DATASETS=/datasets \
     -e SPL_NVRTC_LINEINFO="${SPL_NVRTC_LINEINFO:-}" -e SPL_SORT_DUMP="${SPL_SORT_DUMP:-}" \
-    "${mounts[@]}" -w "$dir" --entrypoint "" "$image" \
+    "${train_env[@]}" "${mounts[@]}" -w "$dir" --entrypoint "" "$image" \
     "$b" --nocapture --test-threads=1 --include-ignored "$@"
 done

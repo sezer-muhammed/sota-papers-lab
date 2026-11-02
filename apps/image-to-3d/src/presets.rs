@@ -219,7 +219,9 @@ impl Preset {
     /// × total/30000, rounded to the nearest multiple of 10; counts (K, τ_d,
     /// every-16/32/64 step cadences) stay (spec-train 6.2).
     pub fn scaled(&self, total: u32) -> Self {
-        let s = |x: u32| scale_iter(x, total);
+        // Relative to the preset's own length: Fast is already at 15k.
+        let from = self.iterations;
+        let s = |x: u32| scale_between(x, from, total);
         let mut p = self.clone();
         p.iterations = total;
         p.sh_interval = s(p.sh_interval).max(10);
@@ -330,10 +332,15 @@ impl Preset {
 
 /// `x · total / 30000`, rounded to the nearest multiple of 10.
 pub fn scale_iter(x: u32, total: u32) -> u32 {
-    if total == 30_000 {
+    scale_between(x, 30_000, total)
+}
+
+/// `x · to / from`, rounded to the nearest multiple of 10 (`x` when equal).
+pub fn scale_between(x: u32, from: u32, to: u32) -> u32 {
+    if from == to || from == 0 {
         return x;
     }
-    let v = x as f64 * total as f64 / 30_000.0;
+    let v = x as f64 * to as f64 / from as f64;
     ((v / 10.0).round() * 10.0) as u32
 }
 
@@ -555,6 +562,8 @@ mod tests {
         assert_eq!(f.adam.eps, 1e-15);
         let fast = Preset::new(PresetName::Fast);
         assert_eq!((fast.iterations, fast.sh_interval), (15_000, 500));
+        // Rescaling a pre-scaled preset is relative to its own length.
+        assert_eq!(fast.scaled(7_500).sh_interval, 250);
     }
 
     #[test]

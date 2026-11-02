@@ -74,6 +74,10 @@ pub struct TrainConfig {
     #[serde(default)]
     #[ts(optional)]
     pub eval_every: Option<u32>,
+    /// Gaussian capacity ceiling; free VRAM decides when absent.
+    #[serde(default)]
+    #[ts(optional)]
+    pub max_gaussians: Option<u32>,
 }
 
 impl Default for TrainConfig {
@@ -85,6 +89,7 @@ impl Default for TrainConfig {
             overrides: PresetOverrides::default(),
             snapshot_every_s: None,
             eval_every: None,
+            max_gaussians: None,
         }
     }
 }
@@ -269,10 +274,17 @@ impl Trainer {
         let preset_cap = match &preset.densify {
             DensifyPreset::Mcmc(c) => c.cap_max as u64,
             _ => MAX_GAUSSIANS,
-        };
+        }
+        .min(cfg.max_gaussians.map_or(u64::MAX, u64::from));
         let bf16 = preset.adam.moments != MomentPrecision::F32;
-        let capacity = plan_capacity(free, 0, reserve, preset_cap, bf16)
+        // 10% of the free memory stays spare: other processes share the device.
+        let capacity = plan_capacity(free - free / 10, 0, reserve, preset_cap, bf16)
             .max(host.len().next_multiple_of(1024) as u64) as usize;
+        tracing::info!(
+            "free VRAM {} MiB, raster reserve {} MiB: capacity {capacity} Gaussians",
+            free >> 20,
+            reserve >> 20
+        );
         let mut g = Gaussians::alloc(gpu, capacity, preset.antialiased)?;
         g.upload(gpu, &host)?;
         let strategy = match &preset.densify {
