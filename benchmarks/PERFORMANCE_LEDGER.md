@@ -49,6 +49,9 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-02 | bonsai (images_2) | 32.78 dB in 380 s | gsplat MCMC: 32.58 dB in 1223 s | +0.20 dB and 3.2x faster | as above | opt-train, 76404de |
 | 2026-11-02 | flowers (images_4) | 21.07 dB in 201 s | FastGS: 21.35 dB in 182 s | -0.28 dB (FastGS wins here) | quality verified | opt-train, 76404de |
 | 2026-11-02 | Mip-NeRF 360, all 9 scenes, Quality preset | mean 27.59 dB, 144–380 s per scene | (no rival measured on all 9 yet) | — | quality verified | opt-train, 76404de |
+| 2026-11-02 | Mip-NeRF 360, all 9 scenes, Big preset | mean 27.66 dB, every scene <= 288 s | (no rival measured on all 9 yet) | — | verified (GPU lock held) | opt-train-2, 0279945 |
+| 2026-11-02 | bicycle with a denser-densification setting (grad 8e-4) | 25.38 dB in 150 s | Faster-GS (fused): 25.27 dB in 619 s | +0.11 dB and 4.1x faster | verified (lock held); setting is not the default (it costs 0.1-0.4 dB on garden, room, kitchen) | opt-train-2, 0279945 |
+| 2026-11-02 | flowers with the same setting | 21.46 dB in 144 s | FastGS: 21.35 dB in 182 s | +0.11 dB and 1.26x faster | as above | opt-train-2, 0279945 |
 
 ### Mesh (Geometry preset + GPU TSDF + marching cubes)
 
