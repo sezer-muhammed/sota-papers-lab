@@ -56,6 +56,25 @@ pub const KBIN_ABS: f32 = 1e-4;
 pub const LOG2E: f32 = std::f32::consts::LOG2_E;
 pub const SH_C0: f32 = 0.282_094_8;
 pub const SH_C1: f32 = 0.488_602_52;
+pub const SH_C2: [f32; 5] = [
+    1.092_548_5,
+    -1.092_548_5,
+    0.315_391_57,
+    -1.092_548_5,
+    0.546_274_24,
+];
+pub const SH_C3: [f32; 7] = [
+    -0.590_043_6,
+    2.890_611_4,
+    -0.457_045_8,
+    0.373_176_34,
+    -0.457_045_8,
+    1.445_305_7,
+    -0.590_043_6,
+];
+/// `SplatRec::{ca, cc}` = A·CONIC_SCALE_AC, `cb` = B·CONIC_SCALE_B (exp2-ready conic).
+pub const CONIC_SCALE_AC: f32 = -(0.5 * std::f32::consts::LOG2_E);
+pub const CONIC_SCALE_B: f32 = -std::f32::consts::LOG2_E;
 
 // ---- status words
 pub const STATUS_LEN: usize = 16;
@@ -215,6 +234,20 @@ mod tests {
             ("LOG2E", LOG2E),
             ("SH_C0", SH_C0),
             ("SH_C1", SH_C1),
+            ("SH_C2_0", SH_C2[0]),
+            ("SH_C2_1", SH_C2[1]),
+            ("SH_C2_2", SH_C2[2]),
+            ("SH_C2_3", SH_C2[3]),
+            ("SH_C2_4", SH_C2[4]),
+            ("SH_C3_0", SH_C3[0]),
+            ("SH_C3_1", SH_C3[1]),
+            ("SH_C3_2", SH_C3[2]),
+            ("SH_C3_3", SH_C3[3]),
+            ("SH_C3_4", SH_C3[4]),
+            ("SH_C3_5", SH_C3[5]),
+            ("SH_C3_6", SH_C3[6]),
+            ("CONIC_SCALE_AC", CONIC_SCALE_AC),
+            ("CONIC_SCALE_B", CONIC_SCALE_B),
         ];
         for (name, value) in floats {
             let got: f32 = d
