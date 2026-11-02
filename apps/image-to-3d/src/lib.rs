@@ -8,7 +8,8 @@
 //!
 //! Ops ([`ops`]): `image_to_3d.train` (COLMAP-posed dataset → splats) and
 //! `image_to_3d.render` (one view of a trained splat); [`pose`]:
-//! `image_to_3d.pose` (photos or video → cameras and points, native VGGT-Ω).
+//! `image_to_3d.pose` (photos or video → cameras and points, native VGGT-Ω);
+//! `image_to_3d.mesh` (splat + cameras → textured GLB, [`mesh::op`]).
 //!
 //! Module owners (one per file; the header of each file names it):
 //! - preprocess (E1): `kernels/{mod,layout,preprocess,selftest}.rs`,
@@ -35,6 +36,7 @@ pub mod ingest;
 pub mod init;
 pub mod io;
 pub mod kernels;
+pub mod mesh;
 pub mod model;
 pub mod ops;
 pub mod pose;
@@ -58,5 +60,6 @@ pub fn register(registry: &mut Registry) {
         .op(pose::Pose)
         .op(reconstruct::Reconstruct)
         .op(generate::Generate)
-        .op(bench::Bench);
+        .op(bench::Bench)
+        .op(mesh::op::MeshOp);
 }

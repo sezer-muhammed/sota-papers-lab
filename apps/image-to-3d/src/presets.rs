@@ -40,6 +40,8 @@ pub enum PresetName {
     Big,
     /// Ours: COLMAP-free fast target, fewer iterations, resolution warm-up.
     Fast,
+    /// Quality plus the geometry regularisers (`mesh::geom`): for meshing.
+    Geometry,
 }
 
 /// Any preset field, for ablations. `None` keeps the preset's value.
@@ -218,11 +220,14 @@ impl Preset {
                 ..base
             },
             // Generic thresholds: FastGS-Big medians as the starting point (6.2).
-            // The DashGaussian warm-up and SH every 500 cost 0.2-0.9 dB here on the
-            // 13-scene suite (opt-train-2), so Quality keeps round-1 settings.
-            PresetName::Quality => Self {
+            PresetName::Quality | PresetName::Geometry => Self {
                 densify: DensifyPreset::FastGs(FastGsConfig {
-                    grad_abs_thresh: 4e-4,
+                    // Geometry: denser (DTU scan24 Chamfer 1.84 -> 1.64 mm at 2e-4).
+                    grad_abs_thresh: if name == PresetName::Geometry {
+                        2e-4
+                    } else {
+                        4e-4
+                    },
                     dense: 0.001,
                     loss_thresh: 0.1,
                     ..FastGsConfig::big()
