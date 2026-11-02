@@ -47,6 +47,12 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-02 | flowers (images_4) | 21.07 dB in 201 s | FastGS: 21.35 dB in 182 s | -0.28 dB (FastGS wins here) | quality verified | opt-train, 76404de |
 | 2026-11-02 | Mip-NeRF 360, all 9 scenes, Quality preset | mean 27.59 dB, 144–380 s per scene | (no rival measured on all 9 yet) | — | quality verified | opt-train, 76404de |
 
+### Mesh (Geometry preset + GPU TSDF + marching cubes)
+
+| Date | Benchmark | Ours | Reference | Note | Status | Source |
+|---|---|---|---|---|---|---|
+| 2026-11-02 | DTU Chamfer, scans 24/37/40/55/63 | mean 1.23 mm; training 109–197 s plus 3–4 s meshing per scan | published, not run by us: 3DGS 2.18 mm (11.2 min), 2DGS 0.64 (10.9 min), GOF 0.64 (2 h), PGSR 0.48 (0.5 h) | better than 3DGS; behind 2DGS/GOF/PGSR in accuracy; do not claim SOTA mesh accuracy | verified for ours (GPU lock held for training) | mesh-mode, 5eeb283 |
+
 Not a win (do not market): Morton re-sort from random order is slower than Faster-GS (8.94 vs 6.21 ms at 1M; 96.1 vs 49.4 ms at 6M).
 
 Not yet marketable: attention with 4×4 key merging runs in 33–38 ms (vs 1047 ms FlashAttention-2), but the approximation error is too high on some layers (up to 56% rel. L1) until the Phase 2 per-layer schedule search shows which layers can use it.
