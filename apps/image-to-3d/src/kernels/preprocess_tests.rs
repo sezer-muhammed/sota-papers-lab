@@ -1215,6 +1215,64 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// frame_begin reads ring slot `iter_counter % slots` (a device buffer stands in
+/// for the mapped pinned ring), composes that slot's camera and keeps the sticky
+/// status words; frame_end stamps ST_ITER, mirrors the status and counts.
+#[test]
+#[ignore]
+fn gpu_frame_begin_reads_the_ring_and_frame_end_counts() {
+    use crate::kernels::layout::{ST_ITER, ST_N_VIS, ST_OVERFLOW, STATUS_LEN};
+    use spl_gpu::cudarc::driver::DevicePtr;
+    let gpu = gpu();
+    let s = gpu.stream.clone();
+    let scene = synthetic_scene(&SyntheticOptions {
+        n: 8,
+        views: 5,
+        ..Default::default()
+    });
+    let mut rig = Rig::new(
+        &gpu,
+        &scene.gaussians,
+        &scene.views,
+        RasterVariant::default(),
+        None,
+        None,
+    );
+    let slots = 8usize;
+    let ring: Vec<IterParams> = (0..slots as u32)
+        .map(|i| {
+            let mut p = iter_params(8, i % 5, 3, 0, 0.3);
+            p.frame.iteration = 100 + i;
+            p
+        })
+        .collect();
+    let ring = s.clone_htod(&ring).unwrap();
+    let (ring_ptr, _sync) = ring.device_ptr(&s);
+    s.memcpy_htod(&[13u32], &mut rig.f.iter.iter_counter)
+        .unwrap();
+    let mut status = vec![0u32; STATUS_LEN];
+    status[ST_OVERFLOW] = 2;
+    status[ST_N_VIS] = 77;
+    status[ST_ITER] = 9;
+    s.memcpy_htod(&status, &mut rig.f.iter.status).unwrap();
+    super::launch_frame_begin(&rig.k, &s, ring_ptr, slots as u32, &rig.cams, &mut rig.f).unwrap();
+    let p: IterParams = s.clone_dtoh(&rig.f.iter.params).unwrap()[0];
+    assert_eq!(p.frame.iteration, 105, "slot 13 % 8 = 5");
+    let cam: FrameCam = s.clone_dtoh(&rig.f.iter.cam).unwrap()[0];
+    assert_eq!(cam.image_index, 0, "slot 5 renders view 5 % 5");
+    let want = RefCam::compose(&scene.views[0], (64, 48), [0.0; 6]);
+    assert!((cam.t[2] as f64 - want.t[2]).abs() < 1e-5);
+    let st = s.clone_dtoh(&rig.f.iter.status).unwrap();
+    assert_eq!((st[ST_OVERFLOW], st[ST_N_VIS], st[ST_ITER]), (2, 0, 9));
+    let mirror = s.alloc_zeros::<u32>(STATUS_LEN).unwrap();
+    let (mirror_ptr, _m) = mirror.device_ptr(&s);
+    super::frame_end(&rig.k, &s, &mut rig.f, mirror_ptr).unwrap();
+    drop(_m);
+    let m = s.clone_dtoh(&mirror).unwrap();
+    assert_eq!((m[ST_OVERFLOW], m[ST_ITER]), (2, 105));
+    assert_eq!(s.clone_dtoh(&rig.f.iter.iter_counter).unwrap()[0], 14);
+}
+
 fn filter_values(n: usize, seed: u64) -> Vec<f32> {
     let rng = Philox::new(seed);
     (0..n as u32)
@@ -2200,27 +2258,32 @@ struct BenchRow {
     bwd_gbps: f64,
 }
 
-/// Mip-NeRF 360 garden at 1/4 resolution with a trained 3M-Gaussian model
-/// (gsplat MCMC, 10k steps; `SPL_GARDEN_PLY`, default
-/// /out/image-to-3d/garden_mcmc3m_10k.ply), Morton-ordered, at N = 1M (every
-/// third), 3M and 6M (each twice, jittered), over every 8th training view.
-/// Times frame_begin + preprocess_fwd and preprocess_bwd (Write sink; with and
-/// without camera gradients and densify statistics) with CUDA events.
-/// Writes /out/image-to-3d/bench/preprocess.json and garden_views.npz (the
-/// cameras and Morton order for the gsplat comparison script).
-#[test]
-#[ignore]
-fn gpu_preprocess_bench_garden() {
+struct BenchInputs {
+    views: Vec<View>,
+    bench_views: Vec<usize>,
+    model: GaussiansHost,
+    order: Vec<u32>,
+    ply: PathBuf,
+    out: PathBuf,
+}
+
+/// The garden benchmark's inputs: training views, the timed subset (every 8th,
+/// at most `SPL_BENCH_VIEWS`), the PLY (`SPL_GARDEN_PLY`, default
+/// `<out>/garden_mcmc3m_10k.ply`) and its Morton order. Also writes
+/// `<out>/bench/garden_views.npz` (cameras of the timed views and the order)
+/// for `benchmarks/image-to-3d/py/preprocess_ref_bench.py`. None (skip) when
+/// the dataset or the PLY is missing.
+fn garden_bench_inputs() -> Option<BenchInputs> {
     let Some(root) = crate::testkit::mip360_scene("garden") else {
         eprintln!("skipped: garden dataset not found");
-        return;
+        return None;
     };
     let ply = std::env::var_os("SPL_GARDEN_PLY")
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::testkit::out_dir("garden_mcmc3m_10k.ply"));
     if !ply.is_file() {
         eprintln!("skipped: {} not found", ply.display());
-        return;
+        return None;
     }
     let scene = crate::io::scene::load_colmap_scene(
         &root,
@@ -2235,22 +2298,10 @@ fn gpu_preprocess_bench_garden() {
         .iter()
         .map(|&i| scene.views[i].clone())
         .collect();
-    // SPL_BENCH_VIEWS limits the timed views (profiling runs), SPL_BENCH_SIZES
-    // the model sizes ("1M,3M,6M").
     let max_views = std::env::var("SPL_BENCH_VIEWS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(usize::MAX);
-    let sizes = std::env::var("SPL_BENCH_SIZES").unwrap_or_else(|_| "1M,3M,6M".into());
-    // SPL_PRE_VARIANTS: occupancy targets "fwd,bwd;..." (PRE_FWD/BWD_MIN_BLOCKS).
-    let variants: Vec<(u32, u32)> = std::env::var("SPL_PRE_VARIANTS")
-        .unwrap_or_else(|_| "3,2".into())
-        .split(';')
-        .map(|v| {
-            let (f, b) = v.split_once(',').expect("fwd,bwd");
-            (f.trim().parse().unwrap(), b.trim().parse().unwrap())
-        })
-        .collect();
     let bench_views: Vec<usize> = (0..views.len()).step_by(8).take(max_views).collect();
     let t0 = std::time::Instant::now();
     let model = read_ply(&ply);
@@ -2267,35 +2318,86 @@ fn gpu_preprocess_bench_garden() {
     );
     let out = crate::testkit::out_dir("bench");
     std::fs::create_dir_all(&out).unwrap();
-    {
-        let mut z = Npz::new();
-        let nv = bench_views.len();
-        z.f32(
-            "viewmats",
-            &[nv, 4, 4],
-            bench_views
-                .iter()
-                .flat_map(|&i| view_matrix(&views[i]))
-                .collect(),
-        )
-        .unwrap()
-        .f32(
-            "Ks",
-            &[nv, 3, 3],
-            bench_views
-                .iter()
-                .flat_map(|&i| k_matrix(&views[i]))
-                .collect(),
-        )
-        .unwrap()
-        .i32_scalar("width", views[0].width as i32)
-        .unwrap()
-        .i32_scalar("height", views[0].height as i32)
-        .unwrap()
-        .insert("order", &[order.len()], NpyData::U32(order.clone()))
-        .unwrap();
-        z.write(&out.join("garden_views.npz")).unwrap();
+    let mut z = Npz::new();
+    let nv = bench_views.len();
+    z.f32(
+        "viewmats",
+        &[nv, 4, 4],
+        bench_views
+            .iter()
+            .flat_map(|&i| view_matrix(&views[i]))
+            .collect(),
+    )
+    .unwrap()
+    .f32(
+        "Ks",
+        &[nv, 3, 3],
+        bench_views
+            .iter()
+            .flat_map(|&i| k_matrix(&views[i]))
+            .collect(),
+    )
+    .unwrap()
+    .i32_scalar("width", views[0].width as i32)
+    .unwrap()
+    .i32_scalar("height", views[0].height as i32)
+    .unwrap()
+    .insert("order", &[order.len()], NpyData::U32(order.clone()))
+    .unwrap();
+    z.write(&out.join("garden_views.npz")).unwrap();
+    Some(BenchInputs {
+        views,
+        bench_views,
+        model,
+        order,
+        ply,
+        out,
+    })
+}
+
+/// Writes the benchmark inputs only (CPU; run natively on the host before the
+/// gsplat / Faster-GS comparison script).
+#[test]
+#[ignore]
+fn bench_inputs_garden() {
+    if let Some(inp) = garden_bench_inputs() {
+        println!("wrote {}", inp.out.join("garden_views.npz").display());
     }
+}
+
+/// Mip-NeRF 360 garden at 1/4 resolution with a trained 3M-Gaussian model
+/// (gsplat MCMC, 10k steps; `SPL_GARDEN_PLY`, default
+/// /out/image-to-3d/garden_mcmc3m_10k.ply), Morton-ordered, at N = 1M (every
+/// third), 3M and 6M (each twice, jittered), over every 8th training view.
+/// Times frame_begin + preprocess_fwd and preprocess_bwd (Write sink; with and
+/// without camera gradients and densify statistics) with CUDA events.
+/// Writes /out/image-to-3d/bench/preprocess.json and garden_views.npz (the
+/// cameras and Morton order for the gsplat comparison script).
+#[test]
+#[ignore]
+fn gpu_preprocess_bench_garden() {
+    let Some(inp) = garden_bench_inputs() else {
+        return;
+    };
+    let BenchInputs {
+        views,
+        bench_views,
+        model,
+        order,
+        ply,
+        out,
+    } = inp;
+    // SPL_BENCH_SIZES: model sizes ("1M,3M,6M").
+    let sizes = std::env::var("SPL_BENCH_SIZES").unwrap_or_else(|_| "1M,3M,6M".into());
+    // SPL_PRE_VARIANTS: occupancy targets "fwd,bwd;..." (PRE_FWD/BWD_MIN_BLOCKS).
+    let variants: Vec<(u32, u32)> = std::env::var("SPL_PRE_VARIANTS")
+        .unwrap_or_else(|_| "3,2;4,2;4,3;5,4".into())
+        .split(';')
+        .map(|v| {
+            let (f, b) = v.split_once(',').expect("fwd,bwd");
+            (f.trim().parse().unwrap(), b.trim().parse().unwrap())
+        })
+        .collect();
     let gpu = gpu();
     {
         let k = SplatKernels::load(&gpu, RasterVariant::default()).unwrap();

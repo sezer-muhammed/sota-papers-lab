@@ -76,10 +76,13 @@ def kernel_ms(fn, keys: list[str], reps: int) -> dict[str, float]:
             fn()
         torch.cuda.synchronize()
     out = {k: 0.0 for k in keys}
-    for e in prof.key_averages():
+    for e in prof.events():
+        # Kernel records only (operator records carry their kernels' time too).
+        if e.device_type != torch.autograd.DeviceType.CUDA:
+            continue
         for k in keys:
-            if k in e.key:
-                out[k] += e.device_time_total / 1000.0 / reps
+            if k in e.name:
+                out[k] += e.time_range.elapsed_us() / 1000.0 / reps
     return out
 
 
