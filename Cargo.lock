@@ -261,6 +261,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "rayon-core",
 ]
 
 [[package]]
@@ -2239,6 +2240,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "spl-core",
+ "tempfile",
  "tokio",
 ]
 
@@ -2272,6 +2274,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "blake3",
+ "futures-util",
  "schemars",
  "serde",
  "serde_json",
@@ -2281,6 +2285,7 @@ dependencies = [
  "spl-gpu",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml 1.1.8+spec-1.1.0",
  "tower",
  "tower-http",
