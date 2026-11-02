@@ -1031,7 +1031,18 @@ impl TestViews {
             .stream
             .clone_dtoh(&self.cams.intr)
             .cuda("download test intrinsics")?;
-        let shared: Vec<_> = mine.iter().map(|_| intr[0]).collect();
+        // One shared camera: its entry; per-image intrinsics: the median focal.
+        let mut k = intr[0];
+        if intr.len() > 1 {
+            let med = |f: fn(&crate::frame::Intr) -> f32| {
+                let mut v: Vec<f32> = intr.iter().map(f).collect();
+                v.sort_by(f32::total_cmp);
+                v[v.len() / 2]
+            };
+            k.fx = med(|k| k.fx);
+            k.fy = med(|k| k.fy);
+        }
+        let shared: Vec<_> = mine.iter().map(|_| k).collect();
         gpu.stream
             .memcpy_htod(&shared, &mut self.cams.intr)
             .cuda("upload test intrinsics")?;

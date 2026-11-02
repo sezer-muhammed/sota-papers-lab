@@ -16,6 +16,8 @@
 //! | `SPL_RECON_TAG` | `<scene>-<preset>` | output folder name |
 //! | `SPL_VGGT_WEIGHTS` | — | engine weights |
 //! | `SPL_RECON_GT_POSES` | 0 | 1 = replace the engine's cameras by the dataset's COLMAP cameras, Sim(3)-aligned into the engine's frame (diagnostic: isolates pose error) |
+//! | `SPL_RECON_GT_REPROJECT` | 0 | with `SPL_RECON_GT_POSES`: 1 = re-unproject the engine depth with the COLMAP cameras |
+//! | `SPL_RECON_GT_POINTS` | 0 | with `SPL_RECON_GT_POSES`: 1 = init from the COLMAP points too (isolates the init source) |
 //!
 //! End to end = from the first JPEG read (or the video probe) to
 //! `splat.spz` written to disk. Writes `/out/image-to-3d/reconstruct/<tag>/`:
@@ -27,7 +29,7 @@ use std::time::Instant;
 
 use spl_core::CancellationToken;
 
-use super::align::{M3, V3, poses_into_frame};
+use super::align::{M3, V3, map_point, poses_into_frame, sim3_between};
 use super::pipeline::{Event, Frames, PipelineConfig, ReconPreset, reconstruct_with};
 use super::scene::Posed;
 use super::{image_files, to_frames};
@@ -214,6 +216,23 @@ fn run_one(
             p.cams.intrinsics[i][0] = (fxn * w) as f32;
             p.cams.intrinsics[i][4] = (fyn * h) as f32;
         }
+        if env("SPL_RECON_GT_REPROJECT", "0") == "1" {
+            let all: Vec<usize> = (0..p.names.len()).collect();
+            p.reproject(&all);
+            eprintln!("diagnostic: engine depth re-unprojected with the COLMAP cameras");
+        }
+        if env("SPL_RECON_GT_POINTS", "0") == "1" {
+            let sim = sim3_between(&ours, &gt);
+            let mut pts = scene.points.clone();
+            for x in &mut pts.xyz {
+                *x = map_point(&sim, x.map(f64::from)).map(|v| v as f32);
+            }
+            eprintln!(
+                "diagnostic: init from {} aligned COLMAP points",
+                pts.xyz.len()
+            );
+            p.seed = Some(pts);
+        }
         eprintln!("diagnostic: engine cameras replaced by aligned COLMAP cameras");
         Ok(())
     };
@@ -245,6 +264,31 @@ fn run_one(
     );
     r.write_exports(&out.join("exports")).unwrap();
     let train = r.evaluate_train(8).unwrap();
+    // Training-camera accuracy against the dataset's COLMAP model, if any.
+    let rre = (video.is_none())
+        .then(|| {
+            let root = PathBuf::from(env("SPL_DATASETS", "/datasets")).join(scene_name);
+            let load = LoadOptions {
+                images_dir: env("SPL_RECON_IMAGES", "images_4"),
+                ..Default::default()
+            };
+            let scene = load_colmap_scene(&root, &load).ok()?;
+            let by_name: std::collections::HashMap<&str, M3> = scene
+                .views
+                .iter()
+                .map(|v| (v.name.as_str(), v.r_cw))
+                .collect();
+            let (ours, gt): (Vec<M3>, Vec<M3>) = r
+                .views
+                .iter()
+                .filter_map(|v| Some((v.r_cw, *by_name.get(v.name.as_str())?)))
+                .unzip();
+            Some(super::geom::relative_rotation_error(&ours, &gt))
+        })
+        .flatten();
+    if let Some(e) = rre {
+        eprintln!("{tag}: training cameras vs COLMAP: median relative rotation error {e:.4}°");
+    }
     eprintln!(
         "{tag}: training views (every 8th): PSNR {:.3} SSIM {:.4}",
         train.psnr, train.ssim
@@ -272,6 +316,7 @@ fn run_one(
         "peak_vram_mib": r.peak_vram_bytes >> 20,
         "spz_bytes": r.spz.len(),
         "train_views": train,
+        "rre_deg": rre,
     });
     if r.test.is_some() {
         let (before, _) = r.evaluate_test(Some(&out.join("renders_before"))).unwrap();

@@ -17,7 +17,7 @@ use crate::io::scene::InitPoints;
 type M3 = [[f64; 3]; 3];
 type V3 = [f64; 3];
 
-fn mv(m: &M3, v: V3) -> V3 {
+pub(super) fn mv(m: &M3, v: V3) -> V3 {
     std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2])
 }
 
@@ -25,12 +25,12 @@ fn mtv(m: &M3, v: V3) -> V3 {
     std::array::from_fn(|i| m[0][i] * v[0] + m[1][i] * v[1] + m[2][i] * v[2])
 }
 
-fn mm(a: &M3, b: &M3) -> M3 {
+pub(super) fn mm(a: &M3, b: &M3) -> M3 {
     std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
 }
 
 /// Rodrigues: `exp([φ]×)`.
-fn so3_exp(p: V3) -> M3 {
+pub(super) fn so3_exp(p: V3) -> M3 {
     let th2 = p[0] * p[0] + p[1] * p[1] + p[2] * p[2];
     let th = th2.sqrt();
     let (a, b) = if th < 1e-9 {
@@ -73,19 +73,19 @@ impl Cam {
         }
     }
 
-    fn cam_of(&self, x: V3) -> V3 {
+    pub(super) fn cam_of(&self, x: V3) -> V3 {
         let c = mv(&self.r, x);
         [c[0] + self.t[0], c[1] + self.t[1], c[2] + self.t[2]]
     }
 
-    fn world_of(&self, c: V3) -> V3 {
+    pub(super) fn world_of(&self, c: V3) -> V3 {
         mtv(
             &self.r,
             [c[0] - self.t[0], c[1] - self.t[1], c[2] - self.t[2]],
         )
     }
 
-    fn project(&self, c: V3) -> Option<(f64, f64)> {
+    pub(super) fn project(&self, c: V3) -> Option<(f64, f64)> {
         (c[2] > 1e-9).then(|| {
             (
                 self.fx * c[0] / c[2] + self.cx,
@@ -94,7 +94,7 @@ impl Cam {
         })
     }
 
-    fn unproject(&self, u: f64, v: f64, z: f64) -> V3 {
+    pub(super) fn unproject(&self, u: f64, v: f64, z: f64) -> V3 {
         [(u - self.cx) / self.fx * z, (v - self.cy) / self.fy * z, z]
     }
 
@@ -117,7 +117,7 @@ impl Cam {
 }
 
 /// One frame's engine depth, `w × h`.
-struct DepthView<'a> {
+pub(super) struct DepthView<'a> {
     d: &'a [f32],
     w: usize,
     h: usize,
@@ -126,7 +126,7 @@ struct DepthView<'a> {
 impl DepthView<'_> {
     /// Bilinear depth at pixel coordinates `(u, v)` (centres at +0.5); `None`
     /// off the image, at invalid depth or across a discontinuity (> 5 %).
-    fn sample(&self, u: f64, v: f64) -> Option<f64> {
+    pub(super) fn sample(&self, u: f64, v: f64) -> Option<f64> {
         let (x, y) = (u - 0.5, v - 0.5);
         if !(x >= 0.0 && y >= 0.0) {
             return None;
@@ -159,7 +159,7 @@ impl DepthView<'_> {
 }
 
 /// Confidence threshold at `percentile` (0-1) over `frames`.
-fn conf_threshold(p: &Posed, frames: &[usize], percentile: f32) -> f32 {
+pub(super) fn conf_threshold(p: &Posed, frames: &[usize], percentile: f32) -> f32 {
     let px = p.cams.width * p.cams.height;
     let mut c: Vec<f32> = frames
         .iter()
@@ -175,7 +175,7 @@ fn conf_threshold(p: &Posed, frames: &[usize], percentile: f32) -> f32 {
 }
 
 /// About `n` confident pixels of frame `i` on a regular grid: (u, v, depth).
-fn grid_samples(p: &Posed, i: usize, thr: f32, n: usize) -> Vec<(f64, f64, f64)> {
+pub(super) fn grid_samples(p: &Posed, i: usize, thr: f32, n: usize) -> Vec<(f64, f64, f64)> {
     let (w, h) = (p.cams.width, p.cams.height);
     let px = w * h;
     let step = ((px as f64 / n.max(1) as f64).sqrt().floor() as usize).max(1);
@@ -192,7 +192,7 @@ fn grid_samples(p: &Posed, i: usize, thr: f32, n: usize) -> Vec<(f64, f64, f64)>
     out
 }
 
-fn depth_view(p: &Posed, i: usize) -> DepthView<'_> {
+pub(super) fn depth_view(p: &Posed, i: usize) -> DepthView<'_> {
     let (w, h) = (p.cams.width, p.cams.height);
     DepthView {
         d: &p.dense.depth[i * w * h..(i + 1) * w * h],
@@ -204,7 +204,7 @@ fn depth_view(p: &Posed, i: usize) -> DepthView<'_> {
 /// For every frame of `frames`, up to `k` others (indices into `frames`)
 /// that see most of its sampled surface consistently (relative depth
 /// within `tau`), best first.
-fn neighbours(
+pub(super) fn neighbours(
     p: &Posed,
     frames: &[usize],
     cams: &[Cam],
@@ -531,7 +531,7 @@ pub fn refine_poses(p: &mut Posed, frames: &[usize], cfg: &GeoRefine) -> GeoRepo
     rep
 }
 
-fn transpose(m: &M3) -> M3 {
+pub(super) fn transpose(m: &M3) -> M3 {
     std::array::from_fn(|i| std::array::from_fn(|j| m[j][i]))
 }
 

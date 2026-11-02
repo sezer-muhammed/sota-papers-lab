@@ -18,10 +18,11 @@ use serde::{Deserialize, Serialize};
 use spl_core::{CancellationToken, Context, Result, bail};
 use ts_rs::TS;
 
+use super::ba::{BaConfig, bundle_adjust};
 use super::geom::{GeoRefine, consistent_points, refine_poses};
 use super::joint::{DepthPriorCfg, DepthPriors, Joint, JointConfig, PoseRefine, TestViews};
 use super::prune::{PruneReport, prune_first};
-use super::scene::{Posed, holdout_split, training_scene};
+use super::scene::{Posed, holdout_split, spread_stats, subsample, training_scene, voxel_merge};
 use crate::eval::{ImageMetrics, image_metrics};
 use crate::export::colmap::{write_colmap, write_transforms_json};
 use crate::export::ply::write_inria_ply;
@@ -29,7 +30,7 @@ use crate::export::spz::{SpzOptions, write_spz};
 use crate::gpu::Gpu;
 use crate::init::{DepthFrames, InitKernels, InitOptions, init_from_depth};
 use crate::io::images::{ImageCache, Rgb8Image};
-use crate::io::scene::View;
+use crate::io::scene::{View, extent};
 use crate::model::GaussiansHost;
 use crate::ppisp::PpispConfig;
 use crate::presets::{DensifyPreset, PresetName, PresetOverrides};
@@ -88,6 +89,9 @@ pub struct PipelineConfig {
     pub bootstrap_iters: u32,
     /// Bootstrap pose LR (rotation; translation the same × extent).
     pub bootstrap_lr: f32,
+    /// The bootstrap trains at 1/this resolution.
+    #[serde(default = "default_one")]
+    pub bootstrap_scale: u32,
     /// Depth prior weight at iteration 0 (decays linearly to 0); 0 = off.
     pub depth_weight: f32,
     /// Fraction of the run over which the depth weight decays.
@@ -122,6 +126,46 @@ pub struct PipelineConfig {
     /// Relative depth tolerance of that check.
     #[serde(default = "default_init_tau")]
     pub init_tau: f32,
+    /// Above 0: engine points are merged per voxel of this fraction of the
+    /// camera extent (coarser with distance, [`voxel_merge`]) before the
+    /// `init_points` cap; `init_oversample` × `init_points` candidates.
+    #[serde(default)]
+    pub init_voxel: f32,
+    #[serde(default = "default_oversample")]
+    pub init_oversample: u32,
+    /// Bundle adjustment on KLT tracks before training ([`ba::bundle_adjust`]):
+    /// LM iterations (0 = off), keypoints per frame, neighbours per keypoint.
+    #[serde(default)]
+    pub ba_iters: u32,
+    #[serde(default = "default_ba_keypoints")]
+    pub ba_keypoints: u32,
+    #[serde(default = "default_ba_neighbours")]
+    pub ba_neighbours: u32,
+    /// Also refine the shared focal in the BA.
+    #[serde(default = "default_true")]
+    pub ba_focal: bool,
+    /// Above 0: a second BA round without observations off by more (half-res px).
+    #[serde(default)]
+    pub ba_reject_px: f32,
+    /// One focal per image instead of one per camera.
+    #[serde(default)]
+    pub per_image_focal: bool,
+}
+
+fn default_ba_keypoints() -> u32 {
+    1024
+}
+
+fn default_ba_neighbours() -> u32 {
+    6
+}
+
+fn default_one() -> u32 {
+    1
+}
+
+fn default_oversample() -> u32 {
+    8
 }
 
 fn default_geo_samples() -> u32 {
@@ -162,6 +206,7 @@ impl PipelineConfig {
             ppisp: false,
             bootstrap_iters: 0,
             bootstrap_lr: 3e-3,
+            bootstrap_scale: 1,
             depth_weight: 0.1,
             depth_until: 0.3,
             depth_conf_drop: 0.3,
@@ -175,6 +220,14 @@ impl PipelineConfig {
             geo_scale: true,
             init_min_views: 0,
             init_tau: default_init_tau(),
+            init_voxel: 0.0,
+            init_oversample: default_oversample(),
+            per_image_focal: false,
+            ba_iters: 0,
+            ba_keypoints: default_ba_keypoints(),
+            ba_neighbours: default_ba_neighbours(),
+            ba_focal: true,
+            ba_reject_px: 0.0,
         };
         match p {
             // Pose bootstrap: +0.4 dB on garden for 17 s.
@@ -244,6 +297,8 @@ pub struct StageTimes {
     pub bootstrap_s: f64,
     #[serde(default)]
     pub geo_s: f64,
+    #[serde(default)]
+    pub ba_s: f64,
     pub train_s: f64,
     pub export_s: f64,
     /// From the call to the exports being encoded.
@@ -511,6 +566,7 @@ pub fn pose_frames(
             cams,
             prepared,
             dense,
+            seed: None,
         };
         let all = out.get_or_insert_with(|| Posed::empty(n, &part));
         all.merge_chunk(&part, chunk, &mut done)?;
@@ -567,6 +623,24 @@ pub fn carry_poses(test: &[View], before: &[View], after: &[View]) -> Vec<View> 
             out
         })
         .collect()
+}
+
+/// Area downscale to `w`×`h`.
+fn downscale(img: Rgb8Image, w: u32, h: u32) -> Rgb8Image {
+    let r = crate::ingest::resize_area_cpu(
+        &crate::ingest::Rgb8 {
+            width: img.width,
+            height: img.height,
+            data: img.data,
+        },
+        w,
+        h,
+    );
+    Rgb8Image {
+        width: r.width,
+        height: r.height,
+        data: r.data,
+    }
 }
 
 /// Pose bootstrap: a short sparse-init run with joint pose refinement;
@@ -700,6 +774,42 @@ pub fn reconstruct_with(
             posed.rescale(cfg.world_spread / s);
         }
     }
+    if cfg.ba_iters > 0 {
+        // Every frame takes part (as COLMAP would); training frame 0 is the gauge.
+        let order: Vec<usize> = train.iter().chain(&test).copied().collect();
+        let imgs: Vec<&Rgb8Image> = order.iter().map(|&i| &frames.trainer[i]).collect();
+        let rep = bundle_adjust(
+            &mut posed,
+            &order,
+            &imgs,
+            &BaConfig {
+                iters: cfg.ba_iters,
+                keypoints: cfg.ba_keypoints,
+                neighbours: cfg.ba_neighbours,
+                focal: cfg.ba_focal,
+                reject_px: cfg.ba_reject_px as f64,
+                ..Default::default()
+            },
+        );
+        times.ba_s = rep.track_s + rep.solve_s;
+        events(Event::Log(format!(
+            "bundle adjustment: {} frames, {} points, {} observations ({} kept, {} tracks tried), rms {:.3} → {:.3} px, inliers {:.3} → {:.3}, focal ×{:.4}, median rotation change {:.3}°, {} iterations, track {:.1} s + solve {:.1} s",
+            rep.frames,
+            rep.points,
+            rep.observations,
+            rep.observations_kept,
+            rep.tracks_tried,
+            rep.rms_before,
+            rep.rms_after,
+            rep.inliers_before,
+            rep.inliers_after,
+            rep.focal_scale,
+            rep.median_rot_change_deg,
+            rep.iterations,
+            rep.track_s,
+            rep.solve_s
+        )));
+    }
     // The engine's training cameras: held-out cameras are carried from them.
     let engine_train = {
         let f = posed.shared_focal(&train, tw, th);
@@ -753,16 +863,38 @@ pub fn reconstruct_with(
     if cfg.bootstrap_iters > 0 {
         let t = Instant::now();
         let imgs: Vec<Rgb8Image> = train.iter().map(|&i| frames.trainer[i].clone()).collect();
-        let views = bootstrap(&gpu, &posed, &train, &imgs, (tw, th), focal, cfg, cancel)?;
-        posed.update_cameras(&train, &views, tw, th);
-        focal = (views[0].fx, views[0].fy);
+        let k = cfg.bootstrap_scale.max(1);
+        let (bw, bh) = ((tw / k).max(1), (th / k).max(1));
+        let imgs: Vec<Rgb8Image> = if k > 1 {
+            imgs.into_iter().map(|i| downscale(i, bw, bh)).collect()
+        } else {
+            imgs
+        };
+        let (sx, sy) = (bw as f64 / tw as f64, bh as f64 / th as f64);
+        let views = bootstrap(
+            &gpu,
+            &posed,
+            &train,
+            &imgs,
+            (bw, bh),
+            (focal.0 * sx, focal.1 * sy),
+            cfg,
+            cancel,
+        )?;
+        posed.update_cameras(&train, &views, bw, bh);
+        focal = (views[0].fx / sx, views[0].fy / sy);
         times.bootstrap_s = t.elapsed().as_secs_f64();
         events(Event::Log(format!(
             "pose bootstrap: {} iterations in {:.1} s",
             cfg.bootstrap_iters, times.bootstrap_s
         )));
     }
-    let train_views = posed.views(&train, tw, th, focal);
+    let mut train_views = posed.views(&train, tw, th, focal);
+    if cfg.per_image_focal {
+        for (k, v) in train_views.iter_mut().enumerate() {
+            v.camera = k as u32;
+        }
+    }
     let test_views = posed.views(&test, tw, th, focal);
     let train_imgs: Vec<Rgb8Image> = train.iter().map(|&i| frames.trainer[i].clone()).collect();
     let test_imgs: Vec<Rgb8Image> = test.iter().map(|&i| frames.trainer[i].clone()).collect();
@@ -770,7 +902,9 @@ pub fn reconstruct_with(
     // Images first: the trainer sizes its capacity from what is left.
     let cache = ImageCache::from_images(&gpu, (0..train.len()).collect(), &train_imgs, 0.0)?;
     drop(train_imgs);
-    let seed_points = if cfg.init_min_views > 0 {
+    let seed_points = if let Some(p) = posed.seed.take() {
+        p
+    } else if cfg.init_min_views > 0 {
         let t = Instant::now();
         let pts = consistent_points(
             &posed,
@@ -787,6 +921,21 @@ pub fn reconstruct_with(
             t.elapsed().as_secs_f64()
         )));
         pts
+    } else if cfg.init_voxel > 0.0 {
+        let cap = cfg.init_points.max(4096) as usize;
+        let cand = posed.points(
+            &train,
+            cfg.init_conf_drop,
+            cap * cfg.init_oversample.max(1) as usize,
+        );
+        let (c, r) = extent(train_views.iter().map(View::center));
+        let merged = voxel_merge(&cand, c, r, cfg.init_voxel);
+        events(Event::Log(format!(
+            "voxel-merged init: {} candidates → {} voxels",
+            cand.xyz.len(),
+            merged.xyz.len()
+        )));
+        subsample(merged, cap)
     } else {
         posed.points(
             &train,
@@ -794,6 +943,15 @@ pub fn reconstruct_with(
             cfg.init_points.max(4096) as usize,
         )
     };
+    {
+        let (c, r) = extent(train_views.iter().map(View::center));
+        let (med, far) = spread_stats(&seed_points, c, r);
+        events(Event::Log(format!(
+            "init points: {}, median distance {med:.3} extents, {:.1} % beyond",
+            seed_points.xyz.len(),
+            100.0 * far
+        )));
+    }
     let mut scene = training_scene(train_views, seed_points)?;
     let all_train = scene.train.clone();
     scene.train = Vec::new();

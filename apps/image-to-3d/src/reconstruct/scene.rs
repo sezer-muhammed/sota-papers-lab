@@ -22,6 +22,8 @@ pub struct Posed {
     pub cams: VggtCameras,
     pub prepared: Prepared,
     pub dense: DenseHost,
+    /// Init points that replace the engine's (diagnostics: reference points).
+    pub seed: Option<InitPoints>,
 }
 
 impl Posed {
@@ -47,6 +49,7 @@ impl Posed {
                 conf: vec![0.0; n * px],
                 world: vec![0.0; n * px * 3],
             },
+            seed: None,
         }
     }
 
@@ -150,6 +153,14 @@ impl Posed {
             let k = &mut self.cams.intrinsics[i];
             k[0] = (v.fx * sx) as f32;
             k[4] = (v.fy * sy) as f32;
+        }
+        self.reproject(frames);
+    }
+
+    /// Recomputes the world points of `frames` from their depth and cameras.
+    pub fn reproject(&mut self, frames: &[usize]) {
+        let (w, h) = (self.cams.width, self.cams.height);
+        for &i in frames {
             let (rot, t) = self.pose(i);
             let k = self.cams.intrinsics[i];
             for py in 0..h {
@@ -332,6 +343,72 @@ impl Posed {
 
 /// The training scene: `views` are the training frames only (scene view
 /// index = training index), so held-out frames never reach the optimizer.
+/// Merges `points` that share a voxel (mean position and colour). The voxel
+/// edge is `voxel × extent` inside the camera sphere (`center`, `extent`) and
+/// grows linearly with the distance beyond it, so the far background is not
+/// over-represented by every view that sees it.
+pub fn voxel_merge(points: &InitPoints, center: [f32; 3], extent: f32, voxel: f32) -> InitPoints {
+    use std::collections::HashMap;
+    let base = (voxel * extent).max(1e-9);
+    let mut cells: HashMap<[i64; 4], ([f64; 3], [u32; 3], u32)> = HashMap::new();
+    let mut order = Vec::new();
+    for (x, c) in points.xyz.iter().zip(&points.rgb) {
+        let d = ((0..3).map(|k| (x[k] - center[k]).powi(2)).sum::<f32>()).sqrt();
+        // Shells of constant voxel size, each one voxel doubling.
+        let level = (d / extent).max(1.0).log2().floor() as i64;
+        let size = base * (1u64 << level.clamp(0, 30)) as f32;
+        let key = [
+            level,
+            (x[0] / size).floor() as i64,
+            (x[1] / size).floor() as i64,
+            (x[2] / size).floor() as i64,
+        ];
+        let e = cells.entry(key).or_insert_with(|| {
+            order.push(key);
+            ([0.0; 3], [0; 3], 0)
+        });
+        for k in 0..3 {
+            e.0[k] += x[k] as f64;
+            e.1[k] += c[k] as u32;
+        }
+        e.2 += 1;
+    }
+    let mut out = InitPoints::default();
+    for key in order {
+        let (p, c, n) = cells[&key];
+        out.xyz.push(p.map(|v| (v / n as f64) as f32));
+        out.rgb.push(c.map(|v| (v / n) as u8));
+    }
+    out
+}
+
+/// Every `stride`-th point so at most `max` remain.
+pub fn subsample(points: InitPoints, max: usize) -> InitPoints {
+    let stride = points.xyz.len().div_ceil(max.max(1)).max(1);
+    if stride == 1 {
+        return points;
+    }
+    InitPoints {
+        xyz: points.xyz.into_iter().step_by(stride).collect(),
+        rgb: points.rgb.into_iter().step_by(stride).collect(),
+    }
+}
+
+/// Median distance from `center` and the fraction beyond `extent`.
+pub fn spread_stats(points: &InitPoints, center: [f32; 3], extent: f32) -> (f32, f32) {
+    let mut d: Vec<f32> = points
+        .xyz
+        .iter()
+        .map(|x| ((0..3).map(|k| (x[k] - center[k]).powi(2)).sum::<f32>()).sqrt() / extent)
+        .collect();
+    if d.is_empty() {
+        return (0.0, 0.0);
+    }
+    let far = d.iter().filter(|&&v| v > 1.0).count() as f32 / d.len() as f32;
+    d.sort_by(f32::total_cmp);
+    (d[d.len() / 2], far)
+}
+
 pub fn training_scene(views: Vec<View>, points: InitPoints) -> Result<Scene> {
     ensure!(!views.is_empty(), "no training views");
     let (center, r) = extent(views.iter().map(View::center));
@@ -389,6 +466,7 @@ mod tests {
                 conf: (0..px).map(|p| (p % 10) as f32).collect(),
                 world: vec![0.5; px * 3],
             },
+            seed: None,
         }
     }
 
@@ -474,6 +552,27 @@ mod tests {
         // Depth scaled by 1/2, world points mapped back.
         assert!((all.dense.depth[4 * 8] - b.dense.depth[3 * 8] * 0.5).abs() < 1e-6);
         assert!((all.dense.world[4 * 8 * 3] - (0.5 - 1.0) * 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn voxel_merge_fuses_close_points_and_coarsens_far_ones() {
+        let pts = InitPoints {
+            xyz: vec![
+                [0.01, 0.01, 0.01],
+                [0.02, 0.02, 0.02],
+                [0.5, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [10.3, 0.0, 0.0],
+            ],
+            rgb: vec![[0, 0, 0], [100, 100, 100], [7, 7, 7], [1, 1, 1], [3, 3, 3]],
+        };
+        let m = voxel_merge(&pts, [0.0; 3], 1.0, 0.1);
+        // Near: 0.1 voxels (the first two fuse); at 10: 0.8 voxels (fuse too).
+        assert_eq!(m.xyz.len(), 3);
+        assert_eq!(m.rgb[0], [50, 50, 50]);
+        assert!((m.xyz[0][0] - 0.015).abs() < 1e-6);
+        assert!((m.xyz[2][0] - 10.15).abs() < 1e-4);
+        assert_eq!(subsample(m, 2).xyz.len(), 2);
     }
 
     #[test]

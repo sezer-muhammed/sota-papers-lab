@@ -51,6 +51,10 @@ bootstrap_iters: number,
  */
 bootstrap_lr: number, 
 /**
+ * The bootstrap trains at 1/this resolution.
+ */
+bootstrap_scale: number, 
+/**
  * Depth prior weight at iteration 0 (decays linearly to 0); 0 = off.
  */
 depth_weight: number, 
@@ -97,4 +101,27 @@ init_min_views: number,
 /**
  * Relative depth tolerance of that check.
  */
-init_tau: number, };
+init_tau: number, 
+/**
+ * Above 0: engine points are merged per voxel of this fraction of the
+ * camera extent (coarser with distance, [`voxel_merge`]) before the
+ * `init_points` cap; `init_oversample` × `init_points` candidates.
+ */
+init_voxel: number, init_oversample: number, 
+/**
+ * Bundle adjustment on KLT tracks before training ([`ba::bundle_adjust`]):
+ * LM iterations (0 = off), keypoints per frame, neighbours per keypoint.
+ */
+ba_iters: number, ba_keypoints: number, ba_neighbours: number, 
+/**
+ * Also refine the shared focal in the BA.
+ */
+ba_focal: boolean, 
+/**
+ * Above 0: a second BA round without observations off by more (half-res px).
+ */
+ba_reject_px: number, 
+/**
+ * One focal per image instead of one per camera.
+ */
+per_image_focal: boolean, };
