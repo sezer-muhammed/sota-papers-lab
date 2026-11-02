@@ -38,6 +38,8 @@ pub enum PresetName {
     Quality,
     /// Ours: COLMAP-free fast target, fewer iterations, resolution warm-up.
     Fast,
+    /// Quality plus the geometry regularisers (`mesh::geom`): for meshing.
+    Geometry,
 }
 
 /// Any preset field, for ablations. `None` keeps the preset's value.
@@ -192,7 +194,7 @@ impl Preset {
                 ..base
             },
             // Generic thresholds: FastGS-Big medians as the starting point (6.2).
-            PresetName::Quality => Self {
+            PresetName::Quality | PresetName::Geometry => Self {
                 densify: DensifyPreset::FastGs(FastGsConfig {
                     grad_abs_thresh: 4e-4,
                     dense: 0.001,

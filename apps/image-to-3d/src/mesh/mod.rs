@@ -13,8 +13,11 @@
 //! lands; tests use synthetic and COLMAP-derived depth.
 
 pub mod bake;
+pub mod geom;
 pub mod glb;
 pub mod mc;
+pub mod op;
+pub mod pipeline;
 pub mod simplify;
 pub mod tsdf;
 pub mod uv;

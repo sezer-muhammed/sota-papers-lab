@@ -46,6 +46,7 @@ use crate::kernels::layout::{
 use crate::kernels::loss::{Loss, resample_target};
 use crate::kernels::raster::{FrameSource, GpuRaster, GradTargets, SplatRaster};
 use crate::kernels::{Capacity, FrameBuffers, GradSink, RenderMode};
+use crate::mesh::geom::{GeomTrain, GeometryConfig};
 use crate::model::{Gaussians, GaussiansHost, Grads, plan_capacity};
 use crate::presets::{DensifyPreset, Preset, PresetName, PresetOverrides, Schedule};
 use crate::rng::Philox;
@@ -78,6 +79,10 @@ pub struct TrainConfig {
     #[serde(default)]
     #[ts(optional)]
     pub max_gaussians: Option<u32>,
+    /// Geometry regularisers (on by default with the Geometry preset).
+    #[serde(default)]
+    #[ts(optional)]
+    pub geometry: Option<GeometryConfig>,
 }
 
 impl Default for TrainConfig {
@@ -90,6 +95,7 @@ impl Default for TrainConfig {
             snapshot_every_s: None,
             eval_every: None,
             max_gaussians: None,
+            geometry: None,
         }
     }
 }
@@ -102,6 +108,13 @@ impl TrainConfig {
             Some(t) if t != p.iterations => p.scaled(t),
             _ => p,
         }
+    }
+
+    /// The geometry regularisers this run uses, if any.
+    pub fn geometry(&self) -> Option<GeometryConfig> {
+        self.geometry
+            .clone()
+            .or_else(|| (self.preset == PresetName::Geometry).then(GeometryConfig::default))
     }
 }
 
@@ -226,6 +239,8 @@ pub struct Trainer {
     pub loss: Loss,
     /// `None` only while it is being regrown.
     pub raster: Option<GpuRaster>,
+    /// Geometry regularisers (Geometry preset).
+    pub geometry: Option<GeomTrain>,
     pub strategy: Box<dyn Strategy>,
     pub stats: DensifyStats,
     pub ring: FrameRing,
@@ -306,6 +321,10 @@ impl Trainer {
             &variant,
         );
         let raster = GpuRaster::new(gpu, cap, variant, strategy.wants_abs_grad())?;
+        let geometry = match cfg.geometry() {
+            Some(c) => Some(GeomTrain::new(gpu, c, &variant, cap, scene.extent, total)?),
+            None => None,
+        };
         let mut t = Self {
             gpu: gpu.clone(),
             grads: Grads::alloc(gpu, capacity)?,
@@ -323,6 +342,7 @@ impl Trainer {
             graphs: Vec::new(),
             eager: false,
             raster: Some(raster),
+            geometry,
             target: gpu
                 .stream
                 .alloc_zeros::<f32>(3 * max_px)
@@ -560,6 +580,9 @@ impl Trainer {
         )?;
         self.loss
             .forward_backward(gpu, io.params, io.image, &self.target, &mut io.grads.d_rgb)?;
+        if let Some(geo) = &mut self.geometry {
+            geo.after_forward(gpu, raster, &self.g)?;
+        }
         let want_stats = self.strategy.wants_stats(t);
         raster.backward(
             gpu,
@@ -570,6 +593,9 @@ impl Trainer {
                 stats: want_stats.then_some(&mut self.stats),
             },
         )?;
+        if let Some(geo) = &mut self.geometry {
+            geo.after_backward(gpu, raster, &self.g, &mut self.grads)?;
+        }
         self.adam
             .step(gpu, &mut self.g, &mut self.grads, raster.params())?;
         raster.end_frame(gpu, &self.status)
