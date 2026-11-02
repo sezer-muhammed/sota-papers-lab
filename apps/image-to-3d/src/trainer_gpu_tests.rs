@@ -80,7 +80,8 @@ fn gpu_train_dataset() {
         ..Default::default()
     };
     let gpu = Gpu::open().unwrap();
-    let (free, _) = gpu.mem_info().unwrap();
+    let (free, total) = gpu.mem_info().unwrap();
+    let used_before = total - free;
     eprintln!("free VRAM at start: {} MiB", free >> 20);
     let t1 = Instant::now();
     let mut trainer = Trainer::new(&gpu, scene, cfg).unwrap();
@@ -112,6 +113,12 @@ fn gpu_train_dataset() {
         report.mean.psnr, report.mean.ssim, report.mean.ssim_valid
     );
     let profile = profile_iterations(&mut trainer, 30);
+    let trainer_raster_cap = {
+        let mut c = trainer.raster.as_ref().unwrap().capacity();
+        c.gaussians = trainer.summary.peak_gaussians;
+        c.visible = c.gaussians;
+        c
+    };
     eprintln!("profile (ms): {profile:#?}");
     let (cloud, summary) = trainer.finish().unwrap();
     let spz = write_spz(&cloud, &SpzOptions::default()).unwrap();
@@ -125,7 +132,22 @@ fn gpu_train_dataset() {
         "setup_s": setup_s,
         "load_s": load_s,
         "final_gaussians": summary.final_gaussians,
-        "peak_vram_mib": summary.peak_vram_bytes as f64 / (1u64 << 20) as f64,
+        // Device-wide peak minus what was in use before Trainer::new (this
+        // process's footprint, fixed capacity included, if nothing else changed).
+        "peak_vram_mib": (summary.peak_vram_bytes.saturating_sub(used_before)) as f64
+            / (1u64 << 20) as f64,
+        "device_used_before_mib": used_before as f64 / (1u64 << 20) as f64,
+        "capacity": summary.capacity,
+        "peak_gaussians": summary.peak_gaussians,
+        // What the run needed: per-Gaussian state at the peak count plus the raster.
+        "needed_vram_mib_est": (summary.peak_gaussians as u64
+            * crate::model::bytes_per_gaussian(false)
+            + crate::kernels::FrameBuffers::vram_bytes(
+                trainer_raster_cap,
+                &crate::kernels::RasterVariant::default(),
+            )
+            .total()) as f64
+            / (1u64 << 20) as f64,
         "graph_captures": summary.graph_captures,
         "densify_steps": summary.densify_steps,
         "raster_regrows": summary.raster_regrows,

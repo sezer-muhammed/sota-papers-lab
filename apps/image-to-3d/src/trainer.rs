@@ -194,6 +194,12 @@ pub struct TrainSummary {
     /// Raster buffers grown after an overflow (each loses the poisoned iterations).
     #[serde(default)]
     pub raster_regrows: u32,
+    /// Most Gaussians alive at once.
+    #[serde(default)]
+    pub peak_gaussians: u32,
+    /// Fixed Gaussian capacity the run allocated (spec-train 5.10).
+    #[serde(default)]
+    pub capacity: u32,
     /// Mean training loss over the last progress window.
     #[serde(default)]
     #[ts(optional)]
@@ -336,6 +342,7 @@ impl Trainer {
             max_size,
             loss_window: 0,
         };
+        t.summary.capacity = t.g.cap;
         t.gpu.sync()?;
         t.sample_vram()?;
         Ok(t)
@@ -602,6 +609,7 @@ impl Trainer {
             self.strategy.morton_sort(&mut cx, t)?;
         }
         let densify = outcome.changed.then_some(outcome);
+        self.summary.peak_gaussians = self.summary.peak_gaussians.max(self.g.n);
         if let Some(d) = densify {
             self.summary.densify_steps += 1;
             self.summary.capped += d.capped;
