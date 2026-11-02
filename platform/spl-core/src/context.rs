@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{ArtifactStore, EventSink, RunEvent};
+use crate::{ArtifactRef, ArtifactStore, EventSink, RunEvent};
 
 /// Shared, host-owned services (GPU pool, DB handle, caches) looked up by type.
 /// Keeps this crate free of CUDA and database dependencies.
@@ -79,6 +79,69 @@ impl RunCx {
         self.events.emit(RunEvent::Progress {
             fraction: fraction.clamp(0.0, 1.0),
             message: message.into(),
+            data: None,
+        });
+    }
+
+    /// [`progress`](Self::progress) with structured state a custom page
+    /// reads, such as `{"stage": "refine", "iteration": 7000, "gaussians":
+    /// 1.2e6}`. Like the message, only the latest is kept and only while the
+    /// run goes.
+    pub fn progress_with(
+        &self,
+        fraction: f64,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) {
+        self.events.emit(RunEvent::Progress {
+            fraction: fraction.clamp(0.0, 1.0),
+            message: message.into(),
+            data: Some(data).filter(|d| !d.is_null()),
+        });
+    }
+
+    /// Shows an artifact this run stored as its current `slot` (`"points"`,
+    /// `"cameras"`, `"splat"`) before the run ends: `GET /v1/runs/{id}`
+    /// lists the latest artifact per slot with a revision that grows on
+    /// every announcement, while the run goes and after it ends. `info` is
+    /// a small JSON value shown with it (`Value::Null` for none). The
+    /// artifact is kept; see [`announce_snapshot`](Self::announce_snapshot)
+    /// for previews that replace each other.
+    pub fn announce(
+        &self,
+        slot: impl Into<String>,
+        artifact: &ArtifactRef,
+        info: serde_json::Value,
+    ) {
+        self.emit_announce(slot.into(), artifact, false, info);
+    }
+
+    /// Like [`announce`](Self::announce), for snapshots that replace each
+    /// other (a splat every few seconds of training): when the run ends,
+    /// the host deletes the snapshots a later one of the same slot
+    /// replaced, unless the run's output names them or something else uses
+    /// the same bytes. The latest of each slot is kept.
+    pub fn announce_snapshot(
+        &self,
+        slot: impl Into<String>,
+        artifact: &ArtifactRef,
+        info: serde_json::Value,
+    ) {
+        self.emit_announce(slot.into(), artifact, true, info);
+    }
+
+    fn emit_announce(
+        &self,
+        slot: String,
+        artifact: &ArtifactRef,
+        snapshot: bool,
+        info: serde_json::Value,
+    ) {
+        self.events.emit(RunEvent::Announce {
+            slot,
+            artifact: artifact.clone(),
+            snapshot,
+            info: Some(info).filter(|i| !i.is_null()),
         });
     }
 

@@ -15,7 +15,9 @@ use async_trait::async_trait;
 use spl_core::{Result, bail};
 
 pub use migrations::{Migration, ORACLE, POSTGRES, SQLITE};
-pub use model::{ArtifactRecord, MetricRecord, NewRun, RunArtifact, RunRecord, RunStatus};
+pub use model::{
+    Announcement, ArtifactRecord, MetricRecord, NewRun, RunArtifact, RunRecord, RunStatus,
+};
 pub use sqlite::SqliteStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,17 @@ pub trait Store: Send + Sync {
     ) -> Result<()>;
     /// Ordered by direction, then slot name (as text).
     async fn list_run_artifacts(&self, run_id: &str) -> Result<Vec<RunArtifact>>;
+    /// Deletes the record of an artifact `run_id` links to and nothing else
+    /// references (no other run's link, no announcement), together with
+    /// that run's links to it. False, and nothing changed, otherwise. The
+    /// caller then deletes the bytes.
+    async fn forget_artifact(&self, run_id: &str, artifact_id: &str) -> Result<bool>;
+
+    /// Makes `announcement` the run's current artifact for its slot,
+    /// replacing the previous one. The artifact must be recorded.
+    async fn announce(&self, run_id: &str, announcement: &Announcement) -> Result<()>;
+    /// The current announcement of every slot, by slot name.
+    async fn list_announcements(&self, run_id: &str) -> Result<Vec<Announcement>>;
 
     async fn add_metrics(&self, metrics: &[MetricRecord]) -> Result<()>;
     async fn list_metrics(&self, run_id: &str) -> Result<Vec<MetricRecord>>;
