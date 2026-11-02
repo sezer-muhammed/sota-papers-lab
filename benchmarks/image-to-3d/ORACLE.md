@@ -273,3 +273,28 @@ and re-run the tests to include the gsplat comparison.
 | MCMC noise, 2^20 draws | covariance (k Sigma)^2 | 1% of the largest variance | 0.30% |
 | `vcd_mask`, `scores_add` (+ overflow guard) | CPU | exact | exact |
 
+
+### Densification performance (RTX 4070 SUPER, exclusive `gpu.lock`, GPU idle before: 0 %, 382 MiB)
+
+`gpu_bench_densify` (CUDA events, median of 10) against gsplat 1.5.3 `strategy.ops`
+(`py/bench_densify_gsplat.py`) and Faster-GS's model ops (`py/bench_densify_fastergs.py`,
+spl-bl-fastergs image). Same workloads: ADC step = 5 % clone, 5 % split, 10 % prune over
+parameters + Adam moments; MCMC = relocate 2 % dead + grow 5 %. Times in ms.
+
+| Op | 1M ours / gsplat / Faster-GS | 3M | 6M |
+|---|---|---|---|
+| ADC emission (178 words/G) | **6.87** / 17.6 / 11.4 | **25.4** / 60.2 / 34.6 | **52.8** / 170 / 106 |
+| Morton re-sort, from random order | 8.94 / - / **6.21** | 34.4 / - / **21.6** | 96.1 / - / **49.4** |
+| Morton re-sort, steady state (near-sorted) | 6.99 | 22.8 | 46.7 |
+| MCMC round | **2.33** / 5.81 / 5.84 | **7.92** / 17.3 / 18.0 | **17.6** / 32.6 / 48.4 |
+| MCMC noise | **0.035** / 1.52 / 0.114 | **0.366** / 5.00 / 0.450 | **0.722** / 10.2 / 0.826 |
+| densify_plan (incl. 1 sync) | 0.05 | 0.29 | 0.56 |
+| Radix sort 32-bit (k,v) | 0.109 | 0.255 | 1.03 |
+| VCP Gumbel-top-k (keys+sort+mark) | 0.41 | 1.07 | 2.19 |
+
+Before/after the Nsight Compute pass (unlocked, same contention both ways): the radix sort's
+single-block scan was 60 % of the sort; per-digit row scan made it 5-6x faster (1M: 0.632 -> 0.123
+ms, 3M: 1.92 -> 0.315 ms), Gumbel-top-k 2.2-3.7x. Slab moves run at ~89 % of peak memory
+throughput (ncu), ~420 GB/s measured; emission is bound by its 4 passes over every word.
+Morton is in-place (fixed capacity); Faster-GS's out-of-place gather does half the traffic but
+allocates a second copy of every tensor.
