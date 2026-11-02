@@ -34,6 +34,7 @@ pub mod refine;
 pub mod rng;
 pub mod testkit;
 pub mod trainer;
+pub mod vggt;
 
 use spl_core::Registry;
 
