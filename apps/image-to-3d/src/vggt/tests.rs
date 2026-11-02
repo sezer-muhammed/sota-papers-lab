@@ -276,11 +276,11 @@ fn plan_chunks_and_offload() {
     let p = Plan::new(g, 8, 10 << 30, 1 << 30, 200 << 20).unwrap();
     let c: Vec<_> = p.chunks().collect();
     assert_eq!(c, vec![0..8, 8..16, 16..20]);
-    assert!(!p.offload);
+    assert!(!p.offload && !p.release_trunk);
     // 300 frames: the cache alone is 4 × 300 × 689 × 2048 × 2 B ≈ 3.4 GB.
     let big = Geometry::new(300, 336, 512);
-    let tight = Plan::new(big, 8, 5_000 << 20, 600 << 20, 400 << 20).unwrap();
-    assert!(tight.offload);
+    let tight = Plan::new(big, 8, 5_500 << 20, 600 << 20, 400 << 20).unwrap();
+    assert!(tight.offload && tight.release_trunk);
     assert!(Plan::new(big, 8, 2 << 30, 600 << 20, 400 << 20).is_err());
 }
 

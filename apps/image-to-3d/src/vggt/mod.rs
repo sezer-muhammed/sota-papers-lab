@@ -224,7 +224,15 @@ impl VggtEngine {
         let margin = 256 << 20;
         let trunk = trunk::Trunk::scratch_bytes(&trunk_geom(&geom));
         let chunk = geom.with_frames(self.cfg.dense_chunk.min(geom.frames));
+        let rest = geom.frames % self.cfg.dense_chunk.max(1);
+        // The dense head keeps work buffers for the full chunk and the
+        // remainder.
         let head = heads::dense::DenseHead::scratch_bytes(&chunk)
+            + if rest > 0 && geom.frames > rest {
+                heads::dense::DenseHead::scratch_bytes(&geom.with_frames(rest))
+            } else {
+                0
+            }
             + heads::camera::CameraHead::scratch_bytes(&geom);
         Plan::new(
             geom,
@@ -352,6 +360,9 @@ impl VggtEngine {
         record(&nn, &ev[3])?;
 
         progress("dense head", 0.8);
+        if ws.plan.release_trunk && !graphed && !use_graph {
+            self.trunk.release_buffers();
+        }
         ws.offload_levels(&nn)?;
         let chunks: Vec<_> = ws.plan.chunks().collect();
         let nchunks = chunks.len();

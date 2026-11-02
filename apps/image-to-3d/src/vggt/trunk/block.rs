@@ -14,7 +14,7 @@ use spl_core::Result;
 use spl_nn::cudarc::driver::{CudaSlice, CudaView};
 use spl_nn::gemm::{Epilogue, GemmShape};
 use spl_nn::norm::{Branch, LnParams, Quant, Rows, RowsMut};
-use spl_nn::qkv::{NormKind, QkNorm, QkvIn, QkvOut, Rope, VFormat};
+use spl_nn::qkv::{NormKind, QkNorm, QkvIn, QkvOut, Rope};
 use spl_nn::{Act, Nn};
 
 use super::{DIM, HEADS, HIDDEN, InterAttention, LN_EPS, Ops, TrunkWeights};
@@ -176,7 +176,7 @@ pub(crate) fn forward(
             q: &mut *s.q,
             k: &mut *s.k,
             v: &mut *s.v,
-            v_format: VFormat::Bf16,
+            v_format: attn.v_format(),
         },
     )?;
     attn.forward(

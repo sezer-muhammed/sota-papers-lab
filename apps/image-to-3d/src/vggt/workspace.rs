@@ -161,6 +161,9 @@ pub struct Plan {
     pub dense_chunk: usize,
     /// Levels 0..3 go to pinned host memory after the trunk.
     pub offload: bool,
+    /// The trunk's work buffers are freed before the dense head (they
+    /// do not fit next to the head's).
+    pub release_trunk: bool,
     /// Estimated device bytes of this workspace (without weights and the
     /// components' own buffers).
     pub device_bytes: usize,
@@ -176,7 +179,10 @@ impl Plan {
         trunk_bytes: usize,
         head_bytes: usize,
     ) -> Result<Self> {
-        let base = geom.frames * geom.pixels() * (3 + 3 * 4 + 2 * 2);
+        // RGB8, normalised f32 images, f16 depth and conf, f32 world
+        // points; the fp32 camera tokens.
+        let base = geom.frames * geom.pixels() * (3 + 3 * 4 + 2 * 2 + 3 * 4)
+            + geom.frames * crate::vggt::trunk::SPECIAL * CACHE_DIM * 4;
         let cache = 4 * geom.cache_level_bytes();
         let need = base + cache + trunk_bytes.max(head_bytes);
         ensure!(
@@ -188,6 +194,9 @@ impl Plan {
             need as f64 / 1e9,
             free as f64 / 1e9
         );
+        // The trunk keeps its buffers unless released: the dense head runs
+        // next to them when both fit, else they are freed after the trunk.
+        let release_trunk = base + cache + trunk_bytes + head_bytes > free;
         // The dense head's buffers come on top of the cache; offloading the
         // first three levels frees room for them when the margin is thin.
         let offload = base + cache + trunk_bytes.max(head_bytes) + head_bytes > free;
@@ -195,6 +204,7 @@ impl Plan {
             geom,
             dense_chunk: dense_chunk.max(1),
             offload,
+            release_trunk,
             device_bytes: need,
         })
     }

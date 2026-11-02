@@ -353,7 +353,11 @@ impl DenseHead {
             .lock()
             .map_err(|_| spl_core::anyhow!("dense work lock poisoned"))?;
         if !map.contains_key(&key) {
-            map.clear();
+            // A run uses at most two chunk sizes (full chunks and the
+            // remainder): keep both, or every run reallocates twice.
+            if map.len() >= 2 {
+                map.clear();
+            }
             map.insert(key, self.make_work(nn, g)?);
         }
         let ws = map.get_mut(&key).unwrap();

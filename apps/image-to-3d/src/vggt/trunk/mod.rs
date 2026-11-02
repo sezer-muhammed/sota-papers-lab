@@ -23,7 +23,7 @@ mod tests;
 
 use spl_core::{Result, anyhow, bail};
 use spl_nn::Nn;
-use spl_nn::attention::{AttnShape, FlashAttention};
+use spl_nn::attention::{AttnShape, FlashAttention, VFormat};
 use spl_nn::cudarc::driver::{CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut};
 use spl_nn::gemm::{Gemm, Tuning};
 use spl_nn::norm::Norm;
@@ -136,6 +136,11 @@ impl TapSink for NoTap {
 /// Attention over head-major `[16][tokens][64]` bf16 Q/K/V, writing
 /// `[tokens][1024]` bf16; `n_seq` sequences of `seq_len` tokens.
 pub trait InterAttention {
+    /// The format the QKV prologue writes V in for this attention.
+    fn v_format(&self) -> VFormat {
+        VFormat::F16
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -171,7 +176,11 @@ impl InterAttention for DenseAttention {
             heads: HEADS,
             o_ld: DIM,
         };
-        fa.forward(nn, q, k, v, o, &shape, ATTN_SCALE, None)
+        // fp16 P·V: twice the tensor rate of bf16 on GeForce Ada and
+        // slightly more accurate (spl-nn `attention`); |V| stays far below
+        // fp16's range in this model.
+        let tile = FlashAttention::default_tile(&shape, self.v_format());
+        fa.forward(nn, q, k, v, o, &shape, ATTN_SCALE, Some(tile))
     }
 }
 
@@ -325,6 +334,13 @@ impl Trunk {
     /// the cache).
     pub fn scratch_bytes(g: &TrunkGeom) -> usize {
         Buffers::bytes(g.rows())
+    }
+
+    /// Frees the work buffers (they come back on the next [`Self::run`]):
+    /// lets the dense head use that memory when the card is tight. Not
+    /// for captured graphs, which hold the buffers' addresses.
+    pub fn release_buffers(&mut self) {
+        self.bufs = None;
     }
 
     /// Runs the trunk on `images` (normalised f32 `[N][3][H][W]`, H = 16 h,
