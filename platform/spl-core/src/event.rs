@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use ts_rs::TS;
 
+use crate::ArtifactRef;
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
@@ -9,6 +11,10 @@ pub enum RunEvent {
     Progress {
         fraction: f64,
         message: String,
+        /// Structured state for a custom page (stage, iteration, counts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "unknown")]
+        data: Option<serde_json::Value>,
     },
     Log {
         message: String,
@@ -17,6 +23,17 @@ pub enum RunEvent {
         key: String,
         value: f64,
         unit: String,
+    },
+    /// `artifact` is now the run's current `slot` (see
+    /// [`RunCx::announce`](crate::RunCx::announce)).
+    Announce {
+        slot: String,
+        artifact: ArtifactRef,
+        /// Superseded snapshots of the slot are deleted when the run ends.
+        snapshot: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "unknown")]
+        info: Option<serde_json::Value>,
     },
 }
 
