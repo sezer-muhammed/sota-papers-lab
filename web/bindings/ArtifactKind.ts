@@ -2,6 +2,7 @@
 
 /**
  * The shared data vocabulary between apps. Add kinds here, not in apps, so
- * any app's output can feed any other app's input.
+ * any app's output can feed any other app's input. [`crate::media`] names
+ * the media types that go with them.
  */
-export type ArtifactKind = "image" | "tensor" | "bitstream" | "table" | "report" | "blob";
+export type ArtifactKind = "image" | "tensor" | "bitstream" | "table" | "report" | "blob" | "splat" | "mesh" | "cameras";
