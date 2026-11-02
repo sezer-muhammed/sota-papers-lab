@@ -281,7 +281,9 @@ impl FrameBuffers {
     }
 
     fn ckpt_floats(cap: &Capacity, v: &RasterVariant) -> u64 {
-        let per_pixel = if v.ckpt_f16 { 2 } else { 4 };
+        // Same words per pixel as `raster::ckpt_words`: the extra channels
+        // (expected depth) are checkpointed too.
+        let per_pixel = if v.ckpt_f16 { 2 } else { 4 } + v.extra_ch as u64;
         cap.chains(v) as u64 * v.tile_pixels() as u64 * per_pixel
     }
 

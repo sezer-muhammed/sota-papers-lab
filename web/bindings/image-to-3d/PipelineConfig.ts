@@ -15,6 +15,11 @@ iterations?: number, seed: number,
  */
 init_target: number, 
 /**
+ * Above 0: skip the voxel init and seed this many engine points with
+ * the trainer's kNN init instead (the COLMAP-style sparse start).
+ */
+init_points: number, 
+/**
  * Fraction of low-confidence pixels Stage B drops (0-1).
  */
 init_conf_drop: number, 
@@ -30,7 +35,21 @@ pose_refine: boolean, pose_start: number,
 /**
  * Absolute end; the densification end when absent.
  */
-pose_end?: number, pose_lr_rot: number, pose_lr_trans: number, focal_lr: number, ppisp: boolean, 
+pose_end?: number, pose_lr_rot: number, pose_lr_trans: number, focal_lr: number, 
+/**
+ * Pose and focal LRs decay exponentially to this factor at the end.
+ */
+pose_lr_final: number, ppisp: boolean, 
+/**
+ * Above 0: a pose bootstrap of this many iterations (sparse init, poses
+ * only kept) before the real run, whose init then uses the engine depth
+ * re-unprojected with the refined cameras.
+ */
+bootstrap_iters: number, 
+/**
+ * Bootstrap pose LR (rotation; translation the same × extent).
+ */
+bootstrap_lr: number, 
 /**
  * Depth prior weight at iteration 0 (decays linearly to 0); 0 = off.
  */
@@ -47,6 +66,16 @@ depth_conf_drop: number,
  * Live snapshot cadence in seconds (0 = none).
  */
 snapshot_every_s: number, 
+/**
+ * Rescale the world so training cameras sit this far (mean) from their
+ * centroid; 0 keeps the engine's units.
+ */
+world_spread: number, 
+/**
+ * Frames per engine pass; more are registered in chunks (12 GB fits
+ * about 190 frames at 512×336).
+ */
+engine_max_frames: number, 
 /**
  * Keep the engine resident after posing (faster next run, less VRAM).
  */

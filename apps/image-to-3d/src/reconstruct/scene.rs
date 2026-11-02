@@ -25,6 +25,90 @@ pub struct Posed {
 }
 
 impl Posed {
+    /// `n` frames shaped like `like` (same engine resolution), zeroed.
+    pub fn empty(n: usize, like: &Posed) -> Self {
+        let (w, h) = (like.cams.width, like.cams.height);
+        let px = w * h;
+        Posed {
+            names: vec![String::new(); n],
+            cams: VggtCameras {
+                pose_enc: vec![[0.0; 9]; n],
+                extrinsics: vec![[0.0; 12]; n],
+                intrinsics: vec![[0.0; 9]; n],
+                width: w,
+                height: h,
+            },
+            prepared: Prepared {
+                geom: crate::vggt::Geometry::new(n, h, w),
+                pixels: vec![0; n * px * 3],
+            },
+            dense: DenseHost {
+                depth: vec![0.0; n * px],
+                conf: vec![0.0; n * px],
+                world: vec![0.0; n * px * 3],
+            },
+        }
+    }
+
+    /// Copies the engine results of one chunk (`part` frame k is frame
+    /// `chunk[k]`) into `self`, mapped into the frame of the frames already
+    /// present (`done`) by a similarity on their shared camera centres. The
+    /// first chunk defines the world.
+    pub fn merge_chunk(&mut self, part: &Posed, chunk: &[usize], done: &mut [bool]) -> Result<()> {
+        use super::align::{M3, V3, map_point, map_pose, sim3_between};
+        ensure!(
+            part.cams.width == self.cams.width && part.cams.height == self.cams.height,
+            "engine chunks differ in resolution"
+        );
+        let as64 = |(r, t): ([[f32; 3]; 3], [f32; 3])| -> (M3, V3) {
+            (r.map(|row| row.map(f64::from)), t.map(f64::from))
+        };
+        let shared: Vec<usize> = (0..chunk.len()).filter(|&k| done[chunk[k]]).collect();
+        let sim = if shared.is_empty() {
+            (
+                1.0,
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [0.0; 3],
+            )
+        } else {
+            ensure!(shared.len() >= 3, "a chunk shares fewer than 3 frames");
+            let dst: Vec<(M3, V3)> = shared.iter().map(|&k| as64(self.pose(chunk[k]))).collect();
+            let src: Vec<(M3, V3)> = shared.iter().map(|&k| as64(part.pose(k))).collect();
+            sim3_between(&dst, &src)
+        };
+        let px = self.cams.width * self.cams.height;
+        for (k, &f) in chunk.iter().enumerate() {
+            if done[f] {
+                continue;
+            }
+            let (r, t) = map_pose(&sim, &as64(part.pose(k)));
+            let e = &mut self.cams.extrinsics[f];
+            for i in 0..3 {
+                e[4 * i] = r[i][0] as f32;
+                e[4 * i + 1] = r[i][1] as f32;
+                e[4 * i + 2] = r[i][2] as f32;
+                e[4 * i + 3] = t[i] as f32;
+            }
+            self.cams.intrinsics[f] = part.cams.intrinsics[k];
+            self.cams.pose_enc[f] = part.cams.pose_enc[k];
+            self.names[f] = part.names[k].clone();
+            let s = sim.0 as f32;
+            let (dst, src) = (f * px, k * px);
+            for p in 0..px {
+                self.dense.depth[dst + p] = part.dense.depth[src + p] * s;
+                self.dense.conf[dst + p] = part.dense.conf[src + p];
+                let x: V3 = std::array::from_fn(|j| part.dense.world[(src + p) * 3 + j] as f64);
+                let y = map_point(&sim, x);
+                let o = (dst + p) * 3;
+                self.dense.world[o..o + 3].copy_from_slice(&y.map(|v| v as f32));
+            }
+            self.prepared.pixels[dst * 3..(dst + px) * 3]
+                .copy_from_slice(&part.prepared.pixels[src * 3..(src + px) * 3]);
+            done[f] = true;
+        }
+        Ok(())
+    }
+
     pub fn frames(&self) -> usize {
         self.cams.extrinsics.len()
     }
@@ -36,6 +120,71 @@ impl Posed {
             [[e[0], e[1], e[2]], [e[4], e[5], e[6]], [e[8], e[9], e[10]]],
             [e[3], e[7], e[11]],
         )
+    }
+
+    /// Multiplies world units by `k` (translations, depth, world points).
+    pub fn rescale(&mut self, k: f32) {
+        for e in &mut self.cams.extrinsics {
+            e[3] *= k;
+            e[7] *= k;
+            e[11] *= k;
+        }
+        self.dense.depth.iter_mut().for_each(|d| *d *= k);
+        self.dense.world.iter_mut().for_each(|w| *w *= k);
+    }
+
+    /// Replaces the cameras of `frames` by trainer views (`views[k]` is frame
+    /// `frames[k]`, at `width × height`) and recomputes their world points
+    /// from the engine depth with the new cameras.
+    pub fn update_cameras(&mut self, frames: &[usize], views: &[View], width: u32, height: u32) {
+        let (w, h) = (self.cams.width, self.cams.height);
+        let (sx, sy) = (w as f64 / width as f64, h as f64 / height as f64);
+        for (&i, v) in frames.iter().zip(views) {
+            let e = &mut self.cams.extrinsics[i];
+            for r in 0..3 {
+                e[4 * r] = v.r_cw[r][0] as f32;
+                e[4 * r + 1] = v.r_cw[r][1] as f32;
+                e[4 * r + 2] = v.r_cw[r][2] as f32;
+                e[4 * r + 3] = v.t_cw[r] as f32;
+            }
+            let k = &mut self.cams.intrinsics[i];
+            k[0] = (v.fx * sx) as f32;
+            k[4] = (v.fy * sy) as f32;
+            let (rot, t) = self.pose(i);
+            let k = self.cams.intrinsics[i];
+            for py in 0..h {
+                for px in 0..w {
+                    let p = i * w * h + py * w + px;
+                    let z = self.dense.depth[p];
+                    let xc = [
+                        (px as f32 + 0.5 - k[2]) / k[0] * z - t[0],
+                        (py as f32 + 0.5 - k[5]) / k[4] * z - t[1],
+                        z - t[2],
+                    ];
+                    let world: [f32; 3] = std::array::from_fn(|j| {
+                        rot[0][j] * xc[0] + rot[1][j] * xc[1] + rot[2][j] * xc[2]
+                    });
+                    self.dense.world[p * 3..p * 3 + 3].copy_from_slice(&world);
+                }
+            }
+        }
+    }
+
+    /// Mean distance of the camera centres of `frames` from their centroid.
+    pub fn spread(&self, frames: &[usize]) -> f32 {
+        let c: Vec<[f32; 3]> = frames
+            .iter()
+            .map(|&i| {
+                let (r, t) = self.pose(i);
+                std::array::from_fn(|j| -(r[0][j] * t[0] + r[1][j] * t[1] + r[2][j] * t[2]))
+            })
+            .collect();
+        let n = c.len().max(1) as f32;
+        let m: [f32; 3] = std::array::from_fn(|k| c.iter().map(|p| p[k]).sum::<f32>() / n);
+        c.iter()
+            .map(|p| ((p[0] - m[0]).powi(2) + (p[1] - m[1]).powi(2) + (p[2] - m[2]).powi(2)).sqrt())
+            .sum::<f32>()
+            / n
     }
 
     /// Median focal over `frames` at a `width × height` image, (fx, fy).
@@ -277,6 +426,54 @@ mod tests {
         assert!(prior.iter().zip(&w).all(|(d, w)| (*w == 0.0) || *d > 0.0));
         let pts = p.points(&[0, 1], 0.0, 10);
         assert!(!pts.xyz.is_empty() && pts.xyz.len() <= 10);
+    }
+
+    #[test]
+    fn updated_cameras_reproject_depth() {
+        let mut p = posed(2, 4, 2);
+        let views = p.views(&[1], 8, 4, (200.0, 200.0));
+        let mut v = views[0].clone();
+        v.t_cw = [0.0, 0.0, 1.0];
+        p.update_cameras(&[1], &[v], 8, 4);
+        assert_eq!(p.cams.intrinsics[1][0], 100.0);
+        // Pixel (0, 0) of frame 1: depth d, x = (0.5 − 2)/100·d, world z = d − 1.
+        let px = 8;
+        let d = p.dense.depth[px];
+        assert!((p.dense.world[px * 3] - (0.5 - 2.0) / 100.0 * d).abs() < 1e-6);
+        assert!((p.dense.world[px * 3 + 2] - (d - 1.0)).abs() < 1e-6);
+        assert_eq!(p.dense.world[0], 0.5, "other frames untouched");
+    }
+
+    #[test]
+    fn merged_chunks_land_in_the_first_chunks_frame() {
+        // Chunk 0 = frames 0..4; chunk 1 = frames 0..3 again plus frame 4,
+        // seen in a world scaled by 2 and shifted by (1, 0, 0).
+        let full = posed(5, 4, 2);
+        let mut a = posed(4, 4, 2);
+        a.cams.extrinsics.truncate(4);
+        let mut b = posed(4, 4, 2);
+        // Frames 0, 1, 2 of chunk 1 are frames 0, 1, 2 of the scene; frame 3 is scene frame 4.
+        for (k, f) in [0usize, 1, 2, 4].iter().enumerate() {
+            let mut e = full.cams.extrinsics[*f];
+            // X' = 2X + (1,0,0): t' = 2t − R·(1,0,0) with R = I.
+            e[3] = 2.0 * e[3] - 1.0;
+            e[7] *= 2.0;
+            e[11] *= 2.0;
+            b.cams.extrinsics[k] = e;
+        }
+        let mut all = Posed::empty(5, &a);
+        let mut done = vec![false; 5];
+        all.merge_chunk(&a, &[0, 1, 2, 3], &mut done).unwrap();
+        all.merge_chunk(&b, &[0, 1, 2, 4], &mut done).unwrap();
+        assert!(done.iter().all(|&d| d));
+        let e = all.cams.extrinsics[4];
+        assert!(
+            (e[3] - 4.0).abs() < 1e-5,
+            "t_x of frame 4 back in chunk-0 units: {e:?}"
+        );
+        // Depth scaled by 1/2, world points mapped back.
+        assert!((all.dense.depth[4 * 8] - b.dense.depth[3 * 8] * 0.5).abs() < 1e-6);
+        assert!((all.dense.world[4 * 8 * 3] - (0.5 - 1.0) * 0.5).abs() < 1e-5);
     }
 
     #[test]

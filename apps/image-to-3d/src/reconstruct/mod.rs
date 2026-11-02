@@ -14,6 +14,7 @@
 //! GPU-exclusive. The VGGT-Ω weights are under the FAIR non-commercial
 //! research licence (see [`crate::pose`]).
 
+pub mod align;
 pub mod joint;
 pub mod pipeline;
 pub mod prune;
@@ -38,7 +39,7 @@ use crate::vggt::VggtEngine;
 pub use pipeline::{Event, Frames, PipelineConfig, ReconPreset, StageTimes, reconstruct};
 
 fn default_max_frames() -> u32 {
-    200
+    300
 }
 
 fn default_long_side() -> u32 {

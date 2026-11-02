@@ -31,7 +31,9 @@ use crate::io::images::{ImageCache, Rgb8Image};
 use crate::io::scene::View;
 use crate::kernels::adam::AdamIterPlan;
 use crate::kernels::densify::{DensifyCx, DensifyOutcome};
-use crate::kernels::layout::{FLAG_ABS_GRAD, FLAG_DENSIFY_STATS, OVF_CHAINS, OVF_INSTANCES};
+use crate::kernels::layout::{
+    FLAG_ABS_GRAD, FLAG_CAM_GRAD, FLAG_DENSIFY_STATS, OVF_CHAINS, OVF_INSTANCES,
+};
 use crate::kernels::loss::resample_target;
 use crate::kernels::preprocess::PreprocessKernels;
 use crate::kernels::raster::{FrameSource, GpuRaster, GradTargets, SplatRaster};
@@ -68,6 +70,17 @@ pub struct PoseRefine {
     pub lr_trans: f32,
     /// Log-focal LR; 0 keeps the focal fixed.
     pub lr_focal: f32,
+    /// LRs decay exponentially to this factor at `end`.
+    pub final_factor: f32,
+}
+
+impl PoseRefine {
+    /// LR multiplier at iteration `t`.
+    pub fn decay(&self, t: u32) -> f32 {
+        let span = self.end.saturating_sub(self.start).max(1) as f32;
+        let a = (t.saturating_sub(self.start) as f32 / span).min(1.0);
+        self.final_factor.max(1e-6).powf(a)
+    }
 }
 
 /// Depth prior: weight `init` at `start`, linear to 0 at `end`.
@@ -372,7 +385,16 @@ impl Joint {
         let res_scale = tr.schedule.res_scale(t);
         let sh_degree = tr.schedule.sh_degree(t);
         let plan = tr.adam.plan(t);
-        let params = tr.iter_params(t, view, sh_degree, res_scale, plan);
+        let mut params = tr.iter_params(t, view, sh_degree, res_scale, plan);
+        if self
+            .cfg
+            .pose
+            .as_ref()
+            .is_some_and(|p| t >= p.start && t < p.end)
+        {
+            params.frame.flags |= FLAG_CAM_GRAD;
+        }
+        let tr = &mut self.tr;
         tr.ring.push(&params)?;
         self.record(t, view, &params)?;
         let tr = &mut self.tr;
@@ -509,13 +531,14 @@ impl Joint {
             .step(&gpu, &mut tr.g, &mut tr.grads, raster.params())?;
         if let Some(p) = self.cfg.pose.as_ref().filter(|_| pose_on) {
             let extent = tr.scene.extent;
+            let k = p.decay(t);
             self.cam.step_pose(
                 &gpu,
                 &self.k,
                 &mut tr.scene_gpu.cams,
                 view as u32,
-                p.lr_rot,
-                p.lr_trans * extent,
+                p.lr_rot * k,
+                p.lr_trans * extent * k,
                 view as u32 == self.frozen,
             )?;
             self.cam.step_focal(
@@ -525,7 +548,7 @@ impl Joint {
                 intr_id,
                 sx,
                 sy,
-                p.lr_focal,
+                p.lr_focal * k,
             )?;
         }
         if let Some((p, _)) = &mut self.ppisp {
@@ -771,7 +794,9 @@ impl Joint {
         for i in 0..tv.views.len() {
             let e = tv.images.entries[i];
             let v = &tv.views[i];
-            let params = self.params_for(i, v.width, v.height, Some((e.offset, e.width, e.height)));
+            let mut params =
+                self.params_for(i, v.width, v.height, Some((e.offset, e.width, e.height)));
+            params.frame.flags |= FLAG_CAM_GRAD;
             for it in 0..iters {
                 // Exponential decay to 1 % over the run.
                 let decay = 0.01f32.powf(it as f32 / iters.max(1) as f32);

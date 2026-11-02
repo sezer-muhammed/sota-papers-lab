@@ -59,6 +59,9 @@ pub struct PipelineConfig {
     pub seed: u64,
     /// Gaussians Stage B creates.
     pub init_target: u32,
+    /// Above 0: skip the voxel init and seed this many engine points with
+    /// the trainer's kNN init instead (the COLMAP-style sparse start).
+    pub init_points: u32,
     /// Fraction of low-confidence pixels Stage B drops (0-1).
     pub init_conf_drop: f32,
     /// Prune-first pass: views, error threshold, fraction removed (0 = off).
@@ -75,7 +78,15 @@ pub struct PipelineConfig {
     pub pose_lr_rot: f32,
     pub pose_lr_trans: f32,
     pub focal_lr: f32,
+    /// Pose and focal LRs decay exponentially to this factor at the end.
+    pub pose_lr_final: f32,
     pub ppisp: bool,
+    /// Above 0: a pose bootstrap of this many iterations (sparse init, poses
+    /// only kept) before the real run, whose init then uses the engine depth
+    /// re-unprojected with the refined cameras.
+    pub bootstrap_iters: u32,
+    /// Bootstrap pose LR (rotation; translation the same × extent).
+    pub bootstrap_lr: f32,
     /// Depth prior weight at iteration 0 (decays linearly to 0); 0 = off.
     pub depth_weight: f32,
     /// Fraction of the run over which the depth weight decays.
@@ -84,6 +95,12 @@ pub struct PipelineConfig {
     pub depth_conf_drop: f32,
     /// Live snapshot cadence in seconds (0 = none).
     pub snapshot_every_s: f32,
+    /// Rescale the world so training cameras sit this far (mean) from their
+    /// centroid; 0 keeps the engine's units.
+    pub world_spread: f32,
+    /// Frames per engine pass; more are registered in chunks (12 GB fits
+    /// about 190 frames at 512×336).
+    pub engine_max_frames: u32,
     /// Keep the engine resident after posing (faster next run, less VRAM).
     pub keep_engine: bool,
     /// Trainer overrides (ablations).
@@ -92,37 +109,47 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
+    /// Defaults measured on Mip-NeRF 360 garden (Fast): sparse kNN init from
+    /// engine points beats the voxel init by 0.25 dB; per-image pose Adam at
+    /// 1e-3 over the whole run (decay to 0.1x) beats 1e-4 by 1.5 dB; the
+    /// depth prior is neutral (kept at the design's 0.1 → 0 over 30 %).
     pub fn preset(p: ReconPreset) -> Self {
         let base = Self {
             preset: p,
             iterations: None,
             seed: 0,
             init_target: 600_000,
+            init_points: 150_000,
             init_conf_drop: 0.2,
             prune_views: 10,
             prune_tau: 0.5,
             prune_fraction: 0.0,
             pose_refine: true,
-            pose_start: 500,
-            pose_end: None,
-            pose_lr_rot: 1e-4,
-            pose_lr_trans: 1e-4,
+            pose_start: 0,
+            pose_end: Some(u32::MAX),
+            pose_lr_rot: 1e-3,
+            pose_lr_trans: 1e-3,
             focal_lr: 1e-4,
+            pose_lr_final: 0.1,
             ppisp: false,
+            bootstrap_iters: 0,
+            bootstrap_lr: 3e-3,
             depth_weight: 0.1,
             depth_until: 0.3,
             depth_conf_drop: 0.3,
             snapshot_every_s: 8.0,
+            world_spread: 0.0,
+            engine_max_frames: 180,
             keep_engine: false,
             overrides: PresetOverrides::default(),
         };
         match p {
-            ReconPreset::Quality => base,
-            ReconPreset::Fast => Self {
-                init_target: 400_000,
-                pose_start: 300,
+            // Pose bootstrap: +0.4 dB on garden for 17 s.
+            ReconPreset::Quality => Self {
+                bootstrap_iters: 5000,
                 ..base
             },
+            ReconPreset::Fast => base,
         }
     }
 
@@ -180,6 +207,8 @@ pub struct StageTimes {
     pub setup_s: f64,
     pub init_s: f64,
     pub prune_s: f64,
+    #[serde(default)]
+    pub bootstrap_s: f64,
     pub train_s: f64,
     pub export_s: f64,
     /// From the call to the exports being encoded.
@@ -257,6 +286,41 @@ impl Reconstruction {
         Ok((mean, per))
     }
 
+    /// Mean metrics of every `every`-th training view (fit diagnostic).
+    pub fn evaluate_train(&mut self, every: usize) -> Result<ImageMetrics> {
+        let Some(joint) = self.joint.as_mut() else {
+            bail!("released");
+        };
+        let views: Vec<(usize, u32, u32)> = joint
+            .tr
+            .scene
+            .views
+            .iter()
+            .enumerate()
+            .step_by(every.max(1))
+            .map(|(i, v)| (i, v.width, v.height))
+            .collect();
+        let mut per = Vec::new();
+        for (i, w, h) in views {
+            let cams = std::mem::replace(
+                &mut joint.tr.scene_gpu.cams,
+                crate::frame::CameraTable::upload(&joint.tr.gpu, &[])?,
+            );
+            let img = joint.render(&cams, i, w, h);
+            joint.tr.scene_gpu.cams = cams;
+            let gt = joint.tr.scene_gpu.images.download(&joint.tr.gpu, i)?;
+            per.push(image_metrics(&img?, &gt)?);
+        }
+        let n = per.len().max(1) as f64;
+        Ok(ImageMetrics {
+            psnr: per.iter().map(|m| m.psnr).sum::<f64>() / n,
+            ssim: per.iter().map(|m| m.ssim).sum::<f64>() / n,
+            ssim_valid: per.iter().map(|m| m.ssim_valid).sum::<f64>() / n,
+            lpips_vgg: None,
+            lpips_vgg_inria: None,
+        })
+    }
+
     /// Test-time pose refinement of the held-out views (frozen Gaussians).
     pub fn refine_test(&mut self, iters: u32, lr_rot: f32, lr_trans: f32) -> Result<f64> {
         let (Some(joint), Some(tv)) = (self.joint.as_mut(), self.test.as_mut()) else {
@@ -312,12 +376,50 @@ pub fn unload_engine() {
     }
 }
 
-/// Runs the engine on every frame. Returns the host results, load and wall
-/// seconds and the forward GPU time.
+/// Engine chunks of exactly `max` frame indices when `n > max`: chunk 0 is
+/// an even sample of all frames; every later chunk is `anchors` frames of
+/// chunk 0 (its first frame first) plus up to `max − anchors` new frames,
+/// padded with more chunk-0 frames so every chunk has the same size (one
+/// engine workspace serves them all).
+pub fn chunk_plan(n: usize, max: usize, anchors: usize) -> Vec<Vec<usize>> {
+    if n <= max {
+        return vec![(0..n).collect()];
+    }
+    let anchors = anchors.clamp(2, max - 1);
+    let first = crate::pose::sample_indices(n, max);
+    let mut in_first = vec![false; n];
+    first.iter().for_each(|&i| in_first[i] = true);
+    let rest: Vec<usize> = (0..n).filter(|&i| !in_first[i]).collect();
+    let anc: Vec<usize> = crate::pose::sample_indices(max, anchors)
+        .into_iter()
+        .map(|k| first[k])
+        .collect();
+    let mut out = vec![first.clone()];
+    for piece in rest.chunks(max - anchors) {
+        let mut c = anc.clone();
+        c.extend_from_slice(piece);
+        for &f in &first {
+            if c.len() >= max {
+                break;
+            }
+            if !c.contains(&f) {
+                c.push(f);
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Runs the engine on every frame (in [`chunk_plan`] chunks of at most
+/// `max_frames`, registered to the first chunk by a similarity on the shared
+/// frames' camera centres). Returns the host results, load and wall seconds
+/// and the summed forward GPU time.
 pub fn pose_frames(
     weights: &std::path::Path,
     frames: &Frames,
     keep: bool,
+    max_frames: usize,
     cancel: &CancellationToken,
     events: &mut dyn FnMut(Event),
 ) -> Result<(Posed, f64, f64, f32)> {
@@ -339,31 +441,94 @@ pub fn pose_frames(
     let load_s = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
     let e = &mut engine.1;
-    let prepared = e.preprocess(&frames.engine)?;
-    let mut progress = |stage: &str, f: f32| {
-        events(Event::Progress(
-            0.02 + 0.13 * f as f64,
-            format!("engine: {stage}"),
-        ));
-    };
-    let cams = e.run(&prepared, cancel, &mut progress)?;
-    let dense = e.download(&prepared.geom)?;
-    let fwd = e.times.total_ms;
+    let n = frames.engine.len();
+    let plan = chunk_plan(n, max_frames.max(2), 32);
+    let n_chunks = plan.len();
+    let mut fwd = 0.0f32;
+    let mut out: Option<Posed> = None;
+    let mut done = vec![false; n];
+    for (ci, chunk) in plan.iter().enumerate() {
+        let imgs: Vec<Rgb8Image> = chunk.iter().map(|&i| frames.engine[i].clone()).collect();
+        let prepared = e.preprocess(&imgs)?;
+        let mut progress = |stage: &str, f: f32| {
+            let g = (ci as f32 + f) / n_chunks as f32;
+            events(Event::Progress(
+                0.02 + 0.13 * g as f64,
+                format!("engine {}/{n_chunks}: {stage}", ci + 1),
+            ));
+        };
+        let cams = e.run(&prepared, cancel, &mut progress)?;
+        let dense = e.download(&prepared.geom)?;
+        fwd += e.times.total_ms;
+        let part = Posed {
+            names: chunk.iter().map(|&i| frames.names[i].clone()).collect(),
+            cams,
+            prepared,
+            dense,
+        };
+        let all = out.get_or_insert_with(|| Posed::empty(n, &part));
+        all.merge_chunk(&part, chunk, &mut done)?;
+    }
     if !keep {
         *slot = None;
     }
     drop(slot);
-    Ok((
-        Posed {
-            names: frames.names.clone(),
-            cams,
-            prepared,
-            dense,
-        },
-        load_s,
-        t1.elapsed().as_secs_f64(),
-        fwd,
-    ))
+    let mut posed = out.ok_or_else(|| spl_core::anyhow!("no frames"))?;
+    posed.names = frames.names.clone();
+    Ok((posed, load_s, t1.elapsed().as_secs_f64(), fwd))
+}
+
+/// Pose bootstrap: a short sparse-init run with joint pose refinement;
+/// returns the refined training views.
+#[allow(clippy::too_many_arguments)]
+fn bootstrap(
+    gpu: &Gpu,
+    posed: &Posed,
+    train: &[usize],
+    imgs: &[Rgb8Image],
+    (tw, th): (u32, u32),
+    focal: (f64, f64),
+    cfg: &PipelineConfig,
+    cancel: &CancellationToken,
+) -> Result<Vec<View>> {
+    let cache = ImageCache::from_images(gpu, (0..train.len()).collect(), imgs, 0.0)?;
+    let points = posed.points(train, cfg.init_conf_drop, 100_000);
+    let mut scene = training_scene(posed.views(train, tw, th, focal), points)?;
+    let all: Vec<usize> = scene.train.clone();
+    scene.train = Vec::new();
+    let tcfg = TrainConfig {
+        preset: PresetName::Fast,
+        iterations: Some(cfg.bootstrap_iters),
+        seed: cfg.seed ^ 0xB007,
+        ..Default::default()
+    };
+    let mut tr = Trainer::new(gpu, scene, tcfg)?;
+    tr.scene.train = all.clone();
+    tr.scene_gpu.train = all.clone();
+    tr.scene_gpu.images = cache;
+    tr.order = ViewOrder::new(all, cfg.seed ^ 0xB007);
+    let total = tr.total;
+    let jc = JointConfig {
+        pose: Some(PoseRefine {
+            start: 0,
+            end: total,
+            lr_rot: cfg.bootstrap_lr,
+            lr_trans: cfg.bootstrap_lr,
+            lr_focal: cfg.focal_lr,
+            final_factor: 0.1,
+        }),
+        ppisp: None,
+        depth: None,
+    };
+    let mut joint = Joint::new(tr, jc, None)?;
+    while joint.tr.t < total {
+        if joint.tr.t.is_multiple_of(50) && cancel.is_cancelled() {
+            bail!("cancelled");
+        }
+        joint.step()?;
+    }
+    joint.tr.gpu.sync()?;
+    joint.refined_views()
 }
 
 /// The densification end of the resolved preset (pose refinement stops there).
@@ -385,6 +550,24 @@ pub fn reconstruct(
     cancel: &CancellationToken,
     events: &mut dyn FnMut(Event),
 ) -> Result<Reconstruction> {
+    reconstruct_with(weights, frames, cfg, holdout_every, cancel, events, None)
+}
+
+/// Edits the engine's results in place (see [`reconstruct_with`]).
+pub type PosedHook<'a> = dyn FnMut(&mut Posed) -> Result<()> + 'a;
+
+/// [`reconstruct`] with a hook that may edit the engine's results before
+/// anything uses them (diagnostics: reference poses).
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_with(
+    weights: &std::path::Path,
+    frames: Frames,
+    cfg: &PipelineConfig,
+    holdout_every: usize,
+    cancel: &CancellationToken,
+    events: &mut dyn FnMut(Event),
+    adjust: Option<&mut PosedHook<'_>>,
+) -> Result<Reconstruction> {
     let started = Instant::now();
     let n = frames.names.len();
     ensure!(n >= 2, "need at least two frames, got {n}");
@@ -400,8 +583,17 @@ pub fn reconstruct(
 
     // A. Engine.
     events(Event::Progress(0.02, "engine".into()));
-    let (posed, load_s, engine_s, fwd_ms) =
-        pose_frames(weights, &frames, cfg.keep_engine, cancel, events)?;
+    let (mut posed, load_s, engine_s, fwd_ms) = pose_frames(
+        weights,
+        &frames,
+        cfg.keep_engine,
+        cfg.engine_max_frames as usize,
+        cancel,
+        events,
+    )?;
+    if let Some(f) = adjust {
+        f(&mut posed)?;
+    }
     times.engine_load_s = load_s;
     times.engine_s = engine_s;
     times.engine_forward_ms = fwd_ms;
@@ -411,6 +603,12 @@ pub fn reconstruct(
     )));
     let (train, test) = holdout_split(n, holdout_every);
     ensure!(train.len() >= 2, "need at least two training frames");
+    if cfg.world_spread > 0.0 {
+        let s = posed.spread(&train);
+        if s > 0.0 && s.is_finite() {
+            posed.rescale(cfg.world_spread / s);
+        }
+    }
     let focal = posed.shared_focal(&train, tw, th);
     {
         let all: Vec<usize> = (0..n).collect();
@@ -430,6 +628,19 @@ pub fn reconstruct(
     let t_setup = Instant::now();
     events(Event::Progress(0.16, "initializing".into()));
     let gpu = Gpu::open()?;
+    let mut focal = focal;
+    if cfg.bootstrap_iters > 0 {
+        let t = Instant::now();
+        let imgs: Vec<Rgb8Image> = train.iter().map(|&i| frames.trainer[i].clone()).collect();
+        let views = bootstrap(&gpu, &posed, &train, &imgs, (tw, th), focal, cfg, cancel)?;
+        posed.update_cameras(&train, &views, tw, th);
+        focal = (views[0].fx, views[0].fy);
+        times.bootstrap_s = t.elapsed().as_secs_f64();
+        events(Event::Log(format!(
+            "pose bootstrap: {} iterations in {:.1} s",
+            cfg.bootstrap_iters, times.bootstrap_s
+        )));
+    }
     let train_views = posed.views(&train, tw, th, focal);
     let test_views = posed.views(&test, tw, th, focal);
     let train_imgs: Vec<Rgb8Image> = train.iter().map(|&i| frames.trainer[i].clone()).collect();
@@ -438,7 +649,11 @@ pub fn reconstruct(
     // Images first: the trainer sizes its capacity from what is left.
     let cache = ImageCache::from_images(&gpu, (0..train.len()).collect(), &train_imgs, 0.0)?;
     drop(train_imgs);
-    let seed_points = posed.points(&train, cfg.init_conf_drop, 4096);
+    let seed_points = posed.points(
+        &train,
+        cfg.init_conf_drop,
+        cfg.init_points.max(4096) as usize,
+    );
     let mut scene = training_scene(train_views, seed_points)?;
     let all_train = scene.train.clone();
     scene.train = Vec::new();
@@ -451,24 +666,32 @@ pub fn reconstruct(
     times.setup_s = t_setup.elapsed().as_secs_f64();
 
     let t_init = Instant::now();
-    let kinit = InitKernels::load(&gpu)?;
-    let depth_host = posed.depth_frames(&train);
-    let df = DepthFrames::upload(&gpu, &depth_host)?;
-    drop(depth_host);
-    let target = cfg.init_target.min((tr.g.cap as f32 / 1.15) as u32).max(1);
-    let opts = InitOptions {
-        target,
-        conf_percentile: cfg.init_conf_drop,
-        ..Default::default()
-    };
-    let rep = init_from_depth(&gpu, &kinit, &df, &opts, &mut tr.g)?;
-    drop(df);
-    gpu.sync()?;
-    times.init_s = t_init.elapsed().as_secs_f64();
-    events(Event::Log(format!(
-        "stage B: {} Gaussians (voxel {:.4}, conf ≥ {:.3}) in {:.0} ms",
-        rep.n_gaussians, rep.voxel, rep.conf_threshold, rep.ms_total
-    )));
+    if cfg.init_points == 0 {
+        let kinit = InitKernels::load(&gpu)?;
+        let depth_host = posed.depth_frames(&train);
+        let df = DepthFrames::upload(&gpu, &depth_host)?;
+        drop(depth_host);
+        let target = cfg.init_target.min((tr.g.cap as f32 / 1.15) as u32).max(1);
+        let opts = InitOptions {
+            target,
+            conf_percentile: cfg.init_conf_drop,
+            ..Default::default()
+        };
+        let rep = init_from_depth(&gpu, &kinit, &df, &opts, &mut tr.g)?;
+        drop(df);
+        gpu.sync()?;
+        times.init_s = t_init.elapsed().as_secs_f64();
+        events(Event::Log(format!(
+            "stage B: {} Gaussians (voxel {:.4}, conf ≥ {:.3}) in {:.0} ms",
+            rep.n_gaussians, rep.voxel, rep.conf_threshold, rep.ms_total
+        )));
+    } else {
+        times.init_s = t_init.elapsed().as_secs_f64();
+        events(Event::Log(format!(
+            "init: {} engine points, kNN scales",
+            tr.g.n
+        )));
+    }
     let init_gaussians = tr.g.n;
     let t_prune = Instant::now();
     let prune = prune_first(
@@ -491,10 +714,11 @@ pub fn reconstruct(
     let joint_cfg = JointConfig {
         pose: cfg.pose_refine.then(|| PoseRefine {
             start: cfg.pose_start,
-            end: cfg.pose_end.unwrap_or(dens_end),
+            end: cfg.pose_end.unwrap_or(dens_end).min(total),
             lr_rot: cfg.pose_lr_rot,
             lr_trans: cfg.pose_lr_trans,
             lr_focal: cfg.focal_lr,
+            final_factor: cfg.pose_lr_final,
         }),
         ppisp: cfg.ppisp.then(PpispConfig::default),
         depth: (cfg.depth_weight > 0.0).then(|| DepthPriorCfg {
@@ -619,6 +843,25 @@ mod tests {
         let json = serde_json::to_string(&f).unwrap();
         let back: PipelineConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, f);
+    }
+
+    #[test]
+    fn chunk_plan_covers_every_frame_with_equal_chunks() {
+        assert_eq!(chunk_plan(10, 20, 4), vec![(0..10).collect::<Vec<_>>()]);
+        let plan = chunk_plan(301, 180, 32);
+        assert!(plan.iter().all(|c| c.len() == 180));
+        let mut seen = vec![false; 301];
+        plan.iter().flatten().for_each(|&i| seen[i] = true);
+        assert!(seen.iter().all(|&s| s));
+        for c in &plan[1..] {
+            assert_eq!(c[0], 0, "the reference frame anchors every chunk");
+            let shared = c.iter().filter(|i| plan[0].contains(i)).count();
+            assert!(shared >= 32);
+            let mut d = c.clone();
+            d.sort_unstable();
+            d.dedup();
+            assert_eq!(d.len(), c.len(), "no duplicates");
+        }
     }
 
     #[test]
