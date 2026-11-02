@@ -322,7 +322,11 @@ impl Trainer {
         );
         let raster = GpuRaster::new(gpu, cap, variant, strategy.wants_abs_grad())?;
         let geometry = match cfg.geometry() {
-            Some(c) => Some(GeomTrain::new(gpu, c, &variant, cap, scene.extent, total)?),
+            Some(c) => {
+                let mut geo = GeomTrain::new(gpu, c, &variant, cap, scene.extent, total)?;
+                geo.enable_multiview(gpu, &scene.views, &scene_gpu.images)?;
+                Some(geo)
+            }
             None => None,
         };
         let mut t = Self {
@@ -581,7 +585,7 @@ impl Trainer {
         self.loss
             .forward_backward(gpu, io.params, io.image, &self.target, &mut io.grads.d_rgb)?;
         if let Some(geo) = &mut self.geometry {
-            geo.after_forward(gpu, raster, &self.g)?;
+            geo.after_forward(gpu, raster, &self.g, Some(&self.scene_gpu.images))?;
         }
         let want_stats = self.strategy.wants_stats(t);
         raster.backward(

@@ -191,6 +191,10 @@ fn gpu_geom_distortion_gradient_matches_finite_differences() {
         dist_from: 0.0,
         normal_from: 0.0,
         flat_from: 0.0,
+        plane_depth: false,
+        lambda_mv_geo: 0.0,
+        lambda_mv_ncc: 0.0,
+        ..Default::default()
     };
     let mut geo = GeomTrain::new(&gpu, cfg, &v, rcap, 1.0, 100).unwrap();
     let params = eager_params(0, n as u32, opts.width, opts.height);
@@ -206,7 +210,7 @@ fn gpu_geom_distortion_gradient_matches_finite_differences() {
                 RenderMode::Train,
             )
             .unwrap();
-        geo.after_forward(gpu, raster, g).unwrap();
+        geo.after_forward(gpu, raster, g, None).unwrap();
         let (d, _) = geo.take_sums(gpu, 1).unwrap();
         d / p
     };
@@ -259,4 +263,132 @@ fn gpu_geom_distortion_gradient_matches_finite_differences() {
         }
     }
     assert!(checked >= 6, "{checked}/8 opacities within 10%");
+}
+
+/// The multi-view gradients (plane depth → N, Ds → means) against central
+/// differences: one term at a time, occlusion weighting off (`mv_max_err` 0),
+/// view 1's depth cached first, then the loss of view 0 against it.
+#[test]
+#[ignore = "GPU: run on the GPU host"]
+fn gpu_geom_multiview_gradients_match_finite_differences() {
+    use crate::io::images::{ImageCache, Rgb8Image};
+    let gpu = Gpu::open().unwrap();
+    let opts = SyntheticOptions {
+        width: 160,
+        height: 120,
+        views: 24,
+        ..Default::default()
+    };
+    let views = synthetic_scene(&opts).views;
+    let host = sphere_cloud(6000);
+    let n = host.len();
+    let cap = n.next_multiple_of(1024);
+    let mut g = Gaussians::alloc(&gpu, cap, false).unwrap();
+    let cams = CameraTable::upload(&gpu, &views).unwrap();
+    // Smooth texture, different per view (NCC stays differentiable).
+    let images: Vec<Rgb8Image> = (0..2)
+        .map(|k| {
+            let mut im = Rgb8Image::new(opts.width, opts.height);
+            for y in 0..opts.height {
+                for x in 0..opts.width {
+                    let (xf, yf) = (x as f32 + 7.0 * k as f32, y as f32);
+                    let v = 128.0 + 90.0 * (0.21 * xf).sin() * (0.17 * yf + 0.3 * k as f32).cos();
+                    let i = 3 * (y * opts.width + x) as usize;
+                    im.data[i..i + 3].fill(v as u8);
+                }
+            }
+            im
+        })
+        .collect();
+    let cache = ImageCache::from_images(&gpu, vec![0, 1], &images, 0.0).unwrap();
+    let v = RasterVariant::default();
+    let rcap = Capacity::new(cap as u32, 1 << 20, opts.width, opts.height, &v);
+    let mut raster = GpuRaster::new(&gpu, rcap, v, false).unwrap();
+    for (name, lg, lp) in [("geometric", 1.0f32, 0.0f32), ("photometric", 0.0, 1.0)] {
+        let cfg = GeometryConfig {
+            lambda_dist: 0.0,
+            lambda_normal: 0.0,
+            lambda_flat: 0.0,
+            lambda_mv_geo: lg,
+            lambda_mv_ncc: lp,
+            mv_from: 0.0,
+            mv_stride: 1,
+            mv_max_err: 0.0,
+            ncc_min_var: 0.0,
+            ..Default::default()
+        };
+        let mut geo = GeomTrain::new(&gpu, cfg, &v, rcap, 1.0, 100).unwrap();
+        geo.enable_multiview(&gpu, &views[..2], &cache).unwrap();
+        let run = |gpu: &Gpu,
+                   g: &mut Gaussians,
+                   raster: &mut GpuRaster,
+                   geo: &mut GeomTrain,
+                   view: usize| {
+            let params = eager_params(view, n as u32, opts.width, opts.height);
+            raster
+                .forward(
+                    gpu,
+                    g,
+                    &cams,
+                    FrameSource::Eager(&params),
+                    RenderMode::Train,
+                )
+                .unwrap();
+            geo.after_forward(gpu, raster, g, Some(&cache)).unwrap();
+            let _ = geo.take_sums(gpu, 1).unwrap();
+            let (lgeo, lpho, used) = geo.mv_sums;
+            let scale = 1.0 / (opts.width * opts.height) as f64;
+            scale * used * (lg as f64 * lgeo + lp as f64 * lpho)
+        };
+        // A slightly different cloud for the neighbour's cached depth.
+        let mut other = host.clone();
+        for m in other.means.iter_mut() {
+            *m *= 1.003;
+        }
+        g.upload(&gpu, &other).unwrap();
+        run(&gpu, &mut g, &mut raster, &mut geo, 1);
+        g.upload(&gpu, &host).unwrap();
+        let l0 = run(&gpu, &mut g, &mut raster, &mut geo, 0);
+        let mut grads = crate::model::Grads::alloc(&gpu, cap).unwrap();
+        raster.pixel_grads.d_rgb = gpu
+            .stream
+            .alloc_zeros(raster.pixel_grads.d_rgb.len())
+            .unwrap();
+        raster
+            .backward(
+                &gpu,
+                &mut g,
+                GradTargets {
+                    sink: GradSink::Write(&mut grads),
+                    camera: None,
+                    stats: None,
+                },
+            )
+            .unwrap();
+        geo.after_backward(&gpu, &raster, &g, &mut grads).unwrap();
+        let ga = gpu.stream.clone_dtoh(&grads.mean).unwrap();
+        eprintln!("{name}: loss {l0:.6e}, mv pixels {:.0}", geo.mv_sums.2);
+        assert!(l0 > 0.0);
+        let mut idx: Vec<usize> = (0..3 * n).collect();
+        idx.sort_by(|&a, &b| ga[b].abs().total_cmp(&ga[a].abs()));
+        let eps = 2e-4f32;
+        let mut close = 0;
+        for &i in idx.iter().take(8) {
+            let mut h = host.clone();
+            h.means[i] += eps;
+            g.upload(&gpu, &h).unwrap();
+            let lp_ = run(&gpu, &mut g, &mut raster, &mut geo, 0);
+            h.means[i] -= 2.0 * eps;
+            g.upload(&gpu, &h).unwrap();
+            let lm = run(&gpu, &mut g, &mut raster, &mut geo, 0);
+            let fd = (lp_ - lm) / (2.0 * eps as f64);
+            let an = ga[i] as f64;
+            let rel = (an - fd).abs() / an.abs().max(fd.abs());
+            eprintln!("{name} mean[{i}]: analytic {an:.4e} fd {fd:.4e} rel {rel:.3}");
+            if rel < 0.2 {
+                close += 1;
+            }
+        }
+        assert!(close >= 6, "{name}: {close}/8 mean gradients within 20%");
+    }
 }

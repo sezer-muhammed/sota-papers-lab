@@ -136,7 +136,8 @@ fn gpu_mesh_dataset() {
             if let Some(geo) = &mut trainer.geometry {
                 let (d, n) = geo.take_sums(&gpu, summary.iterations).unwrap();
                 eprintln!(
-                    "geometry losses (mean per frame, pixel sums): distortion {d:.4e} normal {n:.4e}"
+                    "geometry losses (mean per frame, pixel sums): distortion {d:.4e} normal {n:.4e}; multi-view per pixel: geometric {:.4e} photometric {:.4e}, {:.0} pixels per frame",
+                    geo.mv_sums.0, geo.mv_sums.1, geo.mv_sums.2
                 );
             }
             let (cloud, _) = trainer.finish().unwrap();

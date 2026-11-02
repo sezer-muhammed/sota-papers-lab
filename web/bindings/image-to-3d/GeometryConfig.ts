@@ -23,4 +23,36 @@ near_rel: number,
 /**
  * Fractions of the run where each term switches on (2DGS: 3k and 7k of 30k).
  */
-dist_from: number, normal_from: number, flat_from: number, };
+dist_from: number, normal_from: number, flat_from: number, 
+/**
+ * Median depth replaced by the plane depth `Ds / (N . ray)` (PGSR).
+ */
+plane_depth: boolean, 
+/**
+ * Multi-view geometric consistency weight (relative depth residual).
+ */
+lambda_mv_geo: number, 
+/**
+ * Multi-view photometric weight (1 − NCC of 7x7 patches; PGSR: 0.15).
+ */
+lambda_mv_ncc: number, 
+/**
+ * Fraction of the run where the multi-view terms switch on (PGSR: 7k of 30k).
+ */
+mv_from: number, 
+/**
+ * Multi-view terms on every n-th pixel along each axis.
+ */
+mv_stride: number, 
+/**
+ * Forward-backward reprojection error (pixels) above which a pixel counts as occluded.
+ */
+mv_max_err: number, 
+/**
+ * Gray variance of the reference patch below which NCC is skipped.
+ */
+ncc_min_var: number, 
+/**
+ * Neighbours per view (closest centres with 3–60° between optical axes).
+ */
+mv_neighbours: number, };

@@ -49,4 +49,8 @@ bake_views: number,
  * Chart unwrapping (uvunwrap) up to this many triangles, the
  * per-triangle grid atlas above (chart unwrapping is superlinear).
  */
-chart_uv_max_triangles: number, };
+chart_uv_max_triangles: number, 
+/**
+ * Fuse the plane depth `Ds / (N . ray)` (PGSR) instead of the median depth.
+ */
+plane_depth: boolean, };

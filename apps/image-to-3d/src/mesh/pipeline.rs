@@ -100,6 +100,9 @@ pub struct MeshConfig {
     /// per-triangle grid atlas above (chart unwrapping is superlinear).
     #[serde(default = "d_chart_max")]
     pub chart_uv_max_triangles: u32,
+    /// Fuse the plane depth `Ds / (N . ray)` (PGSR) instead of the median depth.
+    #[serde(default = "yes")]
+    pub plane_depth: bool,
 }
 
 impl Default for MeshConfig {
@@ -117,6 +120,7 @@ impl Default for MeshConfig {
             atlas_size: d_atlas(),
             bake_views: d_bake_views(),
             chart_uv_max_triangles: d_chart_max(),
+            plane_depth: true,
         }
     }
 }
@@ -336,6 +340,7 @@ pub fn fuse_with(
     let gp = GeomParams {
         near_m: 1.0,
         v_cap: raster.frame.cap.visible,
+        plane_depth: cfg.plane_depth as u32,
         ..Default::default()
     };
     let started = Instant::now();
