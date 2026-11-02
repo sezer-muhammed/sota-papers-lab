@@ -43,6 +43,9 @@ fn d_atlas() -> u32 {
 fn d_bake_views() -> u32 {
     24
 }
+fn d_chart_max() -> u32 {
+    30_000
+}
 fn d_keep() -> u32 {
     50
 }
@@ -87,6 +90,10 @@ pub struct MeshConfig {
     /// Photos used for the bake, spread evenly over the views.
     #[serde(default = "d_bake_views")]
     pub bake_views: u32,
+    /// Chart unwrapping (uvunwrap) up to this many triangles, the
+    /// per-triangle grid atlas above (chart unwrapping is superlinear).
+    #[serde(default = "d_chart_max")]
+    pub chart_uv_max_triangles: u32,
 }
 
 impl Default for MeshConfig {
@@ -102,6 +109,7 @@ impl Default for MeshConfig {
             texture: true,
             atlas_size: d_atlas(),
             bake_views: d_bake_views(),
+            chart_uv_max_triangles: d_chart_max(),
         }
     }
 }
@@ -383,7 +391,11 @@ pub fn build(
         summary.simplify_ms = ms;
     }
     tri.compute_normals();
-    let (uv, ms) = super::uv::generate_atlas(&tri, cfg.atlas_size, 2)?;
+    let (uv, ms) = if tri.num_triangles() <= cfg.chart_uv_max_triangles as usize {
+        super::uv::generate_atlas(&tri, cfg.atlas_size, 2)?
+    } else {
+        super::fastuv::grid_atlas(&tri, cfg.atlas_size)?
+    };
     summary.uv_ms = ms;
     let atlas = if cfg.texture && !views.is_empty() {
         let k = (cfg.bake_views.max(1) as usize).min(views.len());
@@ -394,8 +406,7 @@ pub fn build(
             .collect::<Result<Vec<_>>>()?;
         let cams: Vec<BakeCamera> = picks.iter().map(|&i| bake_camera(&views[i])).collect();
         let data: Vec<&[u8]> = imgs.iter().map(|m| m.data.as_slice()).collect();
-        let strides: Vec<u32> = imgs.iter().map(|m| m.width * 3).collect();
-        let (a, ms) = super::bake::bake_texture_cpu(&uv, &cams, &data, &strides)?;
+        let (a, ms) = super::fastbake::bake(&uv, &cams, &data)?;
         summary.bake_ms = ms;
         a
     } else {
@@ -446,3 +457,7 @@ mod tests {
         assert_eq!(c, MeshConfig::default());
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline_gpu_tests.rs"]
+mod gpu_tests;

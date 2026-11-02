@@ -40,4 +40,9 @@ texture: boolean, atlas_size: number,
 /**
  * Photos used for the bake, spread evenly over the views.
  */
-bake_views: number, };
+bake_views: number, 
+/**
+ * Chart unwrapping (uvunwrap) up to this many triangles, the
+ * per-triangle grid atlas above (chart unwrapping is superlinear).
+ */
+chart_uv_max_triangles: number, };

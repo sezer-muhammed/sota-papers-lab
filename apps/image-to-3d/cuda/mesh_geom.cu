@@ -24,7 +24,7 @@
 #define GPIX_CH 5      // gNx, gNy, gNz, distortion weight, sum_k w_k g_k
 
 struct GeomParams {
-    float near_m;      // distortion depth mapping m = 1 - near_m / z
+    float near_m;      // distortion depth mapping m = 1 - near_m / max(z, near_m), in [0, 1)
     float lambda_dist; // both pixel losses are means over the frame
     float lambda_normal;
     float lambda_flat; // per Gaussian
@@ -158,7 +158,7 @@ extern "C" __global__ void __launch_bounds__(TILE_W* TILE_H)
 #endif
             const GeomAux g = S.g[j];
             const float zh = geom_hit_z(g, rx, ry);
-            const float m = 1.f - gp.near_m / fmaxf(zh, 1e-6f);
+            const float m = 1.f - gp.near_m / fmaxf(zh, gp.near_m);
             const float w = alpha * T;
             A += w;
             M1 = fmaf(w, m, M1);
@@ -315,7 +315,7 @@ extern "C" __global__ void __launch_bounds__(TILE_W* TILE_H)
                 const GeomAux g = S.g[j];
                 const float zh = geom_hit_z(g, rx, ry);
                 const float zc = fmaxf(zh, 1e-6f);
-                const float m = 1.f - gp.near_m / zc;
+                const float m = 1.f - gp.near_m / fmaxf(zc, gp.near_m);
                 const float w = alpha * T;
                 // d/dw_i of sum_{j,k} w_j w_k (m_j - m_k)^2 = 2 sum_k w_k (m_i - m_k)^2.
                 const float gw = 2.f * ld * (m * m * A - 2.f * m * M1 + M2) + gN0 * g.nx + gN1 * g.ny + gN2 * g.nz;
@@ -340,7 +340,7 @@ extern "C" __global__ void __launch_bounds__(TILE_W* TILE_H)
                     v_my = fmaf(a.w, qx, 2.f * b.x * qy);
                 }
                 // dm/dz through the centre depth only (the hit depth's plane terms are dropped).
-                v_z = ld * 4.f * w * (m * A - M1) * gp.near_m / (zc * zc);
+                v_z = zc > gp.near_m ? ld * 4.f * w * (m * A - M1) * gp.near_m / (zc * zc) : 0.f;
                 v_n0 = w * gN0;
                 v_n1 = w * gN1;
                 v_n2 = w * gN2;
