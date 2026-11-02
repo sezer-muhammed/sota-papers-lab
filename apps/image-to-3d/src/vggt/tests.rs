@@ -627,9 +627,27 @@ impl Parity {
     }
 }
 
+/// Dense outputs and cached layers within the spec's budget (§8); camera
+/// gates are reported here and asserted by
+/// `gpu_parity_camera_gates`.
 #[test]
 #[ignore]
 fn gpu_parity_with_oracle() {
+    let mut e = engine();
+    for set in ["t1", "t2", "g8", "t32"] {
+        if oracle_dir().join(set).is_dir() {
+            (Parity { set }).run(&mut e);
+        }
+    }
+}
+
+/// Spec §8 camera gates (rotation < 0.1°, translation direction < 0.1°,
+/// fov < 0.05°, or within 1.5× the official bf16-vs-fp32 distance). Open
+/// issue (heads): the camera head's bf16 GEMMs put fov at about 2× the
+/// official noise.
+#[test]
+#[ignore]
+fn gpu_parity_camera_gates() {
     let mut e = engine();
     let mut failed = Vec::new();
     for set in ["t1", "t2", "g8", "t32"] {
