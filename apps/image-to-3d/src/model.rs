@@ -356,9 +356,11 @@ impl Grads {
 
 /// Bytes per Gaussian of capacity (spec-train 13): parameters 236, Adam
 /// moments 472 (236 bf16), gradients 236, last_visible 4, densify stats 12,
-/// VCD scores 8, raster per-Gaussian buffers ~80, compaction slab 180.
+/// VCD scores 8, raster per-Gaussian buffers ~80, compaction slab 180, radix
+/// sort pairs 16 and the emission plan 10 (out_count, two flags, priority).
+/// MCMC adds 24 of its own scratch (`densify::McmcWork`), not counted here.
 pub const fn bytes_per_gaussian(bf16_moments: bool) -> u64 {
-    236 + if bf16_moments { 236 } else { 472 } + 236 + 4 + 12 + 8 + 80 + 180
+    236 + if bf16_moments { 236 } else { 472 } + 236 + 4 + 12 + 8 + 80 + 180 + 16 + 10
 }
 
 /// Capacity from free VRAM (spec-train 5.10):
@@ -442,13 +444,37 @@ impl<'a> PerGaussianArrays<'a> {
 
     /// Gradient buffers: survivors keep their partial sums, new entries start at 0.
     pub fn add_grads(&mut self, s: &CudaStream, g: &'a mut Grads) {
+        self.add_grad_groups(s, g, [true; 6]);
+    }
+
+    /// Only the gradient groups in `groups` (`Group::index` order). After the
+    /// optimizer step, a group that stepped (or is overwritten by the raster
+    /// every iteration) holds nothing a later iteration reads, so emission can
+    /// skip it; only accumulating groups between steps carry partial sums.
+    pub fn add_grad_groups(&mut self, s: &CudaStream, g: &'a mut Grads, groups: [bool; 6]) {
         let cap = g.cap;
-        self.push(s, &mut g.mean, 3, 1, 0, COL_ZERO);
-        self.push(s, &mut g.log_scale, 3, 1, 0, COL_ZERO);
-        self.push(s, &mut g.quat, 4, 1, 0, COL_ZERO);
-        self.push(s, &mut g.opacity, 1, 1, 0, COL_ZERO);
-        self.push(s, &mut g.sh_dc, 3, 1, 0, COL_ZERO);
-        self.push(s, &mut g.sh_rest, 1, 45, cap, COL_ZERO);
+        let Grads {
+            mean,
+            log_scale,
+            quat,
+            opacity,
+            sh_dc,
+            sh_rest,
+            ..
+        } = g;
+        let bufs: [(&'a mut CudaSlice<f32>, u32, u32, u32); 6] = [
+            (mean, 3, 1, 0),
+            (log_scale, 3, 1, 0),
+            (quat, 4, 1, 0),
+            (opacity, 1, 1, 0),
+            (sh_dc, 3, 1, 0),
+            (sh_rest, 1, 45, cap),
+        ];
+        for ((buf, words, rows, stride), on) in bufs.into_iter().zip(groups) {
+            if on {
+                self.push(s, buf, words, rows, stride, COL_ZERO);
+            }
+        }
     }
 
     /// Adam moments of every group, any precision (words per element are
@@ -565,6 +591,7 @@ pub struct CompactKernels {
     pub aabb_reduce: CudaFunction,
     pub morton_codes: CudaFunction,
     pub radix_hist: CudaFunction,
+    pub radix_scan_rows: CudaFunction,
     pub radix_scatter: CudaFunction,
 }
 
@@ -583,6 +610,7 @@ impl CompactKernels {
             aabb_reduce: k.get("aabb_reduce")?,
             morton_codes: k.get("morton_codes")?,
             radix_hist: k.get("radix_hist")?,
+            radix_scan_rows: k.get("radix_scan_rows")?,
             radix_scatter: k.get("radix_scatter")?,
         })
     }
@@ -615,6 +643,8 @@ pub struct Compactor {
     pub part: CudaSlice<u32>,
     /// survivors, clones, splits, scratch.
     pub totals: CudaSlice<u32>,
+    /// Digit totals of the radix passes, `[4][256]`.
+    pub digit_tot: CudaSlice<u32>,
     pub aabb: CudaSlice<u32>,
     pub cols: CudaSlice<Column>,
 }
@@ -633,6 +663,7 @@ impl Compactor {
             vals: [z(cap, "alloc sort values")?, z(cap, "alloc sort values")?],
             part: z(256 * tiles, "alloc tile partials")?,
             totals: z(4, "alloc emission totals")?,
+            digit_tot: z(4 * 256, "alloc digit totals")?,
             aabb: z(6, "alloc AABB")?,
             cols: s
                 .alloc_zeros::<Column>(MAX_COLUMNS)
@@ -814,15 +845,31 @@ impl Compactor {
         }
         let s = gpu.stream.clone();
         let tiles = blocks(n, TILE);
+        s.memset_zeros(&mut self.digit_tot)
+            .cuda("zero digit totals")?;
         for pass in 0..bits.div_ceil(8) {
             let shift = 8 * pass;
+            let at = 256 * pass as usize;
             {
+                let mut tot = self.digit_tot.slice_mut(at..at + 256);
                 let mut l = s.launch_builder(&self.kernels.radix_hist);
-                l.arg(&self.keys[0]).arg(&n).arg(&shift).arg(&mut self.part);
-                // SAFETY: radix_hist(keys, n, shift, hist[256][tiles]), one block of 256 per tile.
+                l.arg(&self.keys[0])
+                    .arg(&n)
+                    .arg(&shift)
+                    .arg(&mut self.part)
+                    .arg(&mut tot);
+                // SAFETY: radix_hist(keys, n, shift, hist[256][tiles], digit_tot[256]), one block of
+                // 256 per tile.
                 unsafe { l.launch(cfg((tiles, 1), 256)) }.cuda("radix_hist")?;
             }
-            self.scan_part(gpu, 0, 256 * tiles, 3)?;
+            {
+                let tot = self.digit_tot.slice(at..at + 256);
+                let mut l = s.launch_builder(&self.kernels.radix_scan_rows);
+                l.arg(&mut self.part).arg(&tiles).arg(&tot);
+                // SAFETY: radix_scan_rows(hist[256][tiles], tiles, digit_tot[256]), one block of 1024
+                // per digit.
+                unsafe { l.launch(cfg((256, 1), 1024)) }.cuda("radix_scan_rows")?;
+            }
             {
                 let [k0, k1] = &mut self.keys;
                 let [v0, v1] = &mut self.vals;
@@ -1004,8 +1051,8 @@ mod tests {
 
     #[test]
     fn capacity_follows_the_memory_table() {
-        assert_eq!(bytes_per_gaussian(false), 1228);
-        assert_eq!(bytes_per_gaussian(true), 992);
+        assert_eq!(bytes_per_gaussian(false), 1254);
+        assert_eq!(bytes_per_gaussian(true), 1018);
         assert_eq!(round_cap(1), 1024);
         assert_eq!(round_cap(2048), 2048);
         // 12 GB card, 0.8 GB images, 1.5 GB raster: about 7M Gaussians (spec-train 13).

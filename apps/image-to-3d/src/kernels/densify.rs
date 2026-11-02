@@ -81,6 +81,7 @@ pub const COMPACT_SOURCE: KernelSource = KernelSource {
         "aabb_reduce",
         "morton_codes",
         "radix_hist",
+        "radix_scan_rows",
         "radix_scatter",
     ],
 };
@@ -931,10 +932,12 @@ fn zero_stats(gpu: &Gpu, st: &mut DensifyStats) -> Result<()> {
 fn emit_all(cx: &mut DensifyCx<'_>, w: &mut Work, t: u32) -> Result<EmitResult> {
     let s = cx.gpu.stream.clone();
     let cap = cx.g.cap;
+    // Statistics are zeroed right after the step and gradients of groups that
+    // stepped at t are dead data: only accumulating groups' partial sums move.
+    let carry: [bool; 6] = std::array::from_fn(|k| !cx.adam.groups[k].plan.due(t));
     let mut extra = PerGaussianArrays::new();
-    extra.add_grads(&s, cx.grads);
+    extra.add_grad_groups(&s, cx.grads, carry);
     extra.add_moments(&s, &mut cx.adam.moments, cap);
-    extra.add_stats(&s, cx.stats);
     w.compactor
         .emit(cx.gpu, &mut w.plan, cx.g, &extra, cx.rng, t)
 }
@@ -1416,8 +1419,9 @@ impl Strategy for Mcmc {
         let s = cx.gpu.stream.clone();
         let cap = cx.g.cap;
         let n_before = cx.g.n;
+        let carry: [bool; 6] = std::array::from_fn(|k| !cx.adam.groups[k].plan.due(t));
         let mut extra = PerGaussianArrays::new();
-        extra.add_grads(&s, cx.grads);
+        extra.add_grad_groups(&s, cx.grads, carry);
         extra.add_moments(&s, &mut cx.adam.moments, cap);
         let (relocated, added) = mcmc_round(cx.gpu, mw, c, cx.g, &extra, cx.rng, t)?;
         Ok(DensifyOutcome {

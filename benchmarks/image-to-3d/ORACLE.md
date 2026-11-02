@@ -173,6 +173,29 @@ Out: `param_out`, `exp_avg_out`, `exp_avg_sq_out` from `torch.optim.Adam`
 kernel (Taming-3DGS): **no bias correction**, `p -= lr m / (sqrt(v) + eps)`,
 rows with `valid = false` untouched (moments too).
 
+### `relocation`: 3DGS-MCMC relocation (gsplat `compute_relocation`)
+
+| In | Shape, dtype | |
+|---|---|---|
+| `opacities`, `scales` | `[N]`, `[N,3]` f4 | activated |
+| `ratios` | `[N]` i4 | N_i = draws + 1, clamped to `[1, n_max]` |
+| `n_max` | `()` i4, default 51 | binomial table size (ours: 50) |
+| `min_opacity` | `()` f4, default 0.005 | clamp of the strategy |
+
+Out: `new_opacities`, `new_scales` (the kernel's float sums), and
+`new_opacities_clamped` (`clamp(o', min_opacity, 1 - 2^-23)`, what the MCMC
+strategy writes).
+
+### `multinomial`: sampling without replacement (`torch.multinomial`)
+
+| In | Shape, dtype | |
+|---|---|---|
+| `weights` | `[n]` f4 | unnormalized |
+| `k`, `trials`, `seed` | `()` i4 | k draws per trial, default 100000 trials |
+
+Out: `counts [n] i4`, how often each index was drawn over all trials (the
+inclusion frequencies FastGS's in-densify VCP relies on).
+
 ### `render`: the whole forward and backward (gsplat `rasterization`)
 
 | In | Shape, dtype | |
@@ -226,3 +249,27 @@ Read these as the tolerance a float32 kernel can meet: aim for errors against
 float64 no worse than gsplat's, not for bitwise equality with gsplat. Discrete
 outputs (radii, tile lists, intersection ids) should match exactly; a mismatch
 there almost always means a different rounding or bound formula.
+
+## Densification (E6) against the oracle and the CPU mirrors
+
+`apps/image-to-3d/src/kernels/densify/gpu_tests.rs` (run with
+`scripts/gpu-test.sh <checkout> densify::gpu_tests::gpu_ --skip gpu_bench`).
+The cases are staged under `/out/image-to-3d/oracle-densify`; run
+`gs-oracle batch ~/spl-work/out/image-to-3d/oracle-densify` (from a checkout
+with these ops: `gs-ref --entry <checkout>/benchmarks/image-to-3d/py/oracle.py batch ...`)
+and re-run the tests to include the gsplat comparison.
+
+| Test | Reference | Tolerance | Measured (RTX 4070 SUPER, 2026-11-02) |
+|---|---|---|---|
+| `densify_plan`, ADC / FastGS / final prune, 40k Gaussians, 5 rule sets | `plan_cpu` (decisions in logit / log space, IEEE division) | bit exact (flags, out_count, priority, candidate count) | 0 mismatches |
+| Emission, 5k and 30k Gaussians, every array (params, last_visible, 6 gradient groups, f32 moments, 3 stats) | host model `emission_cpu` + split rule | bit exact; split-child means 2e-5 rel (device Box-Muller uses fast-math) | exact; means 6.4e-7 |
+| Capacity capping (tail 1.7k into 1.6k free) | `cap_tail_host` | bit exact | 54 dropped, store exact |
+| Radix sort, 1M random 32-bit keys with duplicates, 300k 30-bit, 77 | stable CPU sort | exact keys and values | exact, stable |
+| Morton re-sort, 200k Gaussians, every array | CPU codes (IEEE division), gather model | exact | 0 codes differ, every array permuted |
+| Gumbel-top-k VCP, top-5 of 20, 2e5 trials | sequential sampling (1e6 trials); `multinomial` op (1e6 trials) | chi-square < 36.19 (df 19, p = 0.01) | 22.2; vs torch 15.8 |
+| MCMC relocation, o in {0.006 .. 0.97}, N = 1..50 | `relocation` op (gsplat) | 1e-4 rel | 1.9e-6 |
+| same | f64 closed form | 1e-5 rel for N <= 2, 1e-3 all N (the f32 alternating sum cancels; gsplat's too) | 6.9e-6 (N 2), 8.4e-5 (N 8), 2.9e-4 (N 32) |
+| MCMC round, 20k with 2,244 dead | dead list, copies, zeroed moments, (o', s') vs f64 | exact / 1e-3 | exact; 7.2e-6 |
+| MCMC noise, 2^20 draws | covariance (k Sigma)^2 | 1% of the largest variance | 0.30% |
+| `vcd_mask`, `scores_add` (+ overflow guard) | CPU | exact | exact |
+

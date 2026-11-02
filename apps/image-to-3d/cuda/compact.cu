@@ -9,7 +9,8 @@
 // reads of a batch happen before any of its writes, so the in-place move is safe for any
 // destination order (survivors dst <= src, tails anywhere in [n_surv, n_new)), which the
 // chunked dst <= src scheme of the first spec draft did not guarantee for the tail.
-// The slab holds cap x 45 words, so a batch is any set of columns with sum(words) <= 45.
+// The slab holds cap x 45 words, so a batch is any set of columns with sum(words) <= 45
+// (cap is a multiple of 1024, so the 4-word padding of each column always fits).
 
 #define CT_THREADS 256
 #define CT_ITEMS 8
@@ -153,16 +154,40 @@ extern "C" __global__ void emit_dst(const uint32_t* __restrict__ out_count, cons
 
 // ---------------------------------------------------------------- column moves through the slab
 
-// Batch layout in the slab: column q at word offset n * (sum of words of columns < q).
-// blockIdx.y = column; grid-stride over its n * words words (contiguous both sides).
+// Batch layout in the slab: column q starts at word n4 * (sum of words of columns < q),
+// n4 = n rounded up to 4, so every column is 16-byte aligned there; blockIdx.y = column.
+SPL_INLINE uint32_t slab_n4(uint32_t n) { return (n + 3u) & ~3u; }
+
+SPL_INLINE uint64_t slab_off(const Column* cols, uint32_t q, uint32_t n) {
+    uint32_t w = 0;
+    for (uint32_t k = 0; k < q; k++) w += cols[k].words;
+    return (uint64_t)w * slab_n4(n);
+}
+
+// dst[0..len) = src[0..len), 128-bit when both are 16-byte aligned (grid-stride).
+SPL_INLINE void copy_words(const uint32_t* __restrict__ src, uint32_t* __restrict__ dst, uint32_t len) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
+    uint32_t done = 0;
+    if ((((uint64_t)src | (uint64_t)dst) & 15u) == 0) {
+        uint32_t nv = len >> 2;
+        const uint4* s4 = (const uint4*)src;
+        uint4* d4 = (uint4*)dst;
+        for (uint32_t v = tid; v < nv; v += stride) d4[v] = s4[v];
+        done = nv << 2;
+    }
+    for (uint32_t j = done + tid; j < len; j += stride) dst[j] = src[j];
+}
+
+// Copies the n live entries of each column of the batch into the slab.
 extern "C" __global__ void slab_load(const Column* __restrict__ cols, uint32_t n, uint32_t* __restrict__ slab) {
     Column col = cols[blockIdx.y];
-    uint32_t off = 0;
-    for (uint32_t q = 0; q < blockIdx.y; q++) off += cols[q].words;
-    const uint32_t* src = (const uint32_t*)col.ptr;
-    uint32_t* out = slab + (uint64_t)off * n;
-    uint32_t len = n * col.words;
-    for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < len; j += gridDim.x * blockDim.x) out[j] = src[j];
+    copy_words((const uint32_t*)col.ptr, slab + slab_off(cols, blockIdx.y, n), n * col.words);
+}
+
+// Inverse of slab_load: column <- slab (after slab_gather).
+extern "C" __global__ void slab_store(const Column* __restrict__ cols, uint32_t n, const uint32_t* __restrict__ slab) {
+    Column col = cols[blockIdx.y];
+    copy_words(slab + slab_off(cols, blockIdx.y, n), (uint32_t*)col.ptr, n * col.words);
 }
 
 // Survivors to dst[i], clones / split children (both) to tail_dst[i] (+1): a copy or zero.
@@ -171,9 +196,7 @@ extern "C" __global__ void slab_scatter(const Column* __restrict__ cols, uint32_
                                         const uint32_t* __restrict__ tail_dst,
                                         const uint8_t* __restrict__ split_flag) {
     Column col = cols[blockIdx.y];
-    uint32_t off = 0;
-    for (uint32_t q = 0; q < blockIdx.y; q++) off += cols[q].words;
-    const uint32_t* src = slab + (uint64_t)off * n;
+    const uint32_t* src = slab + slab_off(cols, blockIdx.y, n);
     uint32_t* out = (uint32_t*)col.ptr;
     uint32_t w = col.words, len = n * w;
     for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < len; j += gridDim.x * blockDim.x) {
@@ -193,26 +216,13 @@ extern "C" __global__ void slab_scatter(const Column* __restrict__ cols, uint32_
 extern "C" __global__ void slab_gather(const Column* __restrict__ cols, uint32_t n, const uint32_t* __restrict__ perm,
                                        uint32_t* __restrict__ slab) {
     Column col = cols[blockIdx.y];
-    uint32_t off = 0;
-    for (uint32_t q = 0; q < blockIdx.y; q++) off += cols[q].words;
     const uint32_t* src = (const uint32_t*)col.ptr;
-    uint32_t* out = slab + (uint64_t)off * n;
+    uint32_t* out = slab + slab_off(cols, blockIdx.y, n);
     uint32_t w = col.words, len = n * w;
     for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < len; j += gridDim.x * blockDim.x) {
         uint32_t i = j / w, e = j - i * w;
         out[j] = src[(uint64_t)perm[i] * w + e];
     }
-}
-
-// Inverse of slab_load: column <- slab (after slab_gather).
-extern "C" __global__ void slab_store(const Column* __restrict__ cols, uint32_t n, const uint32_t* __restrict__ slab) {
-    Column col = cols[blockIdx.y];
-    uint32_t off = 0;
-    for (uint32_t q = 0; q < blockIdx.y; q++) off += cols[q].words;
-    const uint32_t* src = slab + (uint64_t)off * n;
-    uint32_t* out = (uint32_t*)col.ptr;
-    uint32_t len = n * col.words;
-    for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < len; j += gridDim.x * blockDim.x) out[j] = src[j];
 }
 
 // ---------------------------------------------------------------- split children
@@ -313,10 +323,12 @@ extern "C" __global__ void morton_codes(const float* __restrict__ mean, const ui
 // ---------------------------------------------------------------- stable LSD radix sort, 8-bit digits
 //
 // Three kernels per pass over tiles of CT_TILE keys: radix_hist (per-tile digit counts,
-// digit-major hist[d * tiles + tile]), scan_u32 over the whole table, radix_scatter (a
-// stable rank per warp with __match_any_sync, warps own consecutive 256-key segments).
+// digit-major hist[d * tiles + tile], and digit totals), radix_scan_rows (one block per
+// digit), radix_scatter (a stable rank per warp with __match_any_sync, warps own
+// consecutive 256-key segments).
 
-extern "C" __global__ void radix_hist(const uint32_t* __restrict__ keys, uint32_t n, uint32_t shift, uint32_t* __restrict__ hist) {
+extern "C" __global__ void radix_hist(const uint32_t* __restrict__ keys, uint32_t n, uint32_t shift,
+                                      uint32_t* __restrict__ hist, uint32_t* __restrict__ digit_tot) {
     __shared__ uint32_t h[256];
     h[threadIdx.x] = 0;
     __syncthreads();
@@ -327,7 +339,31 @@ extern "C" __global__ void radix_hist(const uint32_t* __restrict__ keys, uint32_
         if (i < n) atomicAdd(&h[(keys[i] >> shift) & 255u], 1u);
     }
     __syncthreads();
-    hist[threadIdx.x * gridDim.x + blockIdx.x] = h[threadIdx.x];
+    uint32_t c = h[threadIdx.x];
+    hist[threadIdx.x * gridDim.x + blockIdx.x] = c;
+    if (c) atomicAdd(&digit_tot[threadIdx.x], c);
+}
+
+// One block per digit d (1024 threads): hist[d][0..tiles) <- sum of all keys with a
+// smaller digit + exclusive prefix over the tiles. Replaces a single-block scan of the
+// whole 256 x tiles table (143 us at 1M keys, 60% of the sort).
+extern "C" __global__ void radix_scan_rows(uint32_t* __restrict__ hist, uint32_t tiles,
+                                           const uint32_t* __restrict__ digit_tot) {
+    __shared__ uint32_t sm[32];
+    uint32_t d = blockIdx.x;
+    uint32_t b = threadIdx.x < d ? digit_tot[threadIdx.x] : 0u;  // d < 256 <= blockDim
+    uint32_t tot;
+    block_exscan(b, sm, tot);
+    uint32_t carry = tot;
+    uint32_t* row = hist + (uint64_t)d * tiles;
+    for (uint32_t a = 0; a < tiles; a += blockDim.x) {
+        uint32_t i = a + threadIdx.x;
+        uint32_t x = i < tiles ? row[i] : 0u;
+        uint32_t chunk;
+        uint32_t ex = block_exscan(x, sm, chunk);
+        if (i < tiles) row[i] = carry + ex;
+        carry += chunk;
+    }
 }
 
 extern "C" __global__ void radix_scatter(const uint32_t* __restrict__ keys, const uint32_t* __restrict__ vals, uint32_t n, uint32_t shift,
