@@ -418,10 +418,18 @@ fn gpu_bench_scaling() {
         // Our own allocations (other processes on a shared card distort the
         // free-memory figure): weights, the workspace, and the trunk's and
         // heads' buffers as the planner counts them.
+        // `device_bytes` holds the larger of the trunk's and the heads'
+        // buffers; both are live at once unless the trunk releases its own.
         let trunk = trunk::Trunk::scratch_bytes(&super::trunk_geom(&p.geom));
+        let head =
+            heads::dense::DenseHead::scratch_bytes(&p.geom.with_frames(plan.dense_chunk.min(n)));
         let accounted = e.weights.device_bytes()
             + plan.device_bytes
-            + if plan.release_trunk { 0 } else { trunk };
+            + if plan.release_trunk {
+                0
+            } else {
+                trunk.min(head)
+            };
         let reps = if n <= 50 { 10 } else { 3 };
         let mut t = Vec::new();
         let mut min_free = usize::MAX;
