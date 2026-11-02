@@ -1,24 +1,31 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use spl_core::{
     ArtifactKind, ArtifactRef, ArtifactStore, CancellationToken, Context, DataDir, DynOp,
     EventSink, Registry, Resources, Result, RunCx, RunEvent, anyhow, bail,
 };
 use spl_data::LocalStore;
-use spl_db::{MetricRecord, NewRun, RunRecord, RunStatus, Store};
+use spl_db::{Announcement, MetricRecord, NewRun, RunRecord, RunStatus, Store};
 use spl_gpu::GpuReport;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::Config;
 use crate::api::RunProgress;
+use crate::queue::{Admission, Pending, RunQueue, WaitReason};
 use crate::recording::{RecordingStore, artifact_record};
 
 /// Log lines a live run keeps for `GET /v1/runs/{id}`.
 const LOG_LINES: usize = 50;
+/// Longest slot name an announcement may use (the schema's column width).
+const SLOT_MAX: usize = 200;
+/// Largest `info` an announcement keeps, serialized; it is polled often.
+const INFO_MAX_BYTES: usize = 16 * 1024;
+/// Staged files untouched this long belong to a process that died.
+const STALE_STAGING: Duration = Duration::from_secs(60 * 60);
 
 pub struct Host {
     registry: Registry,
@@ -30,9 +37,10 @@ pub struct Host {
     host_name: Option<String>,
     /// Runs this process has queued or is running, by run id.
     live: Mutex<HashMap<String, Arc<LiveEntry>>>,
-    /// One permit per op allowed to execute at once. Tokio's semaphore is
-    /// fair, so queued runs start in the order they were submitted.
-    slots: Arc<Semaphore>,
+    /// Run slots and the GPU lock; queued runs start in submission order.
+    queue: RunQueue,
+    /// Where uploads land before they move into the artifact store.
+    staging: PathBuf,
     /// Lets `&self` methods hand a run to a task that outlives the call.
     this: Weak<Host>,
 }
@@ -45,6 +53,27 @@ pub struct LiveRun {
     pub logs: Vec<String>,
     /// Reported so far; saved to the database when the run ends.
     pub metrics: Vec<MetricRecord>,
+    /// While queued: what the run waits for.
+    pub waiting_for: Option<WaitReason>,
+}
+
+/// A file in the host's staging directory, on the artifact store's
+/// filesystem, so storing it is a rename. Deleted on drop unless it was
+/// stored.
+pub struct StagedFile {
+    path: PathBuf,
+}
+
+impl StagedFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Default)]
@@ -58,6 +87,19 @@ struct LiveState {
     progress: Option<RunProgress>,
     logs: VecDeque<String>,
     metrics: Vec<MetricRecord>,
+    waiting_for: Option<WaitReason>,
+    /// The current announcement of each slot.
+    slots: HashMap<String, Announced>,
+    /// Snapshots a later announcement of their slot replaced, oldest first.
+    superseded: Vec<String>,
+    /// Artifacts ever announced to be kept (not as snapshots).
+    kept: HashSet<String>,
+}
+
+struct Announced {
+    revision: u32,
+    artifact_id: String,
+    snapshot: bool,
 }
 
 impl Host {
@@ -65,6 +107,10 @@ impl Host {
         std::fs::create_dir_all(&config.data_dir)?;
         let store = spl_db::connect(&config.database_url).await?;
         let artifacts: Arc<dyn ArtifactStore> = Arc::new(LocalStore::new(config.artifact_dir()));
+        let staging = config.staging_dir();
+        std::fs::create_dir_all(&staging)
+            .with_context(|| format!("create {}", staging.display()))?;
+        remove_stale_files(&staging);
 
         let gpu = Arc::new(spl_gpu::probe());
         let env = serde_json::json!({
@@ -85,7 +131,8 @@ impl Host {
             env,
             host_name: std::env::var("HOSTNAME").ok(),
             live: Mutex::default(),
-            slots: Arc::new(Semaphore::new(config.max_concurrent_runs.max(1))),
+            queue: RunQueue::new(config.max_concurrent_runs),
+            staging,
             this: this.clone(),
         }))
     }
@@ -115,8 +162,9 @@ impl Host {
         task.await.map_err(|e| anyhow!("run task died: {e}"))?
     }
 
-    /// Starts one op and returns at once with its record: `running` when a
-    /// slot was free, `queued` while `max_concurrent_runs` others execute.
+    /// Starts one op and returns at once with its record: `running` when it
+    /// could start, `queued` while it waits for a slot (`max_concurrent_runs`
+    /// others execute) or for the GPU (an exclusive op holds it).
     pub async fn start(&self, op_id: &str, input: serde_json::Value) -> Result<RunRecord> {
         let (record, _detached) = self.submit(op_id, input).await?;
         Ok(record)
@@ -145,6 +193,7 @@ impl Host {
             progress: state.progress.clone(),
             logs: state.logs.iter().cloned().collect(),
             metrics: state.metrics.clone(),
+            waiting_for: state.waiting_for,
         })
     }
 
@@ -170,13 +219,47 @@ impl Host {
         meta: Option<serde_json::Value>,
     ) -> Result<ArtifactRef> {
         let artifact = self.artifacts.put(bytes, kind, media_type).await?;
-        let record = artifact_record(&artifact, self.artifacts.uri(&artifact.id), meta);
-        self.store.put_artifact(&record).await?;
+        self.record_artifact(&artifact, meta).await?;
         Ok(artifact)
     }
 
-    /// Records a new run and hands it to a task of its own. The run takes a
-    /// free slot right away when there is one, so the returned record already
+    /// [`put_artifact`](Self::put_artifact) for a file, usually a
+    /// [`StagedFile`]: it moves into the store without being read into
+    /// memory, so uploads of phone videos cost no RAM.
+    pub async fn put_artifact_file(
+        &self,
+        path: &Path,
+        kind: ArtifactKind,
+        media_type: &str,
+        meta: Option<serde_json::Value>,
+    ) -> Result<ArtifactRef> {
+        let artifact = self.artifacts.put_file(path, kind, media_type).await?;
+        self.record_artifact(&artifact, meta).await?;
+        Ok(artifact)
+    }
+
+    /// A fresh, empty path to write an upload to before
+    /// [`put_artifact_file`](Self::put_artifact_file). The file is removed
+    /// when the guard drops, unless it was stored.
+    pub fn staging_file(&self) -> StagedFile {
+        StagedFile {
+            path: self
+                .staging
+                .join(format!("{}.part", uuid::Uuid::now_v7().simple())),
+        }
+    }
+
+    async fn record_artifact(
+        &self,
+        artifact: &ArtifactRef,
+        meta: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let record = artifact_record(artifact, self.artifacts.uri(&artifact.id), meta);
+        self.store.put_artifact(&record).await
+    }
+
+    /// Records a new run and hands it to a task of its own. The run is
+    /// admitted right away when it can be, so the returned record already
     /// says `running`.
     async fn submit(
         &self,
@@ -206,9 +289,10 @@ impl Host {
             host: host.clone(),
             run_id: run_id.clone(),
         };
-        let permit = self.slots.clone().try_acquire_owned().ok();
-        if permit.is_some() {
-            self.store.start_run(&run_id, now_ms()).await?;
+        let admission = self.queue.try_admit(op.gpu());
+        match &admission {
+            Ok(_) => self.store.start_run(&run_id, now_ms()).await?,
+            Err(pending) => lock(&entry.state).waiting_for = Some(pending.waiting_for()),
         }
         let record = self.record(&run_id).await?;
 
@@ -221,7 +305,7 @@ impl Host {
         };
         let task = tokio::spawn(async move {
             let run_id = run.run_id.clone();
-            let result = host.execute(run, permit, guard).await;
+            let result = host.execute(run, admission, guard).await;
             if let Err(e) = &result {
                 tracing::error!(run = %run_id, "could not record the run: {e:#}");
             }
@@ -233,7 +317,7 @@ impl Host {
     async fn execute(
         &self,
         run: Execution,
-        permit: Option<OwnedSemaphorePermit>,
+        admission: Result<Admission, Pending>,
         _guard: LiveGuard,
     ) -> Result<RunRecord> {
         let Execution {
@@ -243,37 +327,47 @@ impl Host {
             input,
             entry,
         } = run;
-        let permit = match permit {
-            Some(permit) => permit,
-            None => tokio::select! {
-                biased;
-                () = entry.cancel.cancelled() => {
-                    self.store
-                        .finish_run(&run_id, RunStatus::Cancelled, None, Some("cancelled while queued"), now_ms())
-                        .await?;
-                    tracing::info!(run = %run_id, op = %op_id, "run cancelled while queued");
-                    return self.record(&run_id).await;
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(pending) => {
+                let note = |reason: WaitReason| lock(&entry.state).waiting_for = Some(reason);
+                tokio::select! {
+                    biased;
+                    () = entry.cancel.cancelled() => {
+                        self.store
+                            .finish_run(&run_id, RunStatus::Cancelled, None, Some("cancelled while queued"), now_ms())
+                            .await?;
+                        tracing::info!(run = %run_id, op = %op_id, "run cancelled while queued");
+                        return self.record(&run_id).await;
+                    }
+                    admission = self.queue.admit(pending, note) => {
+                        let admission = admission?;
+                        lock(&entry.state).waiting_for = None;
+                        self.store.start_run(&run_id, now_ms()).await?;
+                        admission
+                    }
                 }
-                permit = self.slots.clone().acquire_owned() => {
-                    let permit = permit.context("run queue closed")?;
-                    self.store.start_run(&run_id, now_ms()).await?;
-                    permit
-                }
-            },
+            }
         };
-        tracing::info!(run = %run_id, op = %op_id, "run started");
+        tracing::info!(run = %run_id, op = %op_id, gpu = ?op.gpu(), "run started");
         let started = Instant::now();
 
         let (events, rx) = EventSink::channel();
-        let consumer = tokio::spawn(consume(rx, entry.clone(), run_id.clone(), op_id.clone()));
-        let artifacts: Arc<dyn ArtifactStore> = Arc::new(RecordingStore::new(
+        let consumer = tokio::spawn(consume(
+            rx,
+            entry.clone(),
+            self.store.clone(),
+            run_id.clone(),
+            op_id.clone(),
+        ));
+        let recording = Arc::new(RecordingStore::new(
             self.artifacts.clone(),
             self.store.clone(),
             run_id.clone(),
         ));
         let cx = RunCx::with_cancel(
             run_id.clone(),
-            artifacts,
+            recording.clone(),
             self.resources.clone(),
             events,
             entry.cancel.clone(),
@@ -281,7 +375,7 @@ impl Host {
         // A task of its own turns a panicking op into a failed run instead
         // of a run left `running` forever.
         let outcome = tokio::spawn(async move { op.run_json(&cx, input).await }).await;
-        drop(permit);
+        drop(admission);
         // The op task owned `cx`, the only event sender, so the channel is
         // closed and the consumer has seen every event.
         if let Err(e) = consumer.await {
@@ -304,6 +398,8 @@ impl Host {
         if let Err(e) = self.store.add_metrics(&metrics).await {
             tracing::error!(run = %run_id, "could not save metrics: {e:#}");
         }
+        self.prune_snapshots(&run_id, &entry, &recording.created(), output.as_ref())
+            .await;
         self.store
             .finish_run(&run_id, status, output.as_ref(), error.as_deref(), now_ms())
             .await?;
@@ -316,6 +412,63 @@ impl Host {
             "run finished"
         );
         self.record(&run_id).await
+    }
+
+    /// Deletes the snapshots a later announcement of their slot replaced:
+    /// only bytes this run created, that its output does not name, that no
+    /// slot shows now, and that nothing else references. A failure only
+    /// leaves a file behind.
+    async fn prune_snapshots(
+        &self,
+        run_id: &str,
+        entry: &LiveEntry,
+        created: &HashSet<String>,
+        output: Option<&serde_json::Value>,
+    ) {
+        let (superseded, mut keep): (Vec<String>, HashSet<String>) = {
+            let state = lock(&entry.state);
+            let current = state.slots.values().map(|a| a.artifact_id.clone());
+            (
+                state.superseded.clone(),
+                current.chain(state.kept.iter().cloned()).collect(),
+            )
+        };
+        if superseded.is_empty() {
+            return;
+        }
+        let output = output.map(|o| o.to_string()).unwrap_or_default();
+        let (mut count, mut bytes) = (0u32, 0i64);
+        for id in superseded {
+            // Inserting also skips an id superseded twice.
+            if !keep.insert(id.clone()) || !created.contains(&id) || output.contains(&id) {
+                continue;
+            }
+            let size = match self.store.get_artifact(&id).await {
+                Ok(record) => record.map_or(0, |r| r.size_bytes),
+                Err(_) => 0,
+            };
+            match self.store.forget_artifact(run_id, &id).await {
+                Ok(true) => match self.artifacts.delete(&id).await {
+                    Ok(()) => {
+                        count += 1;
+                        bytes += size;
+                    }
+                    Err(e) => {
+                        tracing::warn!(run = %run_id, "could not delete snapshot {id}: {e:#}")
+                    }
+                },
+                Ok(false) => {}
+                Err(e) => tracing::warn!(run = %run_id, "could not forget snapshot {id}: {e:#}"),
+            }
+        }
+        if count > 0 {
+            tracing::info!(
+                run = %run_id,
+                snapshots = count,
+                mib = bytes as f64 / (1024.0 * 1024.0),
+                "deleted superseded snapshots"
+            );
+        }
     }
 
     async fn record(&self, run_id: &str) -> Result<RunRecord> {
@@ -347,22 +500,32 @@ impl Drop for LiveGuard {
     }
 }
 
-/// Keeps a run's latest progress, recent logs and metrics while it runs.
+/// Keeps a run's latest progress, recent logs and metrics while it runs,
+/// and records its announcements as they come.
 async fn consume(
     mut events: UnboundedReceiver<RunEvent>,
     entry: Arc<LiveEntry>,
+    store: Arc<dyn Store>,
     run_id: String,
     op_id: String,
 ) {
     while let Some(event) = events.recv().await {
         match event {
-            RunEvent::Progress { fraction, message } => {
+            RunEvent::Progress {
+                fraction,
+                message,
+                data,
+            } => {
                 let fraction = if fraction.is_finite() {
                     fraction.clamp(0.0, 1.0)
                 } else {
                     0.0
                 };
-                lock(&entry.state).progress = Some(RunProgress { fraction, message });
+                lock(&entry.state).progress = Some(RunProgress {
+                    fraction,
+                    message,
+                    data,
+                });
             }
             RunEvent::Log { message } => {
                 tracing::info!(target: "spl::op", run = %run_id, op = %op_id, "{message}");
@@ -388,6 +551,74 @@ async fn consume(
                     unit: Some(unit).filter(|u| !u.is_empty()),
                 });
             }
+            RunEvent::Announce {
+                slot,
+                artifact,
+                snapshot,
+                info,
+            } => {
+                let slot = slot.trim().to_owned();
+                if slot.is_empty() || slot.len() > SLOT_MAX {
+                    tracing::warn!(run = %run_id, op = %op_id, "dropped an announcement with slot `{slot}`");
+                    continue;
+                }
+                let info = info.filter(|i| {
+                    let fits = i.to_string().len() <= INFO_MAX_BYTES;
+                    if !fits {
+                        tracing::warn!(run = %run_id, op = %op_id, "dropped the info of `{slot}`: over {INFO_MAX_BYTES} bytes");
+                    }
+                    fits
+                });
+                let revision = lock(&entry.state)
+                    .slots
+                    .get(&slot)
+                    .map_or(1, |a| a.revision.saturating_add(1));
+                let announcement = Announcement {
+                    slot: slot.clone(),
+                    artifact,
+                    revision,
+                    info,
+                    announced_at_ms: now_ms(),
+                };
+                if let Err(e) = store.announce(&run_id, &announcement).await {
+                    tracing::warn!(run = %run_id, op = %op_id, "could not announce `{slot}`: {e:#}");
+                    continue;
+                }
+                let current = Announced {
+                    revision,
+                    artifact_id: announcement.artifact.id,
+                    snapshot,
+                };
+                let mut state = lock(&entry.state);
+                if !snapshot {
+                    state.kept.insert(current.artifact_id.clone());
+                }
+                if let Some(previous) = state.slots.insert(slot, current)
+                    && previous.snapshot
+                {
+                    state.superseded.push(previous.artifact_id);
+                }
+            }
+        }
+    }
+}
+
+/// Removes files a crashed process left in the staging directory. A live
+/// upload writes to its file all the time, so it never looks stale.
+fn remove_stale_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_STAGING);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
