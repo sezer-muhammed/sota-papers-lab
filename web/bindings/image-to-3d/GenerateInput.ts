@@ -7,7 +7,7 @@ export type GenerateInput = {
  */
 images: Array<string>, 
 /**
- * Sidecar resolution: 1024 is the only tested value for 12 GB.
+ * Sidecar resolution: 1024 (the only cascade value Pixal3D supports).
  */
 resolution: number, 
 /**

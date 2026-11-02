@@ -29,13 +29,20 @@ fn default_max_tokens() -> u32 {
     49152
 }
 
+const GIB: u64 = 1 << 30;
+const SIDECAR_FULL_NEED: u64 = 10 * GIB;
+const SIDECAR_REDUCED_NEED: u64 = 8 * GIB;
+const SIDECAR_MIN_NEED: u64 = 6 * GIB;
+const REDUCED_TOKENS: u32 = 32768;
+const MIN_TOKENS: u32 = 24576;
+
 #[derive(Debug, Clone, Deserialize, JsonSchema, TS)]
 #[ts(export, export_to = "image-to-3d/")]
 pub struct GenerateInput {
     /// Artifact ids of 1-4 object photos (JPEG, PNG, WebP) with alpha masks
     /// or on a clean background.
     pub images: Vec<String>,
-    /// Sidecar resolution: 1024 is the only tested value for 12 GB.
+    /// Sidecar resolution: 1024 (the only cascade value Pixal3D supports).
     #[serde(default = "default_resolution")]
     pub resolution: u32,
     /// Max sparse tokens for the HR stages: lower = less VRAM.
@@ -77,7 +84,7 @@ impl Op for Generate {
         ensure!((1..=4).contains(&n), "need 1-4 photos, got {n}");
         ensure!(
             input.resolution == 1024,
-            "only resolution 1024 is supported (12 GB)"
+            "only resolution 1024 is supported (Pixal3D cascade)"
         );
 
         // Check sidecar image exists.
@@ -152,8 +159,9 @@ impl Op for Generate {
         cx.metric("pose_time", pose_s, "s");
         cx.log(format!("poses estimated in {pose_s:.1} s"));
 
-        // Unload VGGT engine to free GPU for the sidecar.
+        // Unload VGGT engine and release GPU memory for the sidecar.
         pose::unload_engine();
+        crate::vram::release_quietly();
 
         // 3. Canonicalise.
         cx.progress(0.35, "canonicalising poses");
@@ -161,16 +169,11 @@ impl Op for Generate {
         let model_wh = (cams.width, cams.height);
         let pixels = model_wh.0 * model_wh.1;
 
-        // Build masks (simple: all pixels with alpha > 128, or all true if no alpha).
         let masks: Vec<Vec<bool>> = photos
             .iter()
-            .map(|img| {
-                // For RGB images without alpha, mask everything as object.
-                vec![true; img.width as usize * img.height as usize]
-            })
+            .map(|img| vec![true; img.width as usize * img.height as usize])
             .collect();
 
-        // Build per-view depth and confidence from VGGT dense outputs.
         let mut depths = Vec::with_capacity(n);
         let mut confs = Vec::with_capacity(n);
         for vi in 0..n {
@@ -181,7 +184,6 @@ impl Op for Generate {
             confs.push(dense.conf[off..cend].to_vec());
         }
 
-        // RGBA PNGs for the sidecar.
         let rgba_pngs: Vec<Vec<u8>> = photos
             .iter()
             .zip(&masks)
@@ -210,38 +212,122 @@ impl Op for Generate {
             work_dir.path().display()
         ));
 
-        // 5. Run the sidecar.
-        cx.progress(0.4, "running Pixal3D-mv sidecar");
-        let output_dir = tempfile::tempdir()?;
+        // 5. Choose sidecar token budget based on available VRAM.
+        let free = crate::vram::free_now().unwrap_or(u64::MAX);
+        let sidecar_res = input.resolution;
+        let mut sidecar_tokens = input.max_tokens;
+
+        if free < SIDECAR_FULL_NEED {
+            if free >= SIDECAR_REDUCED_NEED {
+                sidecar_tokens = sidecar_tokens.min(REDUCED_TOKENS);
+                cx.log(format!(
+                    "low GPU memory ({:.1} GB free): reducing tokens to {REDUCED_TOKENS}",
+                    free as f64 / 1e9
+                ));
+            } else if free >= SIDECAR_MIN_NEED {
+                sidecar_tokens = sidecar_tokens.min(MIN_TOKENS);
+                cx.log(format!(
+                    "low GPU memory ({:.1} GB free): reducing tokens to {MIN_TOKENS}",
+                    free as f64 / 1e9
+                ));
+            } else {
+                cx.progress(0.38, "waiting for GPU memory");
+                let cancel = cx.cancel.clone();
+                let (tx_w, mut rx_w) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let wait_job = tokio::task::spawn_blocking(move || {
+                    crate::vram::wait_until(
+                        &crate::vram::WaitPolicy::from_env(),
+                        &cancel,
+                        crate::vram::free_now,
+                        |f| {
+                            if f >= SIDECAR_MIN_NEED {
+                                Ok(Ok(f))
+                            } else {
+                                Ok(Err(crate::vram::Shortfall {
+                                    what: "Pixal3D sidecar".into(),
+                                    need: SIDECAR_MIN_NEED,
+                                }))
+                            }
+                        },
+                        &mut |ws| {
+                            let _ = tx_w.send(ws.message());
+                        },
+                    )
+                });
+                let fwd = async {
+                    while let Some(msg) = rx_w.recv().await {
+                        cx.progress(0.38, &msg);
+                    }
+                };
+                let (res, ()) = tokio::join!(wait_job, fwd);
+                let (free_after, waited) = res??;
+                if waited > 0.0 {
+                    cx.log(format!("waited {waited:.0} s for GPU memory"));
+                }
+                sidecar_tokens = if free_after >= SIDECAR_FULL_NEED {
+                    input.max_tokens
+                } else if free_after >= SIDECAR_REDUCED_NEED {
+                    input.max_tokens.min(REDUCED_TOKENS)
+                } else {
+                    input.max_tokens.min(MIN_TOKENS)
+                };
+            }
+        }
+
+        // 6. Run the sidecar (retry at 512 on OOM).
+        cx.progress(0.4, format!("running Pixal3D-mv sidecar ({sidecar_res})"));
         let weights_dir = pixal3d_weights_dir(cx);
-        let resolution = input.resolution;
         let cancel_flag = cx.cancel.clone();
 
-        let (tx_sc, mut rx_sc) = tokio::sync::mpsc::unbounded_channel::<sidecar::SidecarProgress>();
+        let (sc_result, output_dir) = 'sidecar: {
+            for attempt in 0..2u32 {
+                let out = tempfile::tempdir()?;
+                let (tx_sc, mut rx_sc) =
+                    tokio::sync::mpsc::unbounded_channel::<sidecar::SidecarProgress>();
 
-        let wd = work_dir.path().to_owned();
-        let od = output_dir.path().to_owned();
-        let sidecar_job = tokio::task::spawn_blocking(move || {
-            sidecar::run_sidecar(&wd, &weights_dir, &od, resolution, &cancel_flag, |p| {
-                let _ = tx_sc.send(p);
-            })
-        });
+                let wd = work_dir.path().to_owned();
+                let wd2 = weights_dir.clone();
+                let od = out.path().to_owned();
+                let cancel = cancel_flag.clone();
+                let res = sidecar_res;
+                let tok = sidecar_tokens;
 
-        let sidecar_forward = async {
-            while let Some(p) = rx_sc.recv().await {
-                cx.progress(
-                    0.4 + 0.55 * p.fraction as f64,
-                    format!("pixal3d: {}", p.stage),
-                );
+                let sidecar_job = tokio::task::spawn_blocking(move || {
+                    sidecar::run_sidecar(&wd, &wd2, &od, res, tok, &cancel, |p| {
+                        let _ = tx_sc.send(p);
+                    })
+                });
+
+                let sidecar_fwd = async {
+                    while let Some(p) = rx_sc.recv().await {
+                        cx.progress(
+                            0.4 + 0.55 * p.fraction as f64,
+                            format!("pixal3d [{res}]: {}", p.stage),
+                        );
+                    }
+                };
+                let (sc_res, ()) = tokio::join!(sidecar_job, sidecar_fwd);
+                match sc_res? {
+                    Ok(r) => break 'sidecar (r, out),
+                    Err(e)
+                        if attempt == 0 && sidecar::is_oom(&e) && sidecar_tokens > MIN_TOKENS =>
+                    {
+                        sidecar_tokens = MIN_TOKENS;
+                        cx.log(format!("sidecar OOM: retrying with {MIN_TOKENS} tokens"));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
+            anyhow::bail!("sidecar failed after retries");
         };
-        let (sc_res, ()) = tokio::join!(sidecar_job, sidecar_forward);
-        let sc_result = sc_res??;
         let sidecar_s = sc_result.total_s;
+        crate::vram::release_quietly();
         cx.metric("sidecar_time", sidecar_s, "s");
         cx.metric("peak_vram", sc_result.peak_vram_mb as f64, "MiB");
+        cx.metric("sidecar_tokens", sidecar_tokens as f64, "tokens");
 
-        // 6. Read the GLB and store as an artifact.
+        // 7. Read the GLB and store as an artifact.
         cx.progress(0.95, "storing GLB");
         let glb_path = if std::path::Path::new(&sc_result.glb_path).is_file() {
             PathBuf::from(&sc_result.glb_path)

@@ -42,7 +42,8 @@ pub struct StageTime {
 /// - `work_dir`: host directory with `transforms.json` and RGBA PNGs.
 /// - `weights_dir`: host directory with the bf16 weights.
 /// - `output_dir`: host directory where the GLB is written.
-/// - `resolution`: 1024 (the only tested value for 12 GB).
+/// - `resolution`: 512 or 1024.
+/// - `max_tokens`: sparse-attention token budget (lower = less VRAM).
 /// - `cancel`: cancellation flag.
 /// - `on_progress`: callback for each progress line.
 pub fn run_sidecar(
@@ -50,6 +51,7 @@ pub fn run_sidecar(
     weights_dir: &Path,
     output_dir: &Path,
     resolution: u32,
+    max_tokens: u32,
     cancel: &CancellationToken,
     mut on_progress: impl FnMut(SidecarProgress),
 ) -> Result<SidecarResult> {
@@ -83,6 +85,8 @@ pub fn run_sidecar(
             "--resolution",
             &resolution.to_string(),
             "--low_vram",
+            "--max_tokens",
+            &max_tokens.to_string(),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -143,6 +147,14 @@ pub fn image_exists() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a sidecar failure looks like an OOM.
+pub fn is_oom(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("CUDA out of memory")
+        || msg.contains("OutOfMemoryError")
+        || msg.contains("torch.OutOfMemoryError")
+}
+
 /// Path where weights are expected on the host.
 pub fn default_weights_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -150,4 +162,39 @@ pub fn default_weights_dir() -> PathBuf {
         .join("spl-work")
         .join("models")
         .join("pixal3d")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_oom_detects_torch_messages() {
+        let e = anyhow::anyhow!(
+            "sidecar exited with 1:\nRuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB"
+        );
+        assert!(is_oom(&e));
+
+        let e = anyhow::anyhow!("torch.OutOfMemoryError: ...");
+        assert!(is_oom(&e));
+
+        let e = anyhow::anyhow!("OutOfMemoryError: ...");
+        assert!(is_oom(&e));
+    }
+
+    #[test]
+    fn is_oom_rejects_other_errors() {
+        let e = anyhow::anyhow!("FileNotFoundError: weights not found");
+        assert!(!is_oom(&e));
+
+        let e = anyhow::anyhow!("sidecar exited with 137 (killed)");
+        assert!(!is_oom(&e));
+    }
+
+    #[test]
+    fn default_weights_dir_under_spl_work() {
+        let d = default_weights_dir();
+        assert!(d.to_str().unwrap().contains("spl-work"));
+        assert!(d.to_str().unwrap().ends_with("pixal3d"));
+    }
 }
