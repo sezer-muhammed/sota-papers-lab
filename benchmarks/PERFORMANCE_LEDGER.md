@@ -55,6 +55,14 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-02 | DTU Chamfer, scans 24/37/40/55/63 | mean 1.23 mm; training 109–197 s plus 3–4 s meshing per scan | published, not run by us: 3DGS 2.18 mm (11.2 min), 2DGS 0.64 (10.9 min), GOF 0.64 (2 h), PGSR 0.48 (0.5 h) | better than 3DGS; behind 2DGS/GOF/PGSR in accuracy; do not claim SOTA mesh accuracy | superseded: this round used depth-validity masks instead of the standard IDR silhouettes, so it is not comparable to published numbers | mesh-mode, 5eeb283 |
 | 2026-11-02 | DTU Chamfer, scans 24/37/40/55/63, standard evaluation (IDR silhouette culling as in 2DGS) | mean 0.563 mm (0.474 / 0.787 / 0.350 / 0.395 / 0.809); training 96–256 s plus 2.4–3.0 s meshing per scan | published, not run by us: 2DGS 0.64 mm in 10.9 min; PGSR 0.48 mm in 30 min | more accurate than published 2DGS while training ~3–7x shorter; PGSR is still more accurate (0.48) | verified for ours; times for scans 37 and 55 preliminary (lock timed out) | mesh-mode-2, 9543d3f |
 
+### COLMAP-free end to end (photos or video in, splat out; native VGGT-Ω poses + our trainer)
+
+| Date | Input | Ours (end to end, files in to .spz on disk) | Reference | Note | Status | Source |
+|---|---|---|---|---|---|---|
+| 2026-11-02 | 62 s 1080p H.264 video (stand-in made from Mip-NeRF 360 frames) | .spz in 90 s; camera points on screen at 24 s; held-out keyframes 23.6 dB | — | first end-to-end video run | verified (GPU lock held) | mvp-pipeline, ee8f1bc |
+| 2026-11-02 | Mip-NeRF 360 garden, Quality / Fast | 26.09 dB in 295 s / 24.68 dB in 94 s | VGGT-X published 26.40 dB (not run here: VGGT-X and InstantSplat failed to run on this host); our trainer on COLMAP poses: 27.61 dB | below our targets (27.4 dB in 5 min; 26.5 dB in 90 s); not yet marketable as SOTA | verified | mvp-pipeline, ee8f1bc |
+| 2026-11-02 | Poses vs COLMAP (garden) | median relative rotation error 0.75° after refinement; focal 964.7 vs 961.4 px | COLMAP | — | verified | mvp-pipeline, ee8f1bc |
+
 Not a win (do not market): Morton re-sort from random order is slower than Faster-GS (8.94 vs 6.21 ms at 1M; 96.1 vs 49.4 ms at 6M).
 
 Not yet marketable: attention with 4×4 key merging runs in 33–38 ms (vs 1047 ms FlashAttention-2), but the approximation error is too high on some layers (up to 56% rel. L1) until the Phase 2 per-layer schedule search shows which layers can use it.
