@@ -16,6 +16,7 @@ services:
       SPL_AUTH_TOKEN: ${SPL_AUTH_TOKEN:-}
       SPL_DATASETS: /data/datasets
       SPL_MODELS_DIR: /models
+      SPL_VGGT_WEIGHTS: /models/vggt-omega/vggt_omega_1b_512.safetensors
     volumes:
       - ../data:/var/lib/spl
       - ${SPL_DATASETS_HOST:-../data/datasets}:/data/datasets:ro
