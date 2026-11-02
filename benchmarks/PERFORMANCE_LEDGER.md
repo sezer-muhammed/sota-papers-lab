@@ -39,6 +39,10 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-02 | bicycle (images_4) | 25.15 dB in 201 s | FastGS: 24.82 dB in 190 s. Faster-GS (fused): 25.27 dB in 619 s | +0.33 dB vs FastGS at similar time; 3.1x faster than Faster-GS at -0.12 dB | as above | integrate3d, 152a2dc |
 | 2026-11-02 | room (images_2) | 32.14 dB in 148 s | Brush: 32.42 dB in 722 s | 4.9x faster at -0.28 dB | as above | integrate3d, 152a2dc |
 | 2026-11-02 | garden, Fast preset | 26.40 dB in 50 s | — | — | quality verified | integrate3d, 152a2dc |
+| 2026-11-02 | kitchen (images_2) | 31.91 dB in 296 s | gsplat MCMC: 31.52 dB in 1126 s | +0.39 dB and 3.8x faster | quality verified; times preliminary (quiet re-run pending) | opt-train, 76404de |
+| 2026-11-02 | bonsai (images_2) | 32.78 dB in 380 s | gsplat MCMC: 32.58 dB in 1223 s | +0.20 dB and 3.2x faster | as above | opt-train, 76404de |
+| 2026-11-02 | flowers (images_4) | 21.07 dB in 201 s | FastGS: 21.35 dB in 182 s | -0.28 dB (FastGS wins here) | quality verified | opt-train, 76404de |
+| 2026-11-02 | Mip-NeRF 360, all 9 scenes, Quality preset | mean 27.59 dB, 144–380 s per scene | (no rival measured on all 9 yet) | — | quality verified | opt-train, 76404de |
 
 Not a win (do not market): Morton re-sort from random order is slower than Faster-GS (8.94 vs 6.21 ms at 1M; 96.1 vs 49.4 ms at 6M).
 
