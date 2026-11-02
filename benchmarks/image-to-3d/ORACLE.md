@@ -226,3 +226,67 @@ Read these as the tolerance a float32 kernel can meet: aim for errors against
 float64 no worse than gsplat's, not for bitwise equality with gsplat. Discrete
 outputs (radii, tile lists, intersection ids) should match exactly; a mismatch
 there almost always means a different rounding or bound formula.
+
+## Raster kernels (`raster_fwd`, `raster_bwd`) against the oracle
+
+Owner: raster (E3). Test: `kernels::raster::tests::gpu_raster_matches_gsplat_oracle`
+(apps/image-to-3d/src/kernels/raster/tests.rs). Three deterministic 2D scenes
+(`raster_small` 300 Gaussians 64x48 with a background, `raster_odd` 1,200 on
+67x53, `raster_dense` 20,000 on 160x120), opacities at most 0.98 so neither
+clamp binds (gsplat 1.5.3 clamps alpha at **0.999**, our `ALPHA_MAX` is 0.99;
+see below), radii opacity-aware + 1 px so gsplat's rectangle binning holds every
+contributing pixel, random dL/dC and dL/dalpha.
+
+Two passes on the GPU host:
+
+```sh
+apps/image-to-3d/scripts/gpu-test.sh <checkout> gsplat_oracle    # stages raster_*.rasterize.in.npz, fails
+gs-oracle batch ~/spl-work/out/image-to-3d/oracle                 # gsplat's outputs
+apps/image-to-3d/scripts/gpu-test.sh <checkout> gsplat_oracle    # compares, writes raster_*.rasterize.ours.npz
+for c in raster_small raster_odd raster_dense; do                 # grade ours against float64
+  gs-oracle check rasterize ~/spl-work/out/image-to-3d/oracle/$c.rasterize.{in,ours}.npz
+done
+```
+
+The test runs our kernels twice per case, on gsplat's own tile lists
+(`isect_offsets`, `flatten_ids`) and on our exact lists (spec-raster 2.8), and
+asserts: image max abs ≤ 2e-5 and mean abs ≤ 1e-6, T max abs ≤ 1e-6 against
+gsplat; gradients within spec-raster 6.4 (cosine ≥ 0.99999, rel-L2 ≤ 1e-4,
+element rel ≤ 1e-3) against our CPU f64 reference; gradients against gsplat
+within rel-L2 1e-3, because gsplat's backward recovers T back to front by
+division and its own error against float64 reaches 3e-4 on these cases.
+
+Measured (RTX 4070 SUPER, 2 Nov 2026), `gs-oracle check` against float64,
+max |x - fp64| / max |fp64| over the array:
+
+| Case | Output | gsplat 1.5.3 | ours (K = 4, 16x16) |
+|---|---|---|---|
+| raster_small | render_colors / alphas | 2.5e-7 / 1.9e-7 | 3.0e-7 / 2.1e-7 |
+| | v_means2d / v_conics | 4.6e-6 / 9.8e-7 | 6.2e-7 / 4.7e-7 |
+| | v_colors / v_opacities | 1.3e-6 / 9.1e-7 | 2.9e-7 / 2.7e-7 |
+| raster_odd | render_colors / alphas | 7.9e-7 / 3.0e-8 | 1.2e-6 / 3.0e-8 |
+| | v_means2d / v_conics | **1.4e-4 / 3.0e-4** (fails `check`) | 3.0e-6 / 9.8e-7 |
+| | v_colors / v_opacities | 1.7e-4 / 2.6e-4 (fails) | 7.5e-7 / 2.3e-6 |
+| raster_dense | render_colors / alphas | 1.1e-6 / 3.2e-8 | 9.9e-7 / 3.2e-8 |
+| | v_means2d / v_conics | 1.3e-4 / 1.5e-4 | 8.9e-7 / 1.2e-6 |
+| | v_colors / v_opacities | 9.7e-5 / 1.0e-4 | 2.7e-7 / 2.2e-6 |
+
+Ours against gsplat directly: images within 1.1e-6 max abs, T within 2.2e-7,
+gradients rel-L2 ≤ 1.9e-6 on `raster_small` and ≤ 3.3e-4 on the deep cases
+(gsplat's error, per the table). `v_backgrounds` in our file is summed on the
+host from our T; it is not a raster output.
+
+The other raster GPU tests compare with the CPU f64 reference of
+`kernels::raster::scene` (itself checked by finite differences with frozen
+decisions: 534 gradients agree to 2.5e-8), over every implemented variant
+(K = 1, 2, 4, 8; 16x16 and 16x12 tiles; Faster-GS blending; fp16 checkpoints;
+1 and 4 extra channels), alpha clamping, terminating pixels, empty scenes,
+1x1 and 17x33 images, a whole-image splat, and a tile listing 70,000
+Gaussians: images within 1.5e-6, gradients rel-L2 within 4.2e-6 (fp16
+checkpoints: 1.3e-3).
+
+Constant to settle: gsplat 1.5.3 clamps alpha at 0.999 (`min(0.999f, ...)`
+in `RasterizeToPixels3DGSFwd.cu`; 3DGS uses 0.99), while
+`splat_common.cuh` sets `ALPHA_MAX 0.99` and spec-raster 0 calls that
+"gsplat". The raster reads `ALPHA_MAX`, so parity with gsplat at the clamp is
+a one-line change there (preprocess, E1) plus `layout.rs`.
