@@ -222,7 +222,7 @@ impl Op for Train {
             let (fit, waited) = vram::wait_until(
                 &vram::WaitPolicy::from_env(),
                 &cancel,
-                || vram::device_memory().map(|m| m.0),
+                vram::free_now,
                 |f| {
                     Ok(vram::fit_trainer(
                         f,

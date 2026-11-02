@@ -490,8 +490,7 @@ fn pose_frames_in(
 ) -> Result<Engined> {
     let (p0, p1) = opts.span;
     let mut mem = Coexist::default();
-    let mut waiting = |w: &WaitState| events(Event::Waiting(p0, w.message(), w.data("posing")));
-    let free = || vram::device_memory().map(|m| m.0);
+    let free = vram::free_now;
     let t0 = Instant::now();
     if !matches!(slot, Some((p, _)) if p == weights) {
         *slot = None;
@@ -512,7 +511,7 @@ fn pose_frames_in(
                     })
                 })
             },
-            &mut waiting,
+            &mut |w: &WaitState| events(Event::Waiting(p0, w.message(), w.data("posing"))),
         )?;
         mem.waited_s += waited;
         let nn = Arc::new(spl_nn::Nn::open()?);
@@ -527,39 +526,67 @@ fn pose_frames_in(
     let n = frames.engine.len();
     ensure!(n > 0, "no frames");
 
-    // Frames per pass: the largest that fits now.
+    // Frames per pass: the largest that fits now. Other processes may take
+    // memory between the plan and the allocation: a pass that runs out of
+    // memory retries one step down (at the bottom, after waiting again).
     let geom = e.preprocess(&frames.engine[..1])?.geom;
     let ladder = vram::engine_chunk_ladder(n, opts.max_frames.max(2));
-    let (k, waited) = vram::wait_until(
-        &opts.wait,
-        cancel,
-        free,
-        |f| {
-            for &k in &ladder {
-                if e.plan(geom.with_frames(k)).is_ok() {
-                    return Ok(Ok(k));
+    let deadline = Instant::now() + opts.wait.timeout;
+    let mut lo = 0;
+    let (out, times, k) = loop {
+        let rungs = &ladder[lo..];
+        let policy = WaitPolicy {
+            timeout: deadline.saturating_duration_since(Instant::now()),
+            ..opts.wait
+        };
+        let (k, waited) = vram::wait_until(
+            &policy,
+            cancel,
+            free,
+            |f| {
+                for &k in rungs {
+                    if e.plan(geom.with_frames(k)).is_ok() {
+                        return Ok(Ok(k));
+                    }
                 }
+                let min = *rungs.last().expect("ladder");
+                let need = e
+                    .plan(geom.with_frames(min))
+                    .err()
+                    .and_then(|err| plan_need(&format!("{err}")))
+                    .unwrap_or(f + (1 << 30));
+                Ok(Err(Shortfall {
+                    what: format!(
+                        "the VGGT-Omega engine ({min} frames at {}x{})",
+                        geom.width, geom.height
+                    ),
+                    need,
+                }))
+            },
+            &mut |w: &WaitState| events(Event::Waiting(p0, w.message(), w.data("posing"))),
+        )?;
+        mem.waited_s += waited;
+        let anchors = if k == ladder[0] {
+            32
+        } else {
+            vram::chunk_anchors(k)
+        };
+        let plan = chunk_plan(n, k.max(2), anchors);
+        match run_chunks(e, frames, &plan, (p0, p1), cancel, events) {
+            Ok((out, times)) => break (out, times, k),
+            Err(err) if is_oom(&err) && Instant::now() < deadline => {
+                let i = ladder.iter().position(|&x| x == k).unwrap_or(0);
+                lo = (i + 1).min(ladder.len() - 1);
+                vram::release_quietly();
+                events(Event::Log(format!(
+                    "out of GPU memory at {k} frames per pass (another process took memory); retrying with {}",
+                    ladder[lo]
+                )));
             }
-            let min = *ladder.last().expect("ladder");
-            let need = e
-                .plan(geom.with_frames(min))
-                .err()
-                .and_then(|err| plan_need(&format!("{err}")))
-                .unwrap_or(f + (1 << 30));
-            Ok(Err(Shortfall {
-                what: format!(
-                    "the VGGT-Omega engine ({min} frames at {}x{})",
-                    geom.width, geom.height
-                ),
-                need,
-            }))
-        },
-        &mut waiting,
-    )?;
-    mem.waited_s += waited;
-    let anchors = if k == ladder[0] {
-        32
-    } else {
+            Err(err) => return Err(err),
+        }
+    };
+    if k != ladder[0] {
         let (free, _) = vram::device_memory()?;
         let note = format!(
             "low GPU memory ({:.2} GB free): engine {k} frames per pass instead of {} (chunked registration)",
@@ -568,9 +595,28 @@ fn pose_frames_in(
         );
         events(Event::Log(note.clone()));
         mem.notes.push(note);
-        vram::chunk_anchors(k)
-    };
-    let plan = chunk_plan(n, k.max(2), anchors);
+    }
+    let mut posed = out.ok_or_else(|| spl_core::anyhow!("no frames"))?;
+    posed.names = frames.names.clone();
+    Ok(Engined {
+        posed,
+        load_s,
+        engine_s: t1.elapsed().as_secs_f64(),
+        times,
+        mem,
+    })
+}
+
+/// The engine on every chunk of `plan`, merged.
+fn run_chunks(
+    e: &mut VggtEngine,
+    frames: &Frames,
+    plan: &[Vec<usize>],
+    (p0, p1): (f64, f64),
+    cancel: &CancellationToken,
+    events: &mut dyn FnMut(Event),
+) -> Result<(Option<Posed>, crate::vggt::StageTimes)> {
+    let n = frames.engine.len();
     let n_chunks = plan.len();
     let mut times = crate::vggt::StageTimes::default();
     let mut out: Option<Posed> = None;
@@ -604,15 +650,12 @@ fn pose_frames_in(
         let all = out.get_or_insert_with(|| Posed::empty(n, &part));
         all.merge_chunk(&part, chunk, &mut done)?;
     }
-    let mut posed = out.ok_or_else(|| spl_core::anyhow!("no frames"))?;
-    posed.names = frames.names.clone();
-    Ok(Engined {
-        posed,
-        load_s,
-        engine_s: t1.elapsed().as_secs_f64(),
-        times,
-        mem,
-    })
+    Ok((out, times))
+}
+
+/// A CUDA allocation failure anywhere in the chain.
+fn is_oom(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("OUT_OF_MEMORY")
 }
 
 /// "… need 7.30 GB of device memory …" (the engine planner's error) → bytes.
@@ -844,7 +887,7 @@ pub fn reconstruct_with(
         let (fit, waited) = vram::wait_until(
             &WaitPolicy::from_env(),
             cancel,
-            || vram::device_memory().map(|m| m.0),
+            vram::free_now,
             |f| {
                 Ok(vram::fit_trainer(
                     f,

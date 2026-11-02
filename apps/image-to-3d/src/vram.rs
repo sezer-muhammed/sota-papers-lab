@@ -100,7 +100,7 @@ pub struct WaitState {
 impl WaitState {
     pub fn message(&self) -> String {
         format!(
-            "waiting for GPU memory: {} needs {:.2} GB, {:.2} GB free (other processes hold the rest); {:.0} s of {:.0} min",
+            "waiting for GPU memory: {} needs {:.2} GB, {:.2} GB free (other processes hold the rest); {:.0} s of {:.1} min",
             self.what,
             self.need as f64 / GB,
             self.free as f64 / GB,
@@ -154,6 +154,39 @@ pub fn release_cached() -> Result<()> {
             .map_err(|e| anyhow!("cuMemPoolTrimTo: {e:?}"))?;
     }
     Ok(())
+}
+
+/// Bytes this process's default memory pool holds from the driver (live
+/// buffers plus freed blocks not yet trimmed): its own footprint, unlike
+/// [`device_memory`], which moves with every process on the card.
+pub fn pool_reserved() -> Result<u64> {
+    let ctx = spl_gpu::context(0)?;
+    ctx.bind_to_thread()
+        .map_err(|e| anyhow!("bind CUDA context: {e:?}"))?;
+    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+    let mut v: u64 = 0;
+    // SAFETY: the attribute is a u64 (cuMemPoolGetAttribute docs).
+    unsafe {
+        sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device())
+            .result()
+            .map_err(|e| anyhow!("cuDeviceGetDefaultMemPool: {e:?}"))?;
+        sys::cuMemPoolGetAttribute(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            (&mut v as *mut u64).cast(),
+        )
+        .result()
+        .map_err(|e| anyhow!("cuMemPoolGetAttribute: {e:?}"))?;
+    }
+    Ok(v)
+}
+
+/// Free bytes of the device after handing this process's freed pool
+/// blocks back (what a wait should poll: memory this process dropped
+/// counts as free).
+pub fn free_now() -> Result<u64> {
+    release_quietly();
+    Ok(device_memory()?.0)
 }
 
 /// [`release_cached`], logging instead of failing (end-of-run cleanup).
@@ -249,7 +282,8 @@ pub struct TrainerFit {
 /// Mirrors `Trainer::new`: instances it starts with.
 const INITIAL_INSTANCES: u32 = 1 << 24;
 /// Mirrors `Trainer::new`: its raster reserve is a frame of this many
-/// Gaussians (or the capacity ceiling when smaller).
+/// Gaussians plus 1 GiB of growth room (both scaled down to the capacity
+/// ceiling when smaller).
 const PROBE_GAUSSIANS: u32 = 4 << 20;
 /// Capacity that counts as unconstrained (Mip-NeRF 360 Quality ends at
 /// 1.25M Gaussians).
@@ -268,7 +302,8 @@ const TRAINER_LADDER: [(f64, u64); 4] = [
 fn trainer_capacity(free: u64, images: u64, w: u32, h: u32, probe: u32, preset: &Preset) -> u64 {
     let after = free.saturating_sub(images);
     let cap = Capacity::new(probe, INITIAL_INSTANCES, w, h, &preset.variant);
-    let reserve = FrameBuffers::vram_bytes(cap, &preset.variant).total() + (1 << 30);
+    let reserve = FrameBuffers::vram_bytes(cap, &preset.variant).total()
+        + (1u64 << 30) * probe as u64 / PROBE_GAUSSIANS as u64;
     let bf16 = preset.adam.moments != crate::kernels::adam::MomentPrecision::F32;
     let budget = (after - after / 10).saturating_sub(reserve + 512 * MIB);
     budget / bytes_per_gaussian(bf16) / 1024 * 1024
@@ -402,6 +437,9 @@ mod tests {
         for gb10 in (5..=80).rev().step_by(5) {
             let free = gb10 as u64 * G / 10;
             match fit_trainer(free, 0, 1600, 1066, 160, 8 << 20, &p) {
+                // The trainer's own choice (4M probe) may plan fewer Gaussians
+                // than the capped plans below it: compare capped plans only.
+                Ok(f) if f.max_gaussians.is_none() => fitted += 1,
                 Ok(f) => {
                     fitted += 1;
                     // Never better with less memory.

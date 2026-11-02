@@ -275,13 +275,15 @@ impl Trainer {
         // frame plus room for the instance buffers to grow (spec-train 5.10).
         let (free, _) = gpu.mem_info()?;
         let variant = preset.variant;
-        // A capacity ceiling below 4M shrinks the probe frame alike (the
-        // shared-GPU plans of `crate::vram`; unchanged when absent).
+        // A capacity ceiling below 4M shrinks the probe frame and the 1 GiB
+        // growth room alike (the shared-GPU plans of `crate::vram`;
+        // unchanged when absent).
         let probe_n = cfg
             .max_gaussians
             .map_or(4 << 20, |m| m.clamp(1 << 16, 4 << 20));
         let probe = Capacity::new(probe_n, INITIAL_INSTANCES, max_size.0, max_size.1, &variant);
-        let reserve = FrameBuffers::vram_bytes(probe, &variant).total() + (1 << 30);
+        let reserve = FrameBuffers::vram_bytes(probe, &variant).total()
+            + ((1u64 << 30) * probe_n as u64 / (4 << 20));
         let preset_cap = match &preset.densify {
             DensifyPreset::Mcmc(c) => c.cap_max as u64,
             _ => MAX_GAUSSIANS,
