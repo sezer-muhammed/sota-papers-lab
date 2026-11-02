@@ -18,13 +18,14 @@
 //! - loss (E4): `kernels/loss.rs`, `eval.rs`, `export/*`, `cuda/{loss,metrics}.cu`
 //! - optimizer (E5): `kernels/adam.rs`, `reference.rs`, `cuda/adam.{cuh,cu}`
 //! - densify (E6): `kernels/densify.rs`, `model.rs`, `cuda/{densify,compact,mcmc}.cu`
-//! - trainer (E7): `gpu.rs`, `frame.rs`, `rng.rs`, `presets.rs`,
+//! - trainer (E7): `gpu.rs`, `frame.rs`, `rng.rs`, `presets.rs`, `dash.rs`,
 //!   `trainer.rs`, `ops.rs`, `refine.rs`, `io/*`, `testkit/*`
 //! - ingest (A0): `ingest/*`, `cuda/ingest.cu`
 //! - reconstruct (mvp-pipeline): `reconstruct/*`, `cuda/reconstruct.cu`
 //! - shared-GPU memory plans (gpu-coexist): `vram.rs`
 
 pub mod bench;
+pub mod dash;
 pub mod eval;
 pub mod export;
 pub mod frame;

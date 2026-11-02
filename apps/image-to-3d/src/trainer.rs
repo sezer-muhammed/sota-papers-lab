@@ -248,9 +248,10 @@ pub struct Trainer {
 
 impl Trainer {
     pub fn new(gpu: &Gpu, scene: Scene, cfg: TrainConfig) -> Result<Self> {
-        let preset = cfg.resolve();
+        let mut preset = cfg.resolve();
         let total = preset.iterations;
-        let schedule = Schedule::from_preset(&preset, total);
+        let mut schedule = Schedule::from_preset(&preset, total);
+        crate::dash::install(&mut preset, &mut schedule, &scene)?;
         let kind = match preset.densify {
             DensifyPreset::Mcmc(_) => InitKind::Mcmc,
             _ => InitKind::Standard,

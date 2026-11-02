@@ -3,14 +3,14 @@
 //!
 //! A [`Preset`] holds every setting of a run at T = 30k; [`Preset::scaled`]
 //! applies the T ≠ 30k rule; [`Schedule`] answers per-iteration questions.
-//! Implemented (pure CPU, tested); `DashSchedule::from_spectra` is a stub.
+//! Implemented (pure CPU, tested); spectra come from [`crate::dash`].
 
+use anyhow::ensure;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use spl_core::Result;
 use ts_rs::TS;
 
-use crate::gpu::not_implemented;
 use crate::kernels::RasterVariant;
 use crate::kernels::adam::{
     AdamConfig, GroupConfig, LrSchedule, MomentPrecision, Sparsity, StepPlan,
@@ -33,9 +33,11 @@ pub enum PresetName {
     FastgsBig,
     /// 3DGS-MCMC: quality ceiling and dense-init fallback.
     Mcmc,
-    /// Ours: FastGS-Big with generic thresholds; target ≥ 27.9 dB in ≤ 6 min.
+    /// Ours: FastGS-Big with generic thresholds.
     #[default]
     Quality,
+    /// Ours: Quality with a denser densification budget (target ≥ 27.9 dB in ≤ 6 min).
+    Big,
     /// Ours: COLMAP-free fast target, fewer iterations, resolution warm-up.
     Fast,
 }
@@ -82,6 +84,22 @@ pub struct PresetOverrides {
     #[serde(default)]
     #[ts(optional)]
     pub chain_k: Option<u8>,
+    /// Opacity-compensated 2D filter (Mip-Splatting).
+    #[serde(default)]
+    #[ts(optional)]
+    pub antialiased: Option<bool>,
+    /// SH degree +1 every this many iterations (at the preset's own length).
+    #[serde(default)]
+    #[ts(optional)]
+    pub sh_interval: Option<u32>,
+    /// Last densification iteration (FastGS / ADC / MCMC).
+    #[serde(default)]
+    #[ts(optional)]
+    pub densify_end: Option<u32>,
+    /// Opacity reset period (FastGS / ADC).
+    #[serde(default)]
+    #[ts(optional)]
+    pub reset_every: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -200,6 +218,8 @@ impl Preset {
                 ..base
             },
             // Generic thresholds: FastGS-Big medians as the starting point (6.2).
+            // The DashGaussian warm-up and SH every 500 cost 0.2-0.9 dB here on the
+            // 13-scene suite (opt-train-2), so Quality keeps round-1 settings.
             PresetName::Quality => Self {
                 densify: DensifyPreset::FastGs(FastGsConfig {
                     grad_abs_thresh: 4e-4,
@@ -213,6 +233,18 @@ impl Preset {
                 compact_box_beta: 0.5,
                 ..base
             },
+            // Quality with FastGS-Big's garden budget (grad 3e-4, τ 0.06) and SH every
+            // 500: garden 27.755 dB vs 27.688 at 1000 (opt-train-2). No warm-up.
+            PresetName::Big => {
+                let mut p = Self::new(PresetName::Quality);
+                p.name = name;
+                if let DensifyPreset::FastGs(c) = &mut p.densify {
+                    c.grad_abs_thresh = 3e-4;
+                    c.loss_thresh = 0.06;
+                }
+                p.sh_interval = 500;
+                p
+            }
             // T ablated over {10k, 15k, 20k}; 15k until measured.
             PresetName::Fast => Self {
                 densify: DensifyPreset::FastGs(FastGsConfig::default()),
@@ -283,6 +315,15 @@ impl Preset {
         p
     }
 
+    /// Last densification iteration (DashGaussian's full-resolution point).
+    pub fn densify_end(&self) -> u32 {
+        match &self.densify {
+            DensifyPreset::Adc(c) => c.end,
+            DensifyPreset::FastGs(c) => c.end,
+            DensifyPreset::Mcmc(c) => c.end,
+        }
+    }
+
     /// Applies `o` (and the FastGS per-scene table when `o.scene` names a
     /// known scene and the preset is FastGS parity).
     pub fn with_overrides(mut self, o: &PresetOverrides) -> Self {
@@ -330,6 +371,23 @@ impl Preset {
         }
         if let Some(v) = o.warmup {
             self.warmup = v;
+        }
+        if let Some(v) = o.antialiased {
+            self.antialiased = v;
+        }
+        if let Some(v) = o.sh_interval {
+            self.sh_interval = v.max(1);
+        }
+        match &mut self.densify {
+            DensifyPreset::Adc(c) => {
+                c.end = o.densify_end.unwrap_or(c.end);
+                c.reset_every = o.reset_every.unwrap_or(c.reset_every);
+            }
+            DensifyPreset::FastGs(c) => {
+                c.end = o.densify_end.unwrap_or(c.end);
+                c.reset_every = o.reset_every.unwrap_or(c.reset_every);
+            }
+            DensifyPreset::Mcmc(c) => c.end = o.densify_end.unwrap_or(c.end),
         }
         if let Some(v) = o.tile_h {
             self.variant.tile_h = v;
@@ -507,12 +565,65 @@ pub struct DashSchedule {
 }
 
 impl DashSchedule {
-    /// Steps 1-3 of 6.5 (energy-matched levels from the spectra). STUB (E7).
-    pub fn from_spectra(_spectra: &[MagnitudeSpectrum], _t_res: u32) -> Result<Self> {
-        Err(not_implemented(
-            "DashSchedule::from_spectra",
-            "trainer (E7)",
-        ))
+    /// Steps 2-3 of 6.5: energy-matched levels from the spectra (step 1 is
+    /// [`crate::dash::magnitude_spectrum`]). Spectra of different sizes are fine
+    /// for `s_max`; the mean spectrum uses those of the first one's size.
+    pub fn from_spectra(spectra: &[MagnitudeSpectrum], t_res: u32) -> Result<Self> {
+        const LEVELS: usize = 32;
+        ensure!(
+            !spectra.is_empty(),
+            "DashGaussian needs at least one spectrum"
+        );
+        let tables: Vec<EnergyTable> = spectra.iter().map(EnergyTable::new).collect();
+        let s_max = tables
+            .iter()
+            .map(|e| e.solve(e.total() / 4.0))
+            .fold(8.0f64, f64::min)
+            .max(1.0);
+        let (w0, h0) = (spectra[0].width, spectra[0].height);
+        let same: Vec<&MagnitudeSpectrum> = spectra
+            .iter()
+            .filter(|s| s.width == w0 && s.height == h0)
+            .collect();
+        let mut mean = vec![0f32; same[0].data.len()];
+        for s in &same {
+            for (m, v) in mean.iter_mut().zip(&s.data) {
+                *m += v / same.len() as f32;
+            }
+        }
+        let e = EnergyTable::new(&MagnitudeSpectrum {
+            width: w0,
+            height: h0,
+            data: mean,
+        });
+        let (e_min, e_total) = (e.energy(s_max), e.total());
+        let ratio = (e_total / e_min).ln();
+        let energy = |i: usize| e_min + (e_total - e_min) * i as f64 / (LEVELS - 1) as f64;
+        let levels = (0..LEVELS)
+            .map(|i| {
+                let s = match i {
+                    0 => s_max,
+                    i if i == LEVELS - 1 => 1.0,
+                    _ => e.solve(energy(i)).min(s_max),
+                };
+                let b = if i == 0 || ratio <= 0.0 {
+                    0
+                } else {
+                    (t_res as f64 * (energy(i - 1) / e_min).ln() / ratio).floor() as u32
+                };
+                (b.min(t_res), s as f32)
+            })
+            .collect();
+        Ok(Self { levels, t_res })
+    }
+
+    /// Step 6: the first iteration of the first level below scale 2 (the
+    /// means LR is held at its initial value until then).
+    pub fn hold_until(&self) -> u32 {
+        self.levels
+            .iter()
+            .find(|l| l.1 < 2.0)
+            .map_or(self.t_res, |l| l.0)
     }
 
     /// Step 4: within [b_i, b_{i+1}) interpolate in pixel count from s_{i−1}
@@ -533,6 +644,56 @@ impl DashSchedule {
             1.0 / inv2.sqrt()
         };
         (s.floor() as u32).max(1)
+    }
+}
+
+/// Window energies `E(F, s)` of one spectrum via a summed-area table.
+struct EnergyTable {
+    w: usize,
+    h: usize,
+    sat: Vec<f64>,
+}
+
+impl EnergyTable {
+    fn new(f: &MagnitudeSpectrum) -> Self {
+        let (w, h) = (f.width as usize, f.height as usize);
+        let mut sat = vec![0f64; (w + 1) * (h + 1)];
+        for y in 0..h {
+            let mut row = 0f64;
+            for x in 0..w {
+                row += f.data[y * w + x] as f64;
+                sat[(y + 1) * (w + 1) + x + 1] = sat[y * (w + 1) + x + 1] + row;
+            }
+        }
+        Self { w, h, sat }
+    }
+
+    fn total(&self) -> f64 {
+        self.sat[self.sat.len() - 1]
+    }
+
+    /// Sum over the centred window of size (⌊H/s⌋, ⌊W/s⌋) (at least 1×1).
+    fn energy(&self, s: f64) -> f64 {
+        let ww = ((self.w as f64 / s).floor() as usize).clamp(1, self.w);
+        let wh = ((self.h as f64 / s).floor() as usize).clamp(1, self.h);
+        let (x0, y0) = ((self.w - ww) / 2, (self.h - wh) / 2);
+        let (x1, y1) = (x0 + ww, y0 + wh);
+        let at = |x: usize, y: usize| self.sat[y * (self.w + 1) + x];
+        at(x1, y1) - at(x0, y1) - at(x1, y0) + at(x0, y0)
+    }
+
+    /// The s ≥ 1 with `E(s) = target` (64-step bisection on 1/s).
+    fn solve(&self, target: f64) -> f64 {
+        let (mut lo, mut hi) = (0.0f64, 1.0f64);
+        for _ in 0..64 {
+            let mid = 0.5 * (lo + hi);
+            if mid <= 0.0 || self.energy(1.0 / mid) < target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        1.0 / hi.max(1e-9)
     }
 }
 
@@ -627,6 +788,15 @@ mod tests {
             panic!()
         };
         assert_eq!(c.grad_abs_thresh, 4e-4);
+        let b = Preset::new(PresetName::Big);
+        let DensifyPreset::FastGs(c) = &b.densify else {
+            panic!()
+        };
+        assert_eq!(
+            (b.name, c.grad_abs_thresh, c.loss_thresh),
+            (PresetName::Big, 3e-4, 0.06)
+        );
+        assert!(!b.warmup && b.sh_interval == 500);
     }
 
     #[test]
@@ -657,5 +827,37 @@ mod tests {
         assert_eq!(d.scale_at(150), 2);
         assert_eq!(d.scale_at(299), 1);
         assert_eq!(d.scale_at(300), 1);
+    }
+
+    /// A spectrum whose energy is uniform over the plane: E(s) = total / s².
+    fn flat(w: u32, h: u32) -> MagnitudeSpectrum {
+        MagnitudeSpectrum {
+            width: w,
+            height: h,
+            data: vec![1.0; (w * h) as usize],
+        }
+    }
+
+    #[test]
+    fn dash_levels_match_energy() {
+        let d = DashSchedule::from_spectra(&[flat(256, 256)], 15_000).unwrap();
+        assert_eq!(d.levels.len(), 32);
+        // A quarter of the energy is the half-size window: s_max = 2.
+        assert!((d.levels[0].1 - 2.0).abs() < 0.02, "{:?}", d.levels[0]);
+        assert_eq!(d.levels[31].1, 1.0);
+        assert!(
+            d.levels
+                .windows(2)
+                .all(|w| w[0].0 <= w[1].0 && w[0].1 >= w[1].1)
+        );
+        assert_eq!(d.scale_at(0), 2);
+        assert_eq!(d.scale_at(15_000), 1);
+        assert!(d.hold_until() < 15_000);
+        // Energy concentrated at the centre: s_max clamps at 8.
+        let mut f = flat(256, 256);
+        f.data.iter_mut().for_each(|v| *v = 1e-6);
+        f.data[128 * 256 + 128] = 1.0;
+        let d = DashSchedule::from_spectra(&[f], 15_000).unwrap();
+        assert_eq!(d.levels[0].1, 8.0);
     }
 }

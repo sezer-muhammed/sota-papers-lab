@@ -13,4 +13,20 @@ scene?: string, grad_abs_thresh?: number, dense?: number, loss_thresh?: number,
 /**
  * SH-rest LR = highfeature_lr / 20.
  */
-highfeature_lr?: number, compact_box_beta?: number, sparsity?: Sparsity, moments?: MomentPrecision, warmup?: boolean, mcmc_cap_max?: number, tile_h?: number, chain_k?: number, };
+highfeature_lr?: number, compact_box_beta?: number, sparsity?: Sparsity, moments?: MomentPrecision, warmup?: boolean, mcmc_cap_max?: number, tile_h?: number, chain_k?: number, 
+/**
+ * Opacity-compensated 2D filter (Mip-Splatting).
+ */
+antialiased?: boolean, 
+/**
+ * SH degree +1 every this many iterations (at the preset's own length).
+ */
+sh_interval?: number, 
+/**
+ * Last densification iteration (FastGS / ADC / MCMC).
+ */
+densify_end?: number, 
+/**
+ * Opacity reset period (FastGS / ADC).
+ */
+reset_every?: number, };
