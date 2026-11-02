@@ -228,16 +228,7 @@ impl Weights {
             .stream
             .alloc_zeros::<u8>(total.max(ALIGN))
             .map_err(|e| anyhow!("allocate {total} bytes of weights: {e:?}"))?;
-        for (f, (base, data_start, len)) in files.iter().zip(regions) {
-            if len == 0 {
-                continue;
-            }
-            let src = &f.map[data_start..data_start + len];
-            let mut dst = arena.slice_mut(base..base + len);
-            nn.stream
-                .memcpy_htod(src, &mut dst)
-                .map_err(|e| anyhow!("upload {}: {e:?}", f.path.display()))?;
-        }
+        upload_regions(nn, &files, &regions, &mut arena)?;
         nn.sync()?;
         Ok(Self {
             arena,
@@ -349,6 +340,67 @@ impl Weights {
             Dtype::U8 => bail!("weight {name} is U8, not a float tensor"),
         })
     }
+}
+
+/// Bytes per pinned staging buffer (two of them alternate).
+const STAGE_BYTES: usize = 64 << 20;
+
+/// Copies each file's device region into the arena: the mapping is read
+/// into two pinned buffers in turn (with every core, so page faults of a
+/// cold file overlap), each sent with an asynchronous copy while the other
+/// fills.
+fn upload_regions(
+    nn: &Nn,
+    files: &[Mapped],
+    regions: &[(usize, usize, usize)],
+    arena: &mut CudaSlice<u8>,
+) -> Result<()> {
+    use rayon::prelude::*;
+    let total: usize = regions.iter().map(|r| r.2).sum();
+    if total == 0 {
+        return Ok(());
+    }
+    let n = STAGE_BYTES.min(total);
+    let mut stages = Vec::new();
+    for _ in 0..2 {
+        // SAFETY: the buffers are written on the host before every copy
+        // that reads them, and each refill waits for its previous copy.
+        let buf = unsafe { nn.ctx.alloc_pinned::<u8>(n) }
+            .map_err(|e| anyhow!("allocate pinned staging: {e:?}"))?;
+        let done = nn
+            .ctx
+            .new_event(None)
+            .map_err(|e| anyhow!("create event: {e:?}"))?;
+        stages.push((buf, done, false));
+    }
+    let mut turn = 0usize;
+    for (f, &(base, data_start, len)) in files.iter().zip(regions) {
+        let src = &f.map[data_start..data_start + len];
+        for off in (0..len).step_by(n) {
+            let piece = &src[off..(off + n).min(len)];
+            let (buf, done, used) = &mut stages[turn % 2];
+            if *used {
+                done.synchronize()
+                    .map_err(|e| anyhow!("wait for staging: {e:?}"))?;
+            }
+            let host = buf
+                .as_mut_slice()
+                .map_err(|e| anyhow!("pinned staging: {e:?}"))?;
+            host[..piece.len()]
+                .par_chunks_mut(1 << 20)
+                .zip(piece.par_chunks(1 << 20))
+                .for_each(|(d, s)| d.copy_from_slice(s));
+            let mut dst = arena.slice_mut(base + off..base + off + piece.len());
+            nn.stream
+                .memcpy_htod(&host[..piece.len()], &mut dst)
+                .map_err(|e| anyhow!("upload {}: {e:?}", f.path.display()))?;
+            done.record(&nn.stream)
+                .map_err(|e| anyhow!("record event: {e:?}"))?;
+            *used = true;
+            turn += 1;
+        }
+    }
+    Ok(())
 }
 
 /// The FP8 companion of a weight file: `x.safetensors` → `x_fp8.safetensors`.
