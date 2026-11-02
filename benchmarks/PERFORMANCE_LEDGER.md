@@ -27,6 +27,7 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | 2026-11-01 | Fused multi-group Adam, 6M Gaussians (59 floats each) | 24.1 ms (all), 13.6 ms (50% visible) | PyTorch fused Adam: 48.8 ms; gsplat selective Adam: 19.0 ms | 2.0x vs PyTorch; 1.4x vs gsplat selective | matches torch.optim.Adam to 6e-8 per step; <= 2 ulp vs float64 over 100 steps | preliminary (GPU shared); at 1M Gaussians parity with gsplat (2.08 vs 1.96 ms) | k-loss-opt, bb569c9 |
 | 2026-11-01 | Densification step (clone/split/prune, adaptive density control) at 1M / 3M / 6M Gaussians | 6.87 / 25.4 / 52.8 ms | gsplat: 17.6 / 60.2 / 170 ms. Faster-GS: 11.4 / 34.6 / 106 ms | 2.4–3.2x vs gsplat; 1.4–2.0x vs Faster-GS | densify plan bit-exact vs CPU reference; emission exact on every array | verified (GPU lock held) | k-densify, 6f73b0e |
 | 2026-11-01 | MCMC relocation round at 1M / 3M / 6M Gaussians | 2.33 / 7.92 / 17.6 ms | gsplat: 5.81 / 17.3 / 32.6 ms. Faster-GS: 5.84 / 18.0 / 48.4 ms | 1.9–2.5x vs gsplat; 2.3–2.8x vs Faster-GS | relocation within 1.9e-6 of gsplat | verified (GPU lock held) | k-densify, 6f73b0e |
+| 2026-11-02 | VGGT-Ω camera + dense heads (512x336, N = 8 / 32 frames) | 17.2 / 68.1 ms | official PyTorch heads: 43.5 / 170.7 ms | 2.5x | all 17 intermediates within 4.6e-3 rel. RMS of the official model | preliminary (lock state not recorded) | eng-heads, c2c2050 |
 
 Not a win (do not market): Morton re-sort from random order is slower than Faster-GS (8.94 vs 6.21 ms at 1M; 96.1 vs 49.4 ms at 6M).
 
