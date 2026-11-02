@@ -118,6 +118,18 @@ ba_iters: number, ba_keypoints: number, ba_neighbours: number,
  */
 ba_focal: boolean, 
 /**
+ * Square pixels from the engine's long-side focal ([`Posed::square_pixels`]).
+ */
+square_pixels: boolean, 
+/**
+ * σ (degrees) of the BA's prior toward the engine poses (0 = none).
+ */
+ba_prior_deg: number, 
+/**
+ * BA rounds (track + solve), each from the previous round's cameras.
+ */
+ba_rounds: number, 
+/**
  * Init from the BA's triangulated tracks: 0 = no, 1 = only them, 2 =
  * added to the engine points.
  */

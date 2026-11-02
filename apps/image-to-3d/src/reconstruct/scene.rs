@@ -157,6 +157,25 @@ impl Posed {
         self.reproject(frames);
     }
 
+    /// Square pixels at the trainer size `width`×`height`: the focal along
+    /// the long side is kept and the other derived from it (the engine's two
+    /// fovs disagree by up to 3.6 % on Mip-NeRF 360, the long-side one is
+    /// within 0.5 % of COLMAP); world points are recomputed.
+    pub fn square_pixels(&mut self, width: u32, height: u32) {
+        let (w, h) = (self.cams.width as f32, self.cams.height as f32);
+        let (sx, sy) = (w / width as f32, h / height as f32);
+        let long_x = width >= height;
+        for k in self.cams.intrinsics.iter_mut() {
+            if long_x {
+                k[4] = k[0] / sx * sy;
+            } else {
+                k[0] = k[4] / sy * sx;
+            }
+        }
+        let all: Vec<usize> = (0..self.frames()).collect();
+        self.reproject(&all);
+    }
+
     /// Recomputes the world points of `frames` from their depth and cameras.
     pub fn reproject(&mut self, frames: &[usize]) {
         let (w, h) = (self.cams.width, self.cams.height);
@@ -573,6 +592,15 @@ mod tests {
         assert!((m.xyz[0][0] - 0.015).abs() < 1e-6);
         assert!((m.xyz[2][0] - 10.15).abs() < 1e-4);
         assert_eq!(subsample(m, 2).xyz.len(), 2);
+    }
+
+    #[test]
+    fn square_pixels_keep_the_long_side_focal() {
+        let mut p = posed(2, 8, 6);
+        // Trainer 16×10 from engine 8×6: sx = 0.5, sy = 0.6.
+        p.square_pixels(16, 10);
+        let v = p.views(&[1], 16, 10, p.shared_focal(&[1], 16, 10));
+        assert!((v[0].fx - 202.0).abs() < 1e-3 && (v[0].fy - 202.0).abs() < 1e-3);
     }
 
     #[test]

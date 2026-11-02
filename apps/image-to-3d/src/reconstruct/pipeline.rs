@@ -144,6 +144,15 @@ pub struct PipelineConfig {
     /// Also refine the shared focal in the BA.
     #[serde(default = "default_true")]
     pub ba_focal: bool,
+    /// Square pixels from the engine's long-side focal ([`Posed::square_pixels`]).
+    #[serde(default = "default_true")]
+    pub square_pixels: bool,
+    /// σ (degrees) of the BA's prior toward the engine poses (0 = none).
+    #[serde(default)]
+    pub ba_prior_deg: f32,
+    /// BA rounds (track + solve), each from the previous round's cameras.
+    #[serde(default = "default_one")]
+    pub ba_rounds: u32,
     /// Init from the BA's triangulated tracks: 0 = no, 1 = only them, 2 =
     /// added to the engine points.
     #[serde(default)]
@@ -242,6 +251,9 @@ impl PipelineConfig {
             ba_focal: true,
             ba_reject_px: 3.0,
             init_ba: 0,
+            ba_rounds: 1,
+            square_pixels: true,
+            ba_prior_deg: 0.0,
         }
     }
 
@@ -762,6 +774,9 @@ pub fn reconstruct_with(
         cancel,
         events,
     )?;
+    if cfg.square_pixels {
+        posed.square_pixels(tw, th);
+    }
     if let Some(f) = adjust {
         f(&mut posed)?;
     }
@@ -785,38 +800,42 @@ pub fn reconstruct_with(
         // Every frame takes part (as COLMAP would); training frame 0 is the gauge.
         let order: Vec<usize> = train.iter().chain(&test).copied().collect();
         let imgs: Vec<&Rgb8Image> = order.iter().map(|&i| &frames.trainer[i]).collect();
-        let (rep, pts) = bundle_adjust(
-            &mut posed,
-            &order,
-            &imgs,
-            &BaConfig {
-                iters: cfg.ba_iters,
-                keypoints: cfg.ba_keypoints,
-                neighbours: cfg.ba_neighbours,
-                focal: cfg.ba_focal,
-                reject_px: cfg.ba_reject_px as f64,
-                ..Default::default()
-            },
-        );
-        times.ba_s = rep.track_s + rep.solve_s;
-        events(Event::Log(format!(
-            "bundle adjustment: {} frames, {} points, {} observations ({} kept, {} tracks tried), rms {:.3} → {:.3} px, inliers {:.3} → {:.3}, focal ×{:.4}, median rotation change {:.3}°, {} iterations, track {:.1} s + solve {:.1} s",
-            rep.frames,
-            rep.points,
-            rep.observations,
-            rep.observations_kept,
-            rep.tracks_tried,
-            rep.rms_before,
-            rep.rms_after,
-            rep.inliers_before,
-            rep.inliers_after,
-            rep.focal_scale,
-            rep.median_rot_change_deg,
-            rep.iterations,
-            rep.track_s,
-            rep.solve_s
-        )));
-        ba_points = Some(pts);
+        // Later rounds track again from the adjusted cameras (better
+        // predictions, more inliers on wide-baseline captures).
+        for round in 0..cfg.ba_rounds.max(1) {
+            let (rep, pts) = bundle_adjust(
+                &mut posed,
+                &order,
+                &imgs,
+                &BaConfig {
+                    iters: cfg.ba_iters,
+                    keypoints: cfg.ba_keypoints,
+                    neighbours: cfg.ba_neighbours,
+                    focal: cfg.ba_focal,
+                    reject_px: cfg.ba_reject_px as f64,
+                    ..Default::default()
+                },
+            );
+            times.ba_s += rep.track_s + rep.solve_s;
+            events(Event::Log(format!(
+                "bundle adjustment round {round}: {} frames, {} points, {} observations ({} kept, {} tracks tried), rms {:.3} → {:.3} px, inliers {:.3} → {:.3}, focal ×{:.4}, median rotation change {:.3}°, {} iterations, track {:.1} s + solve {:.1} s",
+                rep.frames,
+                rep.points,
+                rep.observations,
+                rep.observations_kept,
+                rep.tracks_tried,
+                rep.rms_before,
+                rep.rms_after,
+                rep.inliers_before,
+                rep.inliers_after,
+                rep.focal_scale,
+                rep.median_rot_change_deg,
+                rep.iterations,
+                rep.track_s,
+                rep.solve_s
+            )));
+            ba_points = Some(pts);
+        }
     }
     // The engine's training cameras: held-out cameras are carried from them.
     let engine_train = {

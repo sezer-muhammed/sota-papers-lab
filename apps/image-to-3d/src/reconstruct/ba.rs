@@ -54,6 +54,9 @@ pub struct BaConfig {
     pub focal: bool,
     /// Above 0: a second round without observations off by more (working px).
     pub reject_px: f64,
+    /// Above 0: σ (degrees) of a prior holding each pose near its start
+    /// (translation σ: the same fraction of the camera spread).
+    pub prior_deg: f64,
 }
 
 impl Default for BaConfig {
@@ -69,6 +72,7 @@ impl Default for BaConfig {
             huber_px: 1.0,
             focal: true,
             reject_px: 0.0,
+            prior_deg: 0.0,
         }
     }
 }
@@ -95,6 +99,22 @@ pub struct BaReport {
     pub iterations: u32,
     pub track_s: f64,
     pub solve_s: f64,
+}
+
+/// `want` of `list` (best first): the first half, then evenly spaced from
+/// the rest.
+fn spread_pick(list: &[usize], want: usize) -> Vec<usize> {
+    if list.len() <= want {
+        return list.to_vec();
+    }
+    let head = want.div_ceil(2);
+    let mut out: Vec<usize> = list[..head].to_vec();
+    let rest = &list[head..];
+    let k = want - head;
+    for j in 0..k {
+        out.push(rest[(j * rest.len() + rest.len() / 2) / k.max(1)]);
+    }
+    out
 }
 
 /// A float gray image.
@@ -600,6 +620,60 @@ fn evaluate(
     (cost, inl, norms)
 }
 
+/// A weak Gaussian prior that holds every pose near its start (the
+/// engine's, globally consistent): tracks between overlapping neighbours
+/// fix the local error but leave slow drift along long chains free (T&T
+/// train drifted from 0.65° to 1.8° without it).
+struct Prior {
+    poses: Vec<Pose>,
+    /// Inverse variances: rotation (1/rad²) and translation (1/unit²).
+    wr: f64,
+    wt: f64,
+}
+
+/// `log` of a rotation matrix (axis × angle).
+fn so3_log(r: &M3) -> V3 {
+    let c = ((r[0][0] + r[1][1] + r[2][2] - 1.0) / 2.0).clamp(-1.0, 1.0);
+    let th = c.acos();
+    let v = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]];
+    let k = if th < 1e-6 {
+        0.5
+    } else {
+        th / (2.0 * th.sin())
+    };
+    v.map(|x| x * k)
+}
+
+impl Prior {
+    /// The left-perturbation offset `[v, ω]` of `cur` from frame `f`'s start.
+    fn delta(&self, f: usize, cur: &Pose) -> [f64; 6] {
+        let r0 = &self.poses[f];
+        let rd = mm(&cur.r, &transpose(&r0.r));
+        let w = so3_log(&rd);
+        let t = mv(&rd, r0.t);
+        [
+            cur.t[0] - t[0],
+            cur.t[1] - t[1],
+            cur.t[2] - t[2],
+            w[0],
+            w[1],
+            w[2],
+        ]
+    }
+
+    fn cost(&self, poses: &[Pose]) -> f64 {
+        poses
+            .iter()
+            .enumerate()
+            .map(|(f, p)| {
+                let d = self.delta(f, p);
+                0.5 * (self.wt * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+                    + self.wr * (d[3] * d[3] + d[4] * d[4] + d[5] * d[5]))
+            })
+            .sum()
+    }
+}
+
 /// Levenberg-Marquardt on the reduced camera system; returns the
 /// iterations run.
 #[allow(clippy::too_many_arguments)]
@@ -612,8 +686,10 @@ fn lm(
     iters: u32,
     huber: f64,
     fdim: usize,
+    prior: Option<&Prior>,
 ) -> u32 {
     let n = poses.len();
+    let pcost = |p: &[Pose]| prior.map_or(0.0, |q| q.cost(p));
     let dim = 6 * (n - 1) + fdim;
     let off = |f: usize| (f > 0).then(|| 6 * (f - 1));
     let mut by_point: Vec<Vec<usize>> = vec![Vec::new(); points.len()];
@@ -621,11 +697,23 @@ fn lm(
         by_point[o.point].push(i);
     }
     let (mut cost, ..) = evaluate(k, *s, poses, points, obs, huber);
+    cost += pcost(poses);
     let mut iters_done = 0;
     let mut lambda = 1e-4;
     for _ in 0..iters {
         iters_done += 1;
-        let (lins, h, g) = linear_system(k, *s, poses, points, obs, &by_point, huber, fdim);
+        let (lins, mut h, mut g) = linear_system(k, *s, poses, points, obs, &by_point, huber, fdim);
+        if let Some(q) = prior {
+            for (f, pose) in poses.iter().enumerate().skip(1) {
+                let o = 6 * (f - 1);
+                let d = q.delta(f, pose);
+                for i in 0..6 {
+                    let w = if i < 3 { q.wt } else { q.wr };
+                    h[(o + i) * dim + o + i] += w;
+                    g[o + i] -= w * d[i];
+                }
+            }
+        }
         let mut improved = false;
         for _ in 0..6 {
             let mut a = h.clone();
@@ -661,6 +749,7 @@ fn lm(
                 })
                 .collect();
             let (c2, ..) = evaluate(k, new_s, &new_poses, &new_points, obs, huber);
+            let c2 = c2 + pcost(&new_poses);
             if c2 < cost {
                 cost = c2;
                 *poses = new_poses;
@@ -719,7 +808,14 @@ pub fn bundle_adjust(
         .par_iter()
         .map(|&i| grid_samples(p, i, thr, 2000))
         .collect();
-    let nb = neighbours(p, frames, &cams, &samples, cfg.neighbours as usize, 0.05);
+    // Half the best-overlapping frames, half spread over a 4× longer
+    // overlap list: the wider baselines close loops on 360° captures (T&T
+    // train: 4 best only drifted 0.90° → 1.07°, 10 best reached 0.61°).
+    let want = cfg.neighbours as usize;
+    let nb: Vec<Vec<usize>> = neighbours(p, frames, &cams, &samples, 4 * want, 0.05)
+        .into_iter()
+        .map(|list| spread_pick(&list, want))
+        .collect();
 
     // Keypoints with engine depth, then tracks.
     let hw = cfg.half_win as i32;
@@ -811,6 +907,24 @@ pub fn bundle_adjust(
     rep.rms_before =
         (finite.iter().map(|v| v * v).sum::<f64>() / finite.len().max(1) as f64).sqrt();
     rep.inliers_before = inl as f64 / obs.len() as f64;
+    let prior = (cfg.prior_deg > 0.0).then(|| {
+        // Translation σ: the same fraction of the camera spread as the
+        // rotation σ is of a radian.
+        let c: Vec<V3> = cams.iter().map(Cam::center).collect();
+        let m: V3 = std::array::from_fn(|j| c.iter().map(|x| x[j]).sum::<f64>() / c.len() as f64);
+        let mut d: Vec<f64> = c
+            .iter()
+            .map(|x| ((0..3).map(|j| (x[j] - m[j]).powi(2)).sum::<f64>()).sqrt())
+            .collect();
+        d.sort_by(f64::total_cmp);
+        let spread = d[d.len() / 2].max(1e-9);
+        let sr = cfg.prior_deg.to_radians();
+        Prior {
+            poses: poses.clone(),
+            wr: 1.0 / (sr * sr),
+            wt: 1.0 / (sr * spread).powi(2),
+        }
+    });
     rep.iterations = lm(
         &k,
         &mut poses,
@@ -820,6 +934,7 @@ pub fn bundle_adjust(
         cfg.iters,
         huber,
         fdim,
+        prior.as_ref(),
     );
     if cfg.reject_px > 0.0 {
         // Second round without the gross outliers.
@@ -840,6 +955,7 @@ pub fn bundle_adjust(
             cfg.iters.div_ceil(2),
             huber,
             fdim,
+            prior.as_ref(),
         );
     }
     let (_, inl, norms) = evaluate(&k, s, &poses, &points, &obs, huber);
@@ -1078,7 +1194,7 @@ mod tests {
             })
             .collect();
         let mut s = 0.01;
-        lm(&k, &mut poses, &mut points, &mut s, &obs, 30, 1.0, 1);
+        lm(&k, &mut poses, &mut points, &mut s, &obs, 30, 1.0, 1, None);
         let (cost, ..) = evaluate(&k, s, &poses, &points, &obs, 1.0);
         assert!(cost / (obs.len() as f64) < 1e-6, "cost {cost}");
         assert!(s.abs() < 1e-4, "focal {s}");
@@ -1089,6 +1205,22 @@ mod tests {
                 .acos();
             assert!(ang.to_degrees() < 1e-3, "{}", ang.to_degrees());
         }
+    }
+
+    #[test]
+    fn so3_log_inverts_exp() {
+        let w = [0.1, -0.25, 0.4];
+        let l = so3_log(&so3_exp(w));
+        for i in 0..3 {
+            assert!((l[i] - w[i]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn spread_pick_keeps_the_best_and_spreads_the_rest() {
+        let list: Vec<usize> = (0..16).collect();
+        assert_eq!(spread_pick(&list, 4), vec![0, 1, 5, 12]);
+        assert_eq!(spread_pick(&list[..3], 4), vec![0, 1, 2]);
     }
 
     #[test]
