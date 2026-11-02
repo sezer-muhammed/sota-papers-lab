@@ -710,3 +710,57 @@ fn gpu_camera_head_on_bf16_rounded_oracle_cache() {
         cam_gates(&pe, &fp32)
     );
 }
+
+/// The pose op's pipeline on 16 truck photos decoded from disk: cameras,
+/// COLMAP text, point PLY under `target/vggt-pose/` for a look in a viewer.
+#[test]
+#[ignore]
+fn gpu_pose_outputs_on_truck() {
+    let datasets = env_path("SPL_DATASETS", "/datasets");
+    let dir = datasets.join("tandt/truck/images");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    let pick = pose::sample_indices(files.len(), 16);
+    let names: Vec<String> = pick
+        .iter()
+        .map(|&i| files[i].file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let t = std::time::Instant::now();
+    let frames: Vec<_> = pick
+        .iter()
+        .map(|&i| preprocess::decode(&std::fs::read(&files[i]).unwrap()).unwrap())
+        .collect();
+    let mut e = engine();
+    let p = e.preprocess(&frames).unwrap();
+    let prep_s = t.elapsed().as_secs_f64();
+    let cams = e
+        .run(&p, &CancellationToken::new(), &mut |_, _| {})
+        .unwrap();
+    let dense = e.download(&p.geom).unwrap();
+    let pts = pose::point_cloud(&p, &dense, 50.0, 2_000_000);
+    let out = PathBuf::from("target/vggt-pose");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut ply = std::fs::File::create(out.join("points.ply")).unwrap();
+    pose::write_points_ply(&pts, &cams, &mut ply).unwrap();
+    let (c, i, _) = pose::colmap_text(&names, &cams, &pts);
+    std::fs::write(out.join("cameras.txt"), c).unwrap();
+    std::fs::write(out.join("images.txt"), i).unwrap();
+    // Frame 0 is the world: its extrinsic is close to identity.
+    let e0 = cams.extrinsics[0];
+    let off: f32 = [e0[0] - 1.0, e0[5] - 1.0, e0[10] - 1.0, e0[3], e0[7], e0[11]]
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0, f32::max);
+    println!(
+        "pose: 16 frames {}x{}, decode+preprocess {prep_s:.2} s, forward {:.1} ms, {} points, frame-0 offset {off:.4}",
+        p.geom.width,
+        p.geom.height,
+        e.times.total_ms,
+        pts.len()
+    );
+    assert!(off < 0.05);
+    assert!(pts.len() > 100_000);
+}
