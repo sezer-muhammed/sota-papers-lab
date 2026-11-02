@@ -19,8 +19,9 @@ pub struct Config {
     /// Ops executing at once; further runs wait, in order, as `queued`.
     /// One GPU is shared by every run, so keep this small.
     pub max_concurrent_runs: usize,
-    /// Largest `POST /v1/artifacts` body in MiB. Uploads are held in memory
-    /// while they are hashed, so this also bounds memory per upload.
+    /// Largest `POST /v1/artifacts` body in MiB. Uploads stream to disk
+    /// (`<data_dir>/staging`), never into memory, so this bounds disk use
+    /// per upload; the default fits a few minutes of 4K phone video.
     pub max_upload_mb: u64,
 }
 
@@ -33,7 +34,7 @@ impl Default for Config {
             web_dir: None,
             auth_token: None,
             max_concurrent_runs: 3,
-            max_upload_mb: 1024,
+            max_upload_mb: 2048,
         }
     }
 }
@@ -92,9 +93,13 @@ impl Config {
         self.data_dir.join("artifacts")
     }
 
-    pub fn max_upload_bytes(&self) -> usize {
-        usize::try_from(self.max_upload_mb)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(1024 * 1024)
+    /// Uploads and `spl put` files wait here until they move into the
+    /// artifact store; on the same filesystem, so that move is a rename.
+    pub fn staging_dir(&self) -> PathBuf {
+        self.data_dir.join("staging")
+    }
+
+    pub fn max_upload_bytes(&self) -> u64 {
+        self.max_upload_mb.saturating_mul(1024 * 1024)
     }
 }

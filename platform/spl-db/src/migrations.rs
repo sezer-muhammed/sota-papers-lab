@@ -17,9 +17,9 @@ macro_rules! migrations {
 }
 
 // `<version> "<file stem>"`; stems are zero-padded so the files sort.
-pub const SQLITE: &[Migration] = migrations!("sqlite": 1 "0001_init");
-pub const POSTGRES: &[Migration] = migrations!("postgres": 1 "0001_init");
-pub const ORACLE: &[Migration] = migrations!("oracle": 1 "0001_init");
+pub const SQLITE: &[Migration] = migrations!("sqlite": 1 "0001_init", 2 "0002_announcements");
+pub const POSTGRES: &[Migration] = migrations!("postgres": 1 "0001_init", 2 "0002_announcements");
+pub const ORACLE: &[Migration] = migrations!("oracle": 1 "0001_init", 2 "0002_announcements");
 
 #[cfg(test)]
 mod tests {

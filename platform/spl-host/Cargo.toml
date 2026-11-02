@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
+futures-util = { version = "0.3", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 spl-core.workspace = true
@@ -16,6 +17,8 @@ spl-data.workspace = true
 spl-db.workspace = true
 spl-gpu.workspace = true
 tokio.workspace = true
+# `io`: ReaderStream streams artifact files to clients.
+tokio-util = { workspace = true, features = ["io"] }
 toml.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
@@ -23,6 +26,7 @@ ts-rs.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+blake3.workspace = true
 schemars.workspace = true
 tempfile = "3"
 # `ServiceExt::oneshot` drives the router in tests without a socket.
