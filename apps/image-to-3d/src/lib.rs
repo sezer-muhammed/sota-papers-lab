@@ -33,6 +33,7 @@ pub mod kernels;
 pub mod model;
 pub mod ops;
 pub mod pose;
+pub mod ppisp;
 pub mod presets;
 pub mod reference;
 pub mod refine;
