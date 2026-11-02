@@ -9,14 +9,16 @@
 //! Buffers are allocated once per largest geometry and reused across blocks
 //! and runs.
 //!
-//! Inter-frame attention goes through [`InterAttention`], so Phase 2 can swap
-//! the dense global kernel for SageAttention or KV merging per layer.
+//! Inter-frame attention goes through [`InterAttention`]; the per-layer
+//! [`InterKind`] schedule picks dense FlashAttention, SageAttention, KV
+//! merging or frame attention for each global layer (Phase 2, `sched.rs`).
 
 mod aggregator;
 mod block;
 mod dino;
 mod kernels;
 pub mod rope;
+pub mod sched;
 
 #[cfg(test)]
 mod tests;
@@ -30,7 +32,7 @@ use spl_nn::norm::Norm;
 use spl_nn::qkv::{HEAD_DIM, QkvPrologue};
 use spl_nn::residual::Residual;
 
-pub use block::BlockWeights;
+pub use block::{BlockWeights, Fp8Weights};
 
 /// Model width.
 pub const DIM: usize = 1024;
@@ -59,6 +61,11 @@ pub trait TrunkWeights {
     fn f32(&self, name: &str) -> Result<CudaView<'_, f32>>;
     fn host_f32(&self, name: &str) -> Result<Vec<f32>>;
     fn has(&self, name: &str) -> bool;
+    /// The FP8 E4M3 copy of a 2-D weight and its per-output-channel scales
+    /// (Phase 2 FP8 GEMMs).
+    fn fp8(&self, name: &str) -> Result<(CudaView<'_, u8>, CudaView<'_, f32>)> {
+        Err(anyhow!("no FP8 copy of {name}"))
+    }
 }
 
 /// Frames and patch grid of one run.
@@ -88,10 +95,19 @@ impl TrunkGeom {
 /// What an inter-frame block attends over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterKind {
-    /// All `N · T` tokens as one sequence.
+    /// All `N · T` tokens as one sequence (bf16 FlashAttention).
     Global,
     /// Only the 17 special tokens of every frame (`17 N`); patches untouched.
     Register,
+    /// The global block's weights run as per-frame attention (`N`
+    /// sequences of `T`).
+    Frame,
+    /// Global through SageAttention (INT8 QKᵀ, FP8 P·V).
+    Sage,
+    /// Global through SageAttention with 2×2 / 4×4 pooled patch keys and
+    /// values of frames 1.. (+log(count) bias; specials and frame 0 dense).
+    Merge2,
+    Merge4,
 }
 
 /// The official schedule: register attention at 2, 6, 9, 14, 20.
@@ -208,11 +224,15 @@ pub(crate) struct Buffers {
     o: CudaSlice<u16>,
     /// proj / fc2 output.
     y: CudaSlice<u16>,
+    /// Per-token FP8 activation scales (two: one read while the other is
+    /// written). The FP8 activations themselves live in `xd`, idle outside
+    /// the DINO pass and register blocks (which never run FP8).
+    tok: [CudaSlice<f32>; 2],
 }
 
 impl Buffers {
     fn bytes(rows: usize) -> usize {
-        rows * (2 * DIM * 4 + (DIM + HIDDEN + 3 * DIM + 2 * DIM) * 2)
+        rows * (2 * DIM * 4 + (DIM + HIDDEN + 3 * DIM + 2 * DIM) * 2 + 2 * 4)
     }
 
     fn new(nn: &Nn, rows: usize) -> Result<Self> {
@@ -229,14 +249,29 @@ impl Buffers {
             v: s.alloc_zeros(rows * DIM).map_err(e)?,
             o: s.alloc_zeros(rows * DIM).map_err(e)?,
             y: s.alloc_zeros(rows * DIM).map_err(e)?,
+            tok: [
+                s.alloc_zeros(rows).map_err(e)?,
+                s.alloc_zeros(rows).map_err(e)?,
+            ],
         })
     }
 
-    /// The two f32 streams and the block scratch, borrowed apart.
-    fn split(&mut self) -> (&mut CudaSlice<f32>, &mut CudaSlice<f32>, block::Scratch<'_>) {
+    /// The two f32 streams, the FP8 token scales and the block scratch,
+    /// borrowed apart.
+    #[allow(clippy::type_complexity)]
+    fn split(
+        &mut self,
+    ) -> (
+        &mut CudaSlice<f32>,
+        &mut CudaSlice<f32>,
+        [&mut CudaSlice<f32>; 2],
+        block::Scratch<'_>,
+    ) {
+        let [t0, t1] = &mut self.tok;
         (
             &mut self.x,
             &mut self.xd,
+            [t0, t1],
             block::Scratch {
                 xn: &mut self.xn,
                 big: &mut self.big,
@@ -275,6 +310,38 @@ pub struct Trunk {
     /// RoPE tables for the last grid: (grid, DINO, aggregator).
     rope: Option<RopeTables>,
     global: Box<dyn InterAttention + Send + Sync>,
+    sage: sched::Sage,
+    fp8_blocks: Fp8Blocks,
+}
+
+/// Which blocks run their four GEMMs in FP8: bit `i` is `frame_blocks[i]`,
+/// bit `24 + i` is `inter_frame_blocks[i]` (register blocks always stay
+/// bf16). Needs the FP8 weight copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Fp8Blocks(pub u64);
+
+impl Fp8Blocks {
+    pub const NONE: Self = Self(0);
+
+    pub fn frame(self, i: usize) -> bool {
+        self.0 >> i & 1 == 1
+    }
+
+    pub fn inter(self, i: usize) -> bool {
+        self.0 >> (DEPTH + i) & 1 == 1
+    }
+
+    pub fn with_frame(self, i: usize) -> Self {
+        Self(self.0 | 1 << i)
+    }
+
+    pub fn with_inter(self, i: usize) -> Self {
+        Self(self.0 | 1 << (DEPTH + i))
+    }
+
+    pub fn count(self) -> u32 {
+        self.0.count_ones()
+    }
 }
 
 impl Trunk {
@@ -322,6 +389,8 @@ impl Trunk {
             agg_periods: w.host_f32("aggregator.rope_embed.periods")?,
             rope: None,
             global: Box::new(DenseAttention),
+            sage: sched::Sage::new(sched::PvAccum::F32),
+            fp8_blocks: Fp8Blocks::NONE,
         })
     }
 
@@ -330,10 +399,29 @@ impl Trunk {
         self.global = a;
     }
 
+    /// Blocks whose GEMMs run in FP8 (the weights must hold FP8 copies).
+    pub fn set_fp8_blocks(&mut self, b: Fp8Blocks) {
+        self.fp8_blocks = b;
+    }
+
+    /// How SageAttention layers accumulate P·V (FP32 by default).
+    pub fn set_pv_accum(&mut self, pv: sched::PvAccum) {
+        self.sage.set_pv_accum(pv);
+    }
+
     /// Device bytes the trunk allocates for `g` (on top of the weights and
-    /// the cache).
+    /// the cache) with the dense schedule.
     pub fn scratch_bytes(g: &TrunkGeom) -> usize {
         Buffers::bytes(g.rows())
+    }
+
+    /// [`Self::scratch_bytes`] plus the SageAttention workspaces of `sched`.
+    pub fn scratch_bytes_for(g: &TrunkGeom, sched: &[InterKind; DEPTH]) -> usize {
+        Buffers::bytes(g.rows())
+            + sched::merges(sched, g)
+                .into_iter()
+                .map(|m| sched::workspace_bytes(g, m))
+                .sum::<usize>()
     }
 
     /// Frees the work buffers (they come back on the next [`Self::run`]):
@@ -341,6 +429,7 @@ impl Trunk {
     /// for captured graphs, which hold the buffers' addresses.
     pub fn release_buffers(&mut self) {
         self.bufs = None;
+        self.sage.release();
     }
 
     /// Runs the trunk on `images` (normalised f32 `[N][3][H][W]`, H = 16 h,
@@ -391,6 +480,7 @@ impl Trunk {
             let a = rope::table(geom.grid_h, geom.grid_w, SPECIAL, &self.agg_periods);
             self.rope = Some((grid, d.upload(nn)?, a.upload(nn)?));
         }
+        self.sage.prepare(nn, sched, &geom)?;
         let Some(bufs) = self.bufs.as_mut() else {
             bail!("trunk buffers missing");
         };
@@ -416,6 +506,8 @@ impl Trunk {
             &self.special,
             agg_rope,
             self.global.as_ref(),
+            &mut self.sage,
+            self.fp8_blocks,
             cache,
             cam_tokens,
             sched,

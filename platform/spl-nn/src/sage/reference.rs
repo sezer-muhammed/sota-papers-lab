@@ -85,7 +85,11 @@ pub fn members(plan: &Plan, j: usize) -> Vec<usize> {
 
 fn cell_members(layout: &FrameLayout, s: usize, j: usize) -> Vec<usize> {
     let per = layout.merged_per_frame(s);
-    let (f, loc) = (j / per, j % per);
+    let dense = layout.dense_frames.min(layout.frames) * layout.tokens_per_frame();
+    if j < dense {
+        return vec![j];
+    }
+    let (f, loc) = (layout.dense_frames + (j - dense) / per, (j - dense) % per);
     let base = f * layout.tokens_per_frame();
     if loc < layout.special {
         return vec![base + loc];

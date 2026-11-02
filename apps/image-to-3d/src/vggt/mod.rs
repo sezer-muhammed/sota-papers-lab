@@ -23,6 +23,8 @@ pub mod workspace;
 #[cfg(test)]
 mod integration;
 #[cfg(test)]
+mod phase2_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
@@ -49,9 +51,10 @@ pub enum InterAttn {
     Global,
     /// The 17 special tokens of every frame as one sequence; patches pass.
     Register,
-    /// Per-frame attention instead of global (Phase 2 experiment).
+    /// Per-frame attention instead of global (Phase 2).
     Frame,
-    /// Global with 2×2 / 4×4 merged keys and values (Phase 2).
+    /// Global with 2×2 / 4×4 merged keys and values of frames 1.. and a
+    /// +log(count) bias (Phase 2); runs on the SageAttention kernel.
     Merge2,
     Merge4,
     /// SageAttention2 INT8/FP8 global (Phase 2).
@@ -74,6 +77,66 @@ impl AttnSchedule {
     }
 }
 
+/// Global layers the Phase 2 schedule runs as frame attention
+/// (`spec-attn-schedule.md` §1).
+pub const FRAME_LAYERS: [usize; 3] = [3, 4, 5];
+/// Global layers the Phase 2 schedule merges 4×4.
+pub const MERGE4_LAYERS: [usize; 4] = [0, 1, 7, 19];
+/// The extra merge4 layers of the opt-in `ours_wide` schedule.
+pub const WIDE_MERGE4_LAYERS: [usize; 2] = [8, 22];
+
+impl AttnSchedule {
+    /// The shipped Phase 2 schedule (`ours`): frame at 3, 4, 5; merge4 at
+    /// 0, 1, 7, 19; the other global layers dense, through SageAttention
+    /// when `sage`.
+    pub fn phase2(sage: bool) -> Self {
+        let mut s = Self::dense().0;
+        for a in s.iter_mut() {
+            if sage && *a == InterAttn::Global {
+                *a = InterAttn::Sage;
+            }
+        }
+        for i in FRAME_LAYERS {
+            s[i] = InterAttn::Frame;
+        }
+        for i in MERGE4_LAYERS {
+            s[i] = InterAttn::Merge4;
+        }
+        Self(s)
+    }
+
+    /// `ours_wide` (opt-in fast): [`Self::phase2`] plus merge4 at 8 and 22.
+    pub fn phase2_wide(sage: bool) -> Self {
+        let mut s = Self::phase2(sage);
+        for i in WIDE_MERGE4_LAYERS {
+            s.0[i] = InterAttn::Merge4;
+        }
+        s
+    }
+
+    /// Parses `dense`, `sage` (dense + sage), `ours`, `ours+sage`,
+    /// `wide`, `wide+sage`.
+    pub fn named(name: &str) -> Result<Self> {
+        Ok(match name {
+            "dense" => Self::dense(),
+            "sage" => {
+                let mut s = Self::dense();
+                for a in s.0.iter_mut() {
+                    if *a == InterAttn::Global {
+                        *a = InterAttn::Sage;
+                    }
+                }
+                s
+            }
+            "ours" => Self::phase2(false),
+            "ours+sage" => Self::phase2(true),
+            "wide" => Self::phase2_wide(false),
+            "wide+sage" => Self::phase2_wide(true),
+            other => bail!("unknown attention schedule {other:?}"),
+        })
+    }
+}
+
 impl Default for AttnSchedule {
     fn default() -> Self {
         Self::dense()
@@ -92,8 +155,14 @@ pub struct VggtConfig {
     pub schedule: AttnSchedule,
     /// Capture the trunk in a CUDA graph per (N, H, W) for N up to this.
     pub graph_max_frames: usize,
-    /// Also load `<weights>_fp8.safetensors` into the arena (Phase 2).
+    /// Also load `<weights>_fp8.safetensors` into the arena (Phase 2;
+    /// implied by a non-empty `fp8_blocks`).
     pub fp8: bool,
+    /// Trunk blocks whose GEMMs run in FP8 (Phase 2).
+    pub fp8_blocks: trunk::Fp8Blocks,
+    /// SageAttention layers accumulate each 64-key P·V block in FP16
+    /// (SageAttention2++, faster) instead of FP32.
+    pub sage_pv16: bool,
     /// Force (or forbid) moving levels 0..3 to pinned host memory between
     /// the trunk and the dense head; `None` lets the planner decide.
     pub offload: Option<bool>,
@@ -108,6 +177,8 @@ impl Default for VggtConfig {
             schedule: AttnSchedule::dense(),
             graph_max_frames: 32,
             fp8: false,
+            fp8_blocks: trunk::Fp8Blocks::NONE,
+            sage_pv16: false,
             offload: None,
         }
     }
@@ -174,7 +245,7 @@ impl VggtEngine {
         let ctx = nn.ctx.clone();
         let _untracked = graph::Untracked::new(&ctx);
         let mut paths = vec![weights.to_path_buf()];
-        if cfg.fp8 {
+        if cfg.fp8 || cfg.fp8_blocks != trunk::Fp8Blocks::NONE {
             paths.push(weights::fp8_companion(weights));
         }
         let w = Weights::load(&nn, &paths)?;
@@ -222,7 +293,10 @@ impl VggtEngine {
         // so their memory counts as free.
         let held: usize = self.workspaces.values().map(|w| w.plan.device_bytes).sum();
         let margin = 256 << 20;
-        let trunk = trunk::Trunk::scratch_bytes(&trunk_geom(&geom));
+        let trunk = trunk::Trunk::scratch_bytes_for(
+            &trunk_geom(&geom),
+            &trunk_schedule(&self.cfg.schedule)?,
+        );
         let chunk = geom.with_frames(self.cfg.dense_chunk.min(geom.frames));
         let rest = geom.frames % self.cfg.dense_chunk.max(1);
         // The dense head keeps work buffers for the full chunk and the
@@ -303,6 +377,12 @@ impl VggtEngine {
         }
         progress("trunk", 0.02);
         let sched = trunk_schedule(&self.cfg.schedule)?;
+        self.trunk.set_fp8_blocks(self.cfg.fp8_blocks);
+        self.trunk.set_pv_accum(if self.cfg.sage_pv16 {
+            trunk::sched::PvAccum::F16
+        } else {
+            trunk::sched::PvAccum::F32
+        });
         let use_graph = g.frames <= self.cfg.graph_max_frames;
         let mut graphed = false;
         {
@@ -332,9 +412,7 @@ impl VggtEngine {
                 )
             };
             if use_graph {
-                graphed = self
-                    .graphs
-                    .run(&nn, (g, sched_key(&self.cfg.schedule)), &mut body)?;
+                graphed = self.graphs.run(&nn, (g, run_key(&self.cfg)), &mut body)?;
             } else {
                 body(&nn)?;
             }
@@ -527,8 +605,14 @@ fn trunk_schedule(s: &AttnSchedule) -> Result<[trunk::InterKind; 24]> {
         out[i] = match a {
             InterAttn::Global => trunk::InterKind::Global,
             InterAttn::Register => trunk::InterKind::Register,
-            other => bail!("inter-frame attention {other:?} (layer {i}) is Phase 2"),
+            InterAttn::Frame => trunk::InterKind::Frame,
+            InterAttn::Sage => trunk::InterKind::Sage,
+            InterAttn::Merge2 => trunk::InterKind::Merge2,
+            InterAttn::Merge4 => trunk::InterKind::Merge4,
         };
+        if REGISTER_LAYERS.contains(&i) != (*a == InterAttn::Register) {
+            bail!("layer {i}: register attention is fixed by the checkpoint");
+        }
     }
     Ok(out)
 }
@@ -539,6 +623,11 @@ fn trunk_geom(g: &Geometry) -> trunk::TrunkGeom {
         grid_h: g.grid_h,
         grid_w: g.grid_w,
     }
+}
+
+/// Everything besides the geometry that changes the trunk's kernels.
+fn run_key(cfg: &VggtConfig) -> u64 {
+    sched_key(&cfg.schedule) ^ cfg.fp8_blocks.0.rotate_left(17) ^ u64::from(cfg.sage_pv16) << 63
 }
 
 fn sched_key(s: &AttnSchedule) -> u64 {

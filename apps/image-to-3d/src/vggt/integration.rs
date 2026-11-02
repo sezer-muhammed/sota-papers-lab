@@ -23,7 +23,7 @@ use crate::pose;
 // ---------------------------------------------------------------- helpers
 
 /// Writes a little-endian f32 `.npy` in C order.
-fn write_npy(path: &Path, shape: &[usize], data: &[f32]) {
+pub(super) fn write_npy(path: &Path, shape: &[usize], data: &[f32]) {
     assert_eq!(shape.iter().product::<usize>(), data.len());
     let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
     let tuple = if dims.len() == 1 {
@@ -46,11 +46,11 @@ fn write_npy(path: &Path, shape: &[usize], data: &[f32]) {
     std::fs::write(path, b).unwrap();
 }
 
-fn datasets() -> PathBuf {
+pub(super) fn datasets() -> PathBuf {
     env_path("SPL_DATASETS", "/datasets")
 }
 
-fn image_files(dir: &Path) -> Vec<PathBuf> {
+pub(super) fn image_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         .map(|e| e.unwrap().path())
@@ -68,7 +68,7 @@ fn image_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The first of `images_4`, `images_2`, `images` that exists in a scene.
-fn scene_images(scene: &Path) -> PathBuf {
+pub(super) fn scene_images(scene: &Path) -> PathBuf {
     ["images_4", "images_2", "images"]
         .iter()
         .map(|d| scene.join(d))
@@ -76,7 +76,7 @@ fn scene_images(scene: &Path) -> PathBuf {
         .unwrap_or_else(|| panic!("no image folder in {}", scene.display()))
 }
 
-fn decode_all(files: &[PathBuf]) -> Vec<crate::io::images::Rgb8Image> {
+pub(super) fn decode_all(files: &[PathBuf]) -> Vec<crate::io::images::Rgb8Image> {
     use rayon::prelude::*;
     files
         .par_iter()
@@ -84,7 +84,7 @@ fn decode_all(files: &[PathBuf]) -> Vec<crate::io::images::Rgb8Image> {
         .collect()
 }
 
-fn free_bytes() -> usize {
+pub(super) fn free_bytes() -> usize {
     spl_nn::cudarc::driver::result::mem_get_info().unwrap().0
 }
 

@@ -276,6 +276,9 @@ pub struct FrameLayout {
     pub special: usize,
     pub grid_h: usize,
     pub grid_w: usize,
+    /// Leading frames whose keys stay unmerged (VGGT-Ω's reference frame:
+    /// 1); 0 merges every frame.
+    pub dense_frames: usize,
 }
 
 impl FrameLayout {
@@ -287,6 +290,13 @@ impl FrameLayout {
     pub fn merged_per_frame(&self, stride: usize) -> usize {
         self.special + self.grid_h.div_ceil(stride) * self.grid_w.div_ceil(stride)
     }
+
+    /// Keys of the whole sequence after pooling every frame past the first
+    /// `dense_frames`.
+    pub fn merged_keys(&self, stride: usize) -> usize {
+        let d = self.dense_frames.min(self.frames);
+        d * self.tokens_per_frame() + (self.frames - d) * self.merged_per_frame(stride)
+    }
 }
 
 /// Which keys and values attention sees.
@@ -295,7 +305,8 @@ pub enum KvMerge {
     /// Every key: the reference schedule.
     Dense,
     /// Patch keys and values pooled in `stride × stride` cells within each
-    /// frame (`stride` 2 or 4), with a +log(count) bias per pooled key.
+    /// frame (`stride` 2 or 4), with a +log(count) bias per pooled key;
+    /// the first `layout.dense_frames` frames keep every key.
     Pool { stride: usize, layout: FrameLayout },
 }
 
@@ -367,7 +378,7 @@ struct Geom {
     q_mul: f32,
     ln_eps: f32,
     v_range: f32,
-    pad_: i32,
+    dense_frames: i32,
 }
 
 // SAFETY: plain `#[repr(C)]` data with the field order and types of SgGeom.
@@ -411,7 +422,7 @@ impl Plan {
                         shape.tokens
                     );
                 }
-                layout.frames * layout.merged_per_frame(stride)
+                layout.merged_keys(stride)
             }
         };
         let plan = Self {
@@ -718,6 +729,7 @@ impl SageAttention {
             special: 0,
             grid_h: 0,
             grid_w: 0,
+            dense_frames: 0,
         });
         let geom = Geom {
             q_sb: q.strides.batch as i64,
@@ -743,6 +755,7 @@ impl SageAttention {
             grid_w: int(lay.grid_w, "grid width")?,
             merged_frame: int(lay.merged_per_frame(stride), "merged frame")?,
             merged_w: int(lay.grid_w.div_ceil(stride), "merged grid width")?,
+            dense_frames: int(lay.dense_frames.min(lay.frames), "dense frames")?,
             q_tiles: int(plan.q_tiles(), "query tiles")?,
             flags,
             q_mul: scale * std::f32::consts::LOG2_E,

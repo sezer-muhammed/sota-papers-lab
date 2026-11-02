@@ -443,6 +443,10 @@ impl super::trunk::TrunkWeights for Weights {
     fn has(&self, name: &str) -> bool {
         Weights::has(self, name)
     }
+
+    fn fp8(&self, name: &str) -> Result<(CudaView<'_, u8>, CudaView<'_, f32>)> {
+        Weights::fp8(self, name)
+    }
 }
 
 impl super::heads::HeadSource for Weights {
