@@ -11,7 +11,7 @@ on the GPU host. Design context: `reports/Image to 3D.md`, sections 1, 6 and 9.
 | `py/metrics.py` | PSNR, SSIM, LPIPS as 3DGS and gsplat compute them (`gs-metrics`) |
 | `py/oracle.py` | gsplat reference ops on npz files (`gs-oracle`), see [ORACLE.md](ORACLE.md) |
 | `run_baseline.sh` | One tool on one scene under the GPU lock, one JSON line of results |
-| `tools/<tool>.sh` | Baseline adapters (`gsplat` so far) |
+| `tools/<tool>.sh` | Baseline adapters: `gsplat` (3DGS densification), `gsplat-mcmc` (3DGS-MCMC) |
 | `install.sh` | Host setup: wrappers, image, datasets |
 
 ## Setup on the GPU host
@@ -75,6 +75,7 @@ pairs.
 ```sh
 benchmarks/image-to-3d/run_baseline.sh gsplat garden              # full 30k-step run
 benchmarks/image-to-3d/run_baseline.sh gsplat garden --steps 2000 --tag smoke
+benchmarks/image-to-3d/run_baseline.sh gsplat-mcmc garden -- --strategy.cap-max 3000000
 ```
 
 Each run takes `flock -x ~/spl-work/gpu.lock` (so does anyone timing on the
@@ -105,7 +106,18 @@ steps) on a view of the scene whose `images/` is the protocol folder, with
 `images_4/` and re-downsamples the full-resolution JPEGs to PNG itself, a
 different ground truth from the one 3DGS-family papers report on. Test views
 are rendered from the final checkpoint by `py/gsplat_render.py` with the
-trainer's own settings.
+trainer's own settings. `gsplat-mcmc` runs the `mcmc` preset (3DGS-MCMC, 1M
+Gaussian cap unless `--strategy.cap-max` says otherwise) through the same
+adapter. Arguments after `--` reach `simple_trainer.py` and are recorded in
+`tool_version`.
+
+Measured on garden (12 GB card): `gsplat default` does not finish. It
+densifies to 7.2M Gaussians by step 11500 and runs out of the 11.6 GiB there,
+even with `expandable_segments` (without it, step 7600). `--packed` does not
+rescue it (torch peak 1.172 vs 1.186 GB at 2k steps: the parameters and Adam
+state dominate, not the projection buffers). Use `gsplat-mcmc` with an explicit
+cap for the large outdoor scenes, and say which cap in the report. Failed runs
+stay in `results.jsonl` with `status: "failed"`.
 
 ### Adding a tool
 
