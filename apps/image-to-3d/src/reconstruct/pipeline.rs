@@ -37,7 +37,7 @@ use crate::model::GaussiansHost;
 use crate::ppisp::PpispConfig;
 use crate::presets::{DensifyPreset, PresetName, PresetOverrides};
 use crate::trainer::{TrainConfig, Trainer, ViewOrder};
-use crate::vggt::{ResizeMode, VggtConfig, VggtEngine};
+use crate::vggt::{AttnSchedule, ResizeMode, VggtConfig, VggtEngine};
 use crate::vram::{self, Coexist, Shortfall, WaitPolicy, WaitState};
 
 /// User-facing speed/quality trade-off.
@@ -50,6 +50,8 @@ pub enum ReconPreset {
     /// Target: ≥ 27.4 dB on Mip-NeRF 360 in ≤ 5 min end to end.
     #[default]
     Quality,
+    /// Higher capacity (6.5M Gaussians, 40k iterations).
+    Big,
 }
 
 /// Every knob of a run; [`PipelineConfig::preset`] fills the defaults.
@@ -166,6 +168,14 @@ pub struct PipelineConfig {
     /// One focal per image instead of one per camera.
     #[serde(default)]
     pub per_image_focal: bool,
+    /// VGGT-Ω attention schedule name (`dense`, `ours+sage`, etc.); `dense`
+    /// is the safe default, `ours+sage` the fast Phase-2 schedule (2× faster).
+    #[serde(default = "default_engine_schedule")]
+    pub engine_schedule: String,
+    /// Mesh the result (TSDF + marching cubes → GLB); `None` = no mesh.
+    #[serde(default)]
+    #[ts(optional)]
+    pub mesh: Option<crate::mesh::pipeline::MeshConfig>,
 }
 
 fn default_ba_keypoints() -> u32 {
@@ -194,6 +204,10 @@ fn default_true() -> bool {
 
 fn default_init_tau() -> f32 {
     0.01
+}
+
+fn default_engine_schedule() -> String {
+    "dense".to_string()
 }
 
 impl PipelineConfig {
@@ -248,6 +262,8 @@ impl PipelineConfig {
             init_voxel: 0.01,
             init_oversample: default_oversample(),
             per_image_focal: false,
+            engine_schedule: default_engine_schedule(),
+            mesh: None,
             ba_iters: 10,
             ba_keypoints: 512,
             ba_neighbours: 4,
@@ -265,6 +281,7 @@ impl PipelineConfig {
             preset: match self.preset {
                 ReconPreset::Fast => PresetName::Fast,
                 ReconPreset::Quality => PresetName::Quality,
+                ReconPreset::Big => PresetName::Big,
             },
             iterations: self.iterations,
             seed: self.seed,
@@ -550,6 +567,8 @@ pub struct EngineOpts {
     pub wait: WaitPolicy,
     /// Progress fractions of the engine stage.
     pub span: (f64, f64),
+    /// Attention schedule name (`dense`, `ours+sage`, etc.).
+    pub engine_schedule: String,
 }
 
 impl EngineOpts {
@@ -560,6 +579,7 @@ impl EngineOpts {
             resize: ResizeMode::default(),
             wait: WaitPolicy::from_env(),
             span: (0.02, 0.15),
+            engine_schedule: "dense".into(),
         }
     }
 }
@@ -634,7 +654,12 @@ fn pose_frames_in(
         )?;
         mem.waited_s += waited;
         let nn = Arc::new(spl_nn::Nn::open()?);
-        let e = VggtEngine::load(nn, weights, VggtConfig::default())
+        let schedule = AttnSchedule::named(&opts.engine_schedule)?;
+        let vcfg = VggtConfig {
+            schedule,
+            ..VggtConfig::default()
+        };
+        let e = VggtEngine::load(nn, weights, vcfg)
             .with_context(|| format!("load VGGT-Omega from {}", weights.display()))?;
         *slot = Some((weights.to_path_buf(), e));
     }
@@ -963,7 +988,10 @@ pub fn reconstruct_with(
     let engined = pose_frames(
         weights,
         &frames,
-        &EngineOpts::new(cfg.keep_engine, cfg.engine_max_frames as usize),
+        &EngineOpts {
+            engine_schedule: cfg.engine_schedule.clone(),
+            ..EngineOpts::new(cfg.keep_engine, cfg.engine_max_frames as usize)
+        },
         cancel,
         events,
     )?;

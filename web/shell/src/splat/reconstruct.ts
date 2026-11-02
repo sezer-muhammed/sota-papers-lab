@@ -12,17 +12,24 @@ export const RECONSTRUCT_OP = "image_to_3d.reconstruct";
 export const GENERATE_OP = "image_to_3d.generate";
 
 export type Mode = "auto" | "scene" | "object";
-export type Preset = "fast" | "quality";
+export type Preset = "fast" | "quality" | "big";
+export type LicenceProfile = "research" | "commercial";
+export type EngineSchedule = "dense" | "ours+sage";
 
 export type ReconstructOptions = {
   mode: Mode;
   preset: Preset;
   mesh: boolean;
+  profile: LicenceProfile;
+  engineSchedule: EngineSchedule;
   /** Frames sampled from a video, or photos kept from a big set. */
   maxImages: number;
 };
 
-export const DEFAULT_RECONSTRUCT: ReconstructOptions = { mode: "auto", preset: "quality", mesh: false, maxImages: 200 };
+export const DEFAULT_RECONSTRUCT: ReconstructOptions = {
+  mode: "auto", preset: "quality", mesh: false,
+  profile: "research", engineSchedule: "dense", maxImages: 200,
+};
 
 export type ReconstructInput = {
   /** Photo artifacts, in the order the user gave them. */
@@ -32,6 +39,8 @@ export type ReconstructInput = {
   mode: Mode;
   preset: Preset;
   mesh: boolean;
+  profile: LicenceProfile;
+  engine_schedule?: string;
   max_images: number;
 };
 
@@ -45,6 +54,8 @@ export type ReconstructOutput = {
   points?: ArtifactRef;
   eval?: { psnr?: number; ssim?: number; lpips?: number };
   summary?: { total_s?: number; final_gaussians?: number; images?: number };
+  engine?: string;
+  licence?: string;
 };
 
 export function reconstructInput(
@@ -56,6 +67,8 @@ export function reconstructInput(
     mode: o.mode,
     preset: o.preset,
     mesh: o.mesh,
+    profile: o.profile,
+    engine_schedule: o.engineSchedule === "dense" ? undefined : o.engineSchedule,
     max_images: o.maxImages,
   };
 }

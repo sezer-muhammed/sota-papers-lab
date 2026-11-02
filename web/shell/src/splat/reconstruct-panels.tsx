@@ -8,6 +8,8 @@ import {
   STAGE_LABEL,
   pickFiles,
   stageStates,
+  type EngineSchedule,
+  type LicenceProfile,
   type LiveNumbers,
   type Mode,
   type Picked,
@@ -23,11 +25,33 @@ type Input = "media" | "colmap";
 const PRESETS: { value: Preset; label: string }[] = [
   { value: "fast", label: "Fast" },
   { value: "quality", label: "Quality" },
+  { value: "big", label: "Big" },
 ];
 
 const PRESET_NOTE: Record<Preset, string> = {
   fast: "Fewer iterations and Gaussians: a preview in about a minute.",
   quality: "The full schedule: best quality, a few minutes on this GPU.",
+  big: "Maximum Gaussians and iterations: highest fidelity, longest training.",
+};
+
+const PROFILES: { value: LicenceProfile; label: string }[] = [
+  { value: "research", label: "Research" },
+  { value: "commercial", label: "Commercial" },
+];
+
+const PROFILE_NOTE: Record<LicenceProfile, string> = {
+  research: "VGGT-Ω pose engine (FAIR-NC licence, research only).",
+  commercial: "DA3-BASE pose engine (Apache-2.0, commercial use OK).",
+};
+
+const SCHEDULES: { value: EngineSchedule; label: string }[] = [
+  { value: "dense", label: "Dense" },
+  { value: "ours+sage", label: "Fast" },
+];
+
+const SCHEDULE_NOTE: Record<EngineSchedule, string> = {
+  dense: "Full dense attention: best accuracy, more VRAM.",
+  "ours+sage": "Sparse + SAGE attention: faster, lower VRAM.",
 };
 
 const MODES: { value: Mode; label: string }[] = [
@@ -269,6 +293,30 @@ export function NewScenePanel({
                   onCheckedChange={(mesh) => setOptions({ ...options, mesh })}
                 />
               )}
+              <div className="space-y-2">
+                <p className="text-[14px] font-medium text-[var(--ds-gray-1000)]">Licence</p>
+                <SegmentedControl<LicenceProfile>
+                  label="Licence profile"
+                  value={options.profile}
+                  disabled={busy}
+                  onChange={(profile) => setOptions({ ...options, profile })}
+                  options={PROFILES}
+                />
+                <p className={text.caption}>{PROFILE_NOTE[options.profile]}</p>
+              </div>
+              {options.profile === "research" && (
+                <div className="space-y-2">
+                  <p className="text-[14px] font-medium text-[var(--ds-gray-1000)]">Attention</p>
+                  <SegmentedControl<EngineSchedule>
+                    label="Engine schedule"
+                    value={options.engineSchedule}
+                    disabled={busy}
+                    onChange={(engineSchedule) => setOptions({ ...options, engineSchedule })}
+                    options={SCHEDULES}
+                  />
+                  <p className={text.caption}>{SCHEDULE_NOTE[options.engineSchedule]}</p>
+                </div>
+              )}
             </>
           ) : (
             <>
@@ -384,6 +432,8 @@ export function ReconstructResult({ out }: { out: ReconstructOutput }) {
   if (out.eval?.psnr !== undefined) rows.push(["PSNR", `${out.eval.psnr.toFixed(2)} dB`]);
   if (out.eval?.ssim !== undefined) rows.push(["SSIM", out.eval.ssim.toFixed(4)]);
   if (out.eval?.lpips !== undefined) rows.push(["LPIPS", out.eval.lpips.toFixed(3)]);
+  if (out.engine) rows.push(["engine", out.engine]);
+  if (out.licence) rows.push(["licence", out.licence]);
   const all: [string, string, ArtifactRef | undefined][] = [
     ["SPZ", "scene.spz", out.spz],
     ["PLY", "scene.ply", out.ply],

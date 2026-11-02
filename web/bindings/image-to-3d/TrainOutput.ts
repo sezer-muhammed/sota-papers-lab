@@ -9,12 +9,12 @@ export type TrainOutput = { scene: SceneInfo, summary?: TrainSummary,
 /**
  * Mean over the test views.
  */
-eval?: ImageMetrics, ply?: ArtifactRef, spz?: ArtifactRef, colmap?: ArtifactRef,
+eval?: ImageMetrics, ply?: ArtifactRef, spz?: ArtifactRef, colmap?: ArtifactRef, 
 /**
  * What the run gave up because other processes held GPU memory
  * (fewer Gaussians, smaller images); empty on the quality path.
  */
-gpu_memory: Array<string>,
+gpu_memory: Array<string>, 
 /**
  * Seconds spent waiting for GPU memory.
  */

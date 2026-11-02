@@ -25,6 +25,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::ensure;
 use schemars::JsonSchema;
@@ -35,8 +36,8 @@ use ts_rs::TS;
 
 use crate::engine::{Engine, EngineOut, LicenceProfile};
 use crate::io::images::Rgb8Image;
-use crate::reconstruct::pipeline::{EngineOpts, Event, Frames, pose_frames};
-use crate::vggt::{DenseHost, Prepared, ResizeMode, VggtCameras, VggtEngine};
+use crate::reconstruct::pipeline::Event;
+use crate::vggt::{DenseHost, Prepared, ResizeMode, VggtCameras, VggtConfig, VggtEngine};
 
 fn default_max_frames() -> u32 {
     64
@@ -155,7 +156,7 @@ impl Op for Pose {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let job = tokio::task::spawn_blocking(move || -> Result<_> {
             let mut progress = |stage: &str, f: f32| {
-                let _ = tx.send(Event::Progress(f, stage.to_string()));
+                let _ = tx.send(Event::Progress(f as f64, stage.to_string()));
             };
             if let Some(dir) = da3_dir {
                 unload_engine();
@@ -199,7 +200,7 @@ impl Op for Pose {
             dense,
             times,
         } = out;
-        let coexist = vram::Coexist::default();
+        let coexist = crate::vram::Coexist::default();
         cx.log(format!(
             "engine {} (weights licence {}; sha256 {})",
             info.engine,
@@ -267,6 +268,13 @@ impl Op for Pose {
             weights_sha256: info.weights_sha256,
         })
     }
+}
+
+type EngineSlot = Mutex<Option<(PathBuf, VggtEngine)>>;
+
+fn engine_slot() -> &'static EngineSlot {
+    static SLOT: OnceLock<EngineSlot> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
 }
 
 fn weights_path(cx: &RunCx) -> Result<PathBuf> {

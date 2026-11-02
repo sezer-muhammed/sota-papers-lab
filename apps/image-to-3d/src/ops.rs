@@ -397,7 +397,7 @@ fn train_blocking(
     scene: Scene,
     cfg: TrainConfig,
     do_eval: bool,
-    mesh_cfg: &Option<crate::mesh::MeshConfig>,
+    mesh_cfg: &Option<crate::mesh::pipeline::MeshConfig>,
     mesh_views: &[View],
     cancel: &spl_core::CancellationToken,
     tx: &tokio::sync::mpsc::UnboundedSender<Progress>,
