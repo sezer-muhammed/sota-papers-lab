@@ -6,4 +6,16 @@ export type PoseOutput = { frames: number,
 /**
  * Model resolution (pixels of the preprocessed frames).
  */
-width: number, height: number, cameras: ArtifactRef, colmap: ArtifactRef, points: ArtifactRef, point_count: number, times: PoseTimes, };
+width: number, height: number, cameras: ArtifactRef, colmap: ArtifactRef, points: ArtifactRef, point_count: number, times: PoseTimes, 
+/**
+ * The front end that ran (`vggt-omega-1b-512`, `da3-base`).
+ */
+engine: string, 
+/**
+ * Licence of its weights (SPDX id or name).
+ */
+licence: string, 
+/**
+ * SHA-256 of the source weights, when the engine records it.
+ */
+weights_sha256?: string, };

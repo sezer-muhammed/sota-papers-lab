@@ -21,6 +21,7 @@
 //! - trainer (E7): `gpu.rs`, `frame.rs`, `rng.rs`, `presets.rs`,
 //!   `trainer.rs`, `ops.rs`, `refine.rs`, `io/*`, `testkit/*`
 
+pub mod engine;
 pub mod eval;
 pub mod export;
 pub mod frame;

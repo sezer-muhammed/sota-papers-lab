@@ -555,6 +555,8 @@ fn gpu_pose_op_vs_colmap() {
     let input: pose::PoseInput = serde_json::from_value(serde_json::json!({
         "dataset": rel_images,
         "max_frames": frames,
+        // `commercial` runs DA3-BASE from `$SPL_DA3_DIR` (engine/gpu_tests.rs).
+        "profile": std::env::var("SPL_POSE_PROFILE").unwrap_or("research".into()),
     }))
     .unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();

@@ -1,0 +1,19 @@
+[package]
+name = "spl-ort"
+description = "ONNX Runtime on CUDA for model front ends: one process-wide environment loaded at runtime, CUDA execution-provider sessions, device-resident tensors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `load-dynamic`: libonnxruntime.so is opened at runtime ($ORT_DYLIB_PATH), so
+# the crate compiles everywhere and nothing is downloaded at build time (the
+# prebuilt binaries ort would fetch target CUDA 13; we run CUDA 12.8). api-23
+# = ONNX Runtime 1.23, the newest release whose default GPU build is CUDA 12.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "cuda", "half", "api-23"] }
+half = "2"
+spl-core.workspace = true
+
+[lints]
+workspace = true

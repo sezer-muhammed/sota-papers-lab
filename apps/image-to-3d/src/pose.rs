@@ -10,6 +10,11 @@
 //! cameras in slot `cameras`. GPU-exclusive: the engine takes most of the
 //! card.
 //!
+//! `profile` picks the front end ([`crate::engine`]): `research` (default)
+//! runs VGGT-Ω, `commercial` runs DA3-BASE (Apache-2.0) on ONNX Runtime and
+//! loads nothing non-commercial. The output records the engine, its weights
+//! licence and hash.
+//!
 //! The engine is loaded once per process and reused by later runs.
 //! Weights: `$SPL_VGGT_WEIGHTS`, else
 //! `<data dir>/models/vggt-omega/vggt_omega_1b_512.safetensors` (converted
@@ -27,6 +32,7 @@ use spl_core::media;
 use spl_core::{ArtifactKind, ArtifactRef, Context, DataDir, GpuUse, Op, Result, RunCx, anyhow};
 use ts_rs::TS;
 
+use crate::engine::{Engine, EngineOut, LicenceProfile};
 use crate::io::images::Rgb8Image;
 use crate::vggt::{DenseHost, Prepared, ResizeMode, VggtCameras, VggtConfig, VggtEngine};
 
@@ -73,6 +79,10 @@ pub struct PoseInput {
     pub conf_percentile: f32,
     #[serde(default = "default_max_points")]
     pub max_points: u32,
+    /// Licence profile: `research` (VGGT-Ω, non-commercial research use
+    /// only) or `commercial` (DA3-BASE, Apache-2.0).
+    #[serde(default)]
+    pub profile: LicenceProfile,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, TS)]
@@ -99,14 +109,20 @@ pub struct PoseOutput {
     pub points: ArtifactRef,
     pub point_count: u32,
     pub times: PoseTimes,
+    /// The front end that ran (`vggt-omega-1b-512`, `da3-base`).
+    pub engine: String,
+    /// Licence of its weights (SPDX id or name).
+    pub licence: String,
+    /// SHA-256 of the source weights, when the engine records it.
+    #[ts(optional)]
+    pub weights_sha256: Option<String>,
 }
 
 pub struct Pose;
 
 impl Op for Pose {
     const ID: &'static str = "image_to_3d.pose";
-    const SUMMARY: &'static str =
-        "Cameras and a coloured point cloud from photos or a video (native VGGT-Omega)";
+    const SUMMARY: &'static str = "Cameras and a coloured point cloud from photos or a video (VGGT-Omega, or DA3-BASE in the commercial profile)";
     const GPU: GpuUse = GpuUse::Exclusive;
 
     type Input = PoseInput;
@@ -123,11 +139,22 @@ impl Op for Pose {
             frames.len()
         ));
 
-        let weights = weights_path(cx)?;
         let cancel = cx.cancel.clone();
         let resize = input.resize;
+        let (weights, da3_dir) = match input.profile {
+            LicenceProfile::Research => (weights_path(cx)?, None),
+            LicenceProfile::Commercial => (PathBuf::new(), Some(crate::engine::da3_dir(cx)?)),
+        };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, f32)>();
         let job = tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut progress = |stage: &str, f: f32| {
+                let _ = tx.send((stage.to_string(), f));
+            };
+            if let Some(dir) = da3_dir {
+                unload_engine();
+                return crate::engine::infer_commercial(&dir, &frames, &cancel, &mut progress);
+            }
+            crate::engine::unload_commercial();
             let mut slot = engine_slot()
                 .lock()
                 .map_err(|_| anyhow!("engine lock poisoned"))?;
@@ -144,13 +171,8 @@ impl Op for Pose {
             let load_s = t.elapsed().as_secs_f64();
             let engine = &mut engine.1;
             engine.cfg.resize = resize;
-            let prepared = engine.preprocess(&frames)?;
-            let mut progress = |stage: &str, f: f32| {
-                let _ = tx.send((stage.to_string(), f));
-            };
-            let cams = engine.run(&prepared, &cancel, &mut progress)?;
-            let dense = engine.download(&prepared.geom)?;
-            Ok((prepared, cams, dense, engine.times.clone(), load_s))
+            let out = engine.infer(&frames, &cancel, &mut progress)?;
+            Ok((out, load_s, engine.info()))
         });
         let forward = async {
             while let Some((stage, f)) = rx.recv().await {
@@ -158,9 +180,21 @@ impl Op for Pose {
             }
         };
         let (res, ()) = tokio::join!(job, forward);
-        let (prepared, cams, dense, times, load_s) = res??;
+        let (out, load_s, info) = res??;
+        let EngineOut {
+            prepared,
+            cameras: cams,
+            dense,
+            times,
+        } = out;
+        cx.log(format!(
+            "engine {} (weights licence {}; sha256 {})",
+            info.engine,
+            info.licence,
+            info.weights_sha256.as_deref().unwrap_or("not recorded")
+        ));
         cx.metric("frames", cams.pose_enc.len() as f64, "");
-        cx.metric("forward_time", times.total_ms as f64, "ms");
+        cx.metric("forward_time", times.forward_ms as f64, "ms");
         cx.metric("trunk_time", times.trunk_ms as f64, "ms");
 
         cx.progress(0.9, "writing outputs");
@@ -208,11 +242,14 @@ impl Op for Pose {
             times: PoseTimes {
                 decode_s,
                 load_s,
-                forward_ms: times.total_ms,
+                forward_ms: times.forward_ms,
                 trunk_ms: times.trunk_ms,
-                heads_ms: times.camera_ms + times.dense_ms,
+                heads_ms: times.dense_ms,
                 wall_s: started.elapsed().as_secs_f64(),
             },
+            engine: info.engine,
+            licence: info.licence,
+            weights_sha256: info.weights_sha256,
         })
     }
 }
