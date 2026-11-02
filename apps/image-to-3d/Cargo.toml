@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 spl-core.workspace = true
 spl-gpu.workspace = true
+spl-nn.workspace = true
 tempfile = "3"
 tokio.workspace = true
 tracing.workspace = true
