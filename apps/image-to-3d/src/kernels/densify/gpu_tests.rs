@@ -1407,8 +1407,8 @@ fn gpu_bench_densify() {
         });
         for rep in 0..=reps.min(5) {
             g.upload(&gpu, &hh).unwrap();
+            // What the strategy moves: parameters and moments.
             let mut extra = PerGaussianArrays::new();
-            extra.add_grads(&s, &mut grads);
             extra.add_moments(&s, &mut adam_like, cap as u32);
             gpu.sync().unwrap();
             timer.start(&s).unwrap();
