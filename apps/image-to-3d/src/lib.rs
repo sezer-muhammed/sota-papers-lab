@@ -20,11 +20,13 @@
 //! - densify (E6): `kernels/densify.rs`, `model.rs`, `cuda/{densify,compact,mcmc}.cu`
 //! - trainer (E7): `gpu.rs`, `frame.rs`, `rng.rs`, `presets.rs`,
 //!   `trainer.rs`, `ops.rs`, `refine.rs`, `io/*`, `testkit/*`
+//! - ingest (A0): `ingest/*`, `cuda/ingest.cu`
 
 pub mod eval;
 pub mod export;
 pub mod frame;
 pub mod gpu;
+pub mod ingest;
 pub mod io;
 pub mod kernels;
 pub mod model;
