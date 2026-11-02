@@ -1312,6 +1312,50 @@ fn gpu_bench_densify() {
             (oc, cf, sf, vec![0f32; n])
         };
         upload_plan(&gpu, &mut w.plan, &oc, &cf, &sf, &pri);
+        {
+            // What the strategies move: parameters and moments (gradients of groups that
+            // stepped and the statistics zeroed after the step are skipped).
+            let mut extra = PerGaussianArrays::new();
+            extra.add_moments(&s, &mut moments, cap as u32);
+            let words = extra.words() + 59 + 1;
+            let timer = GpuTimer::new(&gpu).unwrap();
+            let mut samples = Vec::new();
+            for rep in 0..=reps {
+                g.n = nn;
+                w.plan.n_before = nn;
+                timer.start(&s).unwrap();
+                w.compactor
+                    .emit(&gpu, &mut w.plan, &mut g, &extra, Philox::new(1), 600)
+                    .unwrap();
+                let ms = timer.stop_ms(&s).unwrap() as f64;
+                if rep > 0 {
+                    samples.push(ms);
+                }
+            }
+            put(
+                &format!("emit strategy ({words} words/G)"),
+                Stats::from_samples(&samples),
+                n as f64 * words as f64 * 4.0 * 4.0,
+            );
+            g.n = nn;
+            // Morton over the same arrays, from a random order (the first sort of a run;
+            // later sorts start near-sorted) and again from sorted (steady state).
+            let timer = GpuTimer::new(&gpu).unwrap();
+            timer.start(&s).unwrap();
+            w.compactor.morton_sort(&gpu, &mut g, &extra).unwrap();
+            let cold = timer.stop_ms(&s).unwrap() as f64;
+            put(
+                &format!("morton strategy random ({words} w)"),
+                Stats::from_samples(&[cold]),
+                n as f64 * (words as f64 * 4.0 * 4.0 + 52.0),
+            );
+            let t = timed(&gpu, reps, || w.compactor.morton_sort(&gpu, &mut g, &extra));
+            put(
+                &format!("morton strategy sorted ({words} w)"),
+                t,
+                n as f64 * (words as f64 * 4.0 * 4.0 + 52.0),
+            );
+        }
         let words;
         {
             let mut extra = PerGaussianArrays::new();
@@ -1348,33 +1392,6 @@ fn gpu_bench_densify() {
                 t,
                 n as f64 * (words as f64 * 4.0 * 4.0 + 12.0 + 40.0),
             );
-        }
-        {
-            // What the strategies move: parameters and moments (gradients of groups that
-            // stepped and the statistics zeroed after the step are skipped).
-            let mut extra = PerGaussianArrays::new();
-            extra.add_moments(&s, &mut moments, cap as u32);
-            let words = extra.words() + 59 + 1;
-            let timer = GpuTimer::new(&gpu).unwrap();
-            let mut samples = Vec::new();
-            for rep in 0..=reps {
-                g.n = nn;
-                w.plan.n_before = nn;
-                timer.start(&s).unwrap();
-                w.compactor
-                    .emit(&gpu, &mut w.plan, &mut g, &extra, Philox::new(1), 600)
-                    .unwrap();
-                let ms = timer.stop_ms(&s).unwrap() as f64;
-                if rep > 0 {
-                    samples.push(ms);
-                }
-            }
-            put(
-                &format!("emit strategy ({words} words/G)"),
-                Stats::from_samples(&samples),
-                n as f64 * words as f64 * 4.0 * 4.0,
-            );
-            g.n = nn;
         }
         // FastGS bookkeeping: opacity clamp with moments.
         let mut adam_like = moments;
