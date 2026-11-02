@@ -21,4 +21,8 @@ snapshot_every_s?: number,
 /**
  * Test-view PSNR every n iterations; off when absent.
  */
-eval_every?: number, };
+eval_every?: number, 
+/**
+ * Gaussian capacity ceiling; free VRAM decides when absent.
+ */
+max_gaussians?: number, };

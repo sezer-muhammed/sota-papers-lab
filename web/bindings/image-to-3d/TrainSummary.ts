@@ -15,6 +15,14 @@ peak_vram_bytes: number, graph_captures: number, densify_steps: number, capped: 
  */
 raster_regrows: number, 
 /**
+ * Most Gaussians alive at once.
+ */
+peak_gaussians: number, 
+/**
+ * Fixed Gaussian capacity the run allocated (spec-train 5.10).
+ */
+capacity: number, 
+/**
  * Mean training loss over the last progress window.
  */
 final_loss?: number, };
