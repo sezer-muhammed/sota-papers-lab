@@ -634,8 +634,11 @@ fn gpu_parity_with_oracle() {
 #[ignore]
 fn gpu_bench_engine() {
     let mut e = engine();
+    let only = std::env::var("SPL_VGGT_BENCH_SETS").unwrap_or_default();
     for set in ["t1", "t2", "g8", "t32"] {
-        if !oracle_dir().join(set).is_dir() {
+        if !oracle_dir().join(set).is_dir()
+            || !(only.is_empty() || only.split(',').any(|s| s == set))
+        {
             continue;
         }
         let p = prepared_from_oracle(set);
