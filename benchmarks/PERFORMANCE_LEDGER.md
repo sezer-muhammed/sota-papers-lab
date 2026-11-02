@@ -52,6 +52,7 @@ Hardware for every row unless stated: NVIDIA RTX 4070 SUPER (12 GB, sm_89), driv
 | Date | Benchmark | Ours | Reference | Note | Status | Source |
 |---|---|---|---|---|---|---|
 | 2026-11-02 | DTU Chamfer, scans 24/37/40/55/63 | mean 1.23 mm; training 109–197 s plus 3–4 s meshing per scan | published, not run by us: 3DGS 2.18 mm (11.2 min), 2DGS 0.64 (10.9 min), GOF 0.64 (2 h), PGSR 0.48 (0.5 h) | better than 3DGS; behind 2DGS/GOF/PGSR in accuracy; do not claim SOTA mesh accuracy | verified for ours (GPU lock held for training) | mesh-mode, 5eeb283 |
+| 2026-11-02 | DTU Chamfer, scans 24/37/40/55/63 (Geometry preset + PGSR plane depth + multi-view geometric/NCC terms; eval culls with the IDR object silhouettes as 2DGS does) | 0.47 / 0.79 / 0.35 / 0.40 / 0.81 mm, mean 0.56 mm; training 194 / 216 / 256 / 96 / 123 s (30k iterations) plus 2.4–3.0 s meshing | published, not run by us: 2DGS 0.64 mm (10.9 min), GOF 0.64 (2 h), PGSR 0.48 (0.5 h). Same GPU, our round-1 config on scan 24 with the same eval: 1.02 mm | better than published 2DGS mean at ~1/3 of its time; behind PGSR (scans 37 and 63 worst) | training times: scans 24/40/63 GPU lock held; 37/55 lock timed out (shared GPU, preliminary) | mesh-mode-2 |
 
 Not a win (do not market): Morton re-sort from random order is slower than Faster-GS (8.94 vs 6.21 ms at 1M; 96.1 vs 49.4 ms at 6M).
 
