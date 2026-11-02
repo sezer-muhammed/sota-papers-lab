@@ -27,6 +27,7 @@ use super::geom::{
 };
 use super::scene::Posed;
 use crate::io::images::Rgb8Image;
+use crate::io::scene::InitPoints;
 
 type M3 = [[f64; 3]; 3];
 type V3 = [f64; 3];
@@ -686,7 +687,7 @@ pub fn bundle_adjust(
     frames: &[usize],
     images: &[&Rgb8Image],
     cfg: &BaConfig,
-) -> BaReport {
+) -> (BaReport, InitPoints) {
     let t0 = std::time::Instant::now();
     let n = frames.len();
     let mut rep = BaReport {
@@ -695,7 +696,7 @@ pub fn bundle_adjust(
         ..Default::default()
     };
     if cfg.iters == 0 || n < 2 || images.len() != n {
-        return rep;
+        return (rep, InitPoints::default());
     }
     let ds = cfg.downscale.max(1) as usize;
     let pyr: Vec<Vec<Gray>> = images
@@ -795,7 +796,7 @@ pub fn bundle_adjust(
     rep.observations = obs.len();
     rep.track_s = t0.elapsed().as_secs_f64();
     if obs.len() < 100 {
-        return rep;
+        return (rep, InitPoints::default());
     }
 
     // LM on the reduced camera system.
@@ -875,8 +876,36 @@ pub fn bundle_adjust(
     }
     let all: Vec<usize> = (0..p.frames()).collect();
     p.reproject(&all);
+    // Triangulated tracks (seen by at least two other frames) as SfM-style
+    // init points, coloured from their anchor image.
+    let mut seen = vec![0u32; points.len()];
+    obs.iter().for_each(|o| seen[o.point] += 1);
+    let mut cloud = InitPoints::default();
+    let (fx, fy) = (k.fx * s.exp(), k.fy * s.exp());
+    for (pt, &c) in points.iter().zip(&seen) {
+        if c < 2 {
+            continue;
+        }
+        let pa = &poses[pt.anchor];
+        let z = 1.0 / pt.rho;
+        let q = [(pt.u - k.cx) / fx * z, (pt.v - k.cy) / fy * z, z];
+        let x = mv(
+            &transpose(&pa.r),
+            [q[0] - pa.t[0], q[1] - pa.t[1], q[2] - pa.t[2]],
+        );
+        let img = images[pt.anchor];
+        let (px, py) = (
+            ((pt.u * ds as f64) as usize).min(img.width as usize - 1),
+            ((pt.v * ds as f64) as usize).min(img.height as usize - 1),
+        );
+        let o = (py * img.width as usize + px) * 3;
+        cloud.xyz.push(x.map(|v| v as f32));
+        cloud
+            .rgb
+            .push([img.data[o], img.data[o + 1], img.data[o + 2]]);
+    }
     rep.solve_s = t1.elapsed().as_secs_f64();
-    rep
+    (rep, cloud)
 }
 
 #[cfg(test)]

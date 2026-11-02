@@ -118,6 +118,11 @@ ba_iters: number, ba_keypoints: number, ba_neighbours: number,
  */
 ba_focal: boolean, 
 /**
+ * Init from the BA's triangulated tracks: 0 = no, 1 = only them, 2 =
+ * added to the engine points.
+ */
+init_ba: number, 
+/**
  * Above 0: a second BA round without observations off by more (half-res px).
  */
 ba_reject_px: number, 

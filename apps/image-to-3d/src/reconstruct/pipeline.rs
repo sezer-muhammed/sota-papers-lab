@@ -144,6 +144,10 @@ pub struct PipelineConfig {
     /// Also refine the shared focal in the BA.
     #[serde(default = "default_true")]
     pub ba_focal: bool,
+    /// Init from the BA's triangulated tracks: 0 = no, 1 = only them, 2 =
+    /// added to the engine points.
+    #[serde(default)]
+    pub init_ba: u32,
     /// Above 0: a second BA round without observations off by more (half-res px).
     #[serde(default)]
     pub ba_reject_px: f32,
@@ -181,33 +185,42 @@ fn default_init_tau() -> f32 {
 }
 
 impl PipelineConfig {
-    /// Defaults measured on Mip-NeRF 360 garden (Fast): sparse kNN init from
-    /// engine points beats the voxel init by 0.25 dB; per-image pose Adam at
-    /// 1e-3 over the whole run (decay to 0.1x) beats 1e-4 by 1.5 dB; the
-    /// depth prior is neutral (kept at the design's 0.1 → 0 over 30 %).
+    /// Defaults measured on Mip-NeRF 360 garden (Fast, held-out PSNR after
+    /// coarse-to-fine test-time refinement; mvp-quality-2,
+    /// `benchmarks/image-to-3d/RECONSTRUCT_QUALITY.md`): BA on KLT tracks
+    /// (5 s) takes the training poses from 0.64° to 0.21° median relative
+    /// rotation error against COLMAP, +0.6 dB; keeping the low-confidence
+    /// (far) engine pixels and merging them per distance-adaptive voxel
+    /// before the sparse kNN init, +0.75 dB; per-image pose Adam at 3e-3
+    /// (decay to 0.1×) over the whole run, +0.2 dB over 1e-3. Neutral and
+    /// off: the depth prior (±0.01 dB, 3 s), PPISP on photos (±0 dB, 31 s).
+    ///
+    /// With the BA the pose bootstrap costs Quality 0.27 dB on garden (27.16
+    /// vs 27.43) and 20 s: off in both presets, which now differ only in the
+    /// trainer preset.
     pub fn preset(p: ReconPreset) -> Self {
-        let base = Self {
+        Self {
             preset: p,
             iterations: None,
             seed: 0,
             init_target: 600_000,
             init_points: 150_000,
-            init_conf_drop: 0.2,
+            init_conf_drop: 0.0,
             prune_views: 10,
             prune_tau: 0.5,
             prune_fraction: 0.0,
             pose_refine: true,
             pose_start: 0,
             pose_end: Some(u32::MAX),
-            pose_lr_rot: 1e-3,
-            pose_lr_trans: 1e-3,
+            pose_lr_rot: 3e-3,
+            pose_lr_trans: 3e-3,
             focal_lr: 1e-4,
             pose_lr_final: 0.1,
             ppisp: false,
             bootstrap_iters: 0,
             bootstrap_lr: 3e-3,
             bootstrap_scale: 1,
-            depth_weight: 0.1,
+            depth_weight: 0.0,
             depth_until: 0.3,
             depth_conf_drop: 0.3,
             snapshot_every_s: 8.0,
@@ -220,22 +233,15 @@ impl PipelineConfig {
             geo_scale: true,
             init_min_views: 0,
             init_tau: default_init_tau(),
-            init_voxel: 0.0,
+            init_voxel: 0.01,
             init_oversample: default_oversample(),
             per_image_focal: false,
-            ba_iters: 0,
-            ba_keypoints: default_ba_keypoints(),
-            ba_neighbours: default_ba_neighbours(),
+            ba_iters: 10,
+            ba_keypoints: 512,
+            ba_neighbours: 4,
             ba_focal: true,
-            ba_reject_px: 0.0,
-        };
-        match p {
-            // Pose bootstrap: +0.4 dB on garden for 17 s.
-            ReconPreset::Quality => Self {
-                bootstrap_iters: 5000,
-                ..base
-            },
-            ReconPreset::Fast => base,
+            ba_reject_px: 3.0,
+            init_ba: 0,
         }
     }
 
@@ -774,11 +780,12 @@ pub fn reconstruct_with(
             posed.rescale(cfg.world_spread / s);
         }
     }
+    let mut ba_points = None;
     if cfg.ba_iters > 0 {
         // Every frame takes part (as COLMAP would); training frame 0 is the gauge.
         let order: Vec<usize> = train.iter().chain(&test).copied().collect();
         let imgs: Vec<&Rgb8Image> = order.iter().map(|&i| &frames.trainer[i]).collect();
-        let rep = bundle_adjust(
+        let (rep, pts) = bundle_adjust(
             &mut posed,
             &order,
             &imgs,
@@ -809,6 +816,7 @@ pub fn reconstruct_with(
             rep.track_s,
             rep.solve_s
         )));
+        ba_points = Some(pts);
     }
     // The engine's training cameras: held-out cameras are carried from them.
     let engine_train = {
@@ -904,6 +912,8 @@ pub fn reconstruct_with(
     drop(train_imgs);
     let seed_points = if let Some(p) = posed.seed.take() {
         p
+    } else if let (1, Some(p)) = (cfg.init_ba, ba_points.take()) {
+        p
     } else if cfg.init_min_views > 0 {
         let t = Instant::now();
         let pts = consistent_points(
@@ -943,6 +953,11 @@ pub fn reconstruct_with(
             cfg.init_points.max(4096) as usize,
         )
     };
+    let mut seed_points = seed_points;
+    if let (2, Some(p)) = (cfg.init_ba, ba_points.take()) {
+        seed_points.xyz.extend(p.xyz);
+        seed_points.rgb.extend(p.rgb);
+    }
     {
         let (c, r) = extent(train_views.iter().map(View::center));
         let (med, far) = spread_stats(&seed_points, c, r);
