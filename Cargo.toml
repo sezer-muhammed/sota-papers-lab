@@ -17,9 +17,11 @@ spl-gpu = { path = "platform/spl-gpu" }
 spl-data = { path = "platform/spl-data" }
 spl-db = { path = "platform/spl-db" }
 spl-host = { path = "platform/spl-host" }
+spl-nn = { path = "platform/spl-nn" }
 spl-catalog = { path = "catalog", default-features = false }
 
 # apps
+spl-app-image-to-3d = { path = "apps/image-to-3d" }
 spl-app-raw-retouch = { path = "apps/raw-retouch" }
 spl-app-device-info = { path = "apps/device-info" }
 
