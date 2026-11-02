@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use spl_core::ArtifactKind;
+use spl_core::{ArtifactKind, media};
 use spl_host::{Config, Host};
 
 #[derive(Parser)]
@@ -39,13 +39,17 @@ enum Command {
         #[arg(long, default_value = "{}")]
         input: String,
     },
-    /// Store a file as a `blob` artifact, recording its file name, and print
-    /// the artifact reference (its `id` is what op inputs take).
+    /// Store a file as an artifact, recording its file name, and print the
+    /// artifact reference (its `id` is what op inputs take). The file is
+    /// copied, never read into memory, so videos of any size work.
     Put {
         file: PathBuf,
         /// Media type; guessed from the extension when omitted.
         #[arg(long)]
         media_type: Option<String>,
+        /// Artifact kind: blob, image, splat, mesh, cameras, ...
+        #[arg(long, default_value = "blob")]
+        kind: String,
     },
 }
 
@@ -79,15 +83,28 @@ async fn main() -> Result<()> {
             let run = host.run(&op, serde_json::from_str(&input)?).await?;
             println!("{}", serde_json::to_string_pretty(&run)?);
         }
-        Command::Put { file, media_type } => {
-            let bytes = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+        Command::Put {
+            file,
+            media_type,
+            kind,
+        } => {
+            let kind = ArtifactKind::parse(&kind).with_context(|| {
+                let kinds: Vec<_> = ArtifactKind::ALL.iter().map(|k| k.as_str()).collect();
+                format!("--kind `{kind}` is not one of {}", kinds.join(", "))
+            })?;
             let media_type = media_type.unwrap_or_else(|| guess_media_type(&file).to_owned());
             let meta = file
                 .file_name()
                 .map(|name| serde_json::json!({ "filename": name.to_string_lossy() }));
             let host = Host::open(&config, registry).await?;
+            // A copy in the staging directory moves into the store; the
+            // original stays where it is.
+            let staged = host.staging_file();
+            tokio::fs::copy(&file, staged.path())
+                .await
+                .with_context(|| format!("read {}", file.display()))?;
             let artifact = host
-                .put_artifact(bytes, ArtifactKind::Blob, &media_type, meta)
+                .put_artifact_file(staged.path(), kind, &media_type, meta)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&artifact)?);
         }
@@ -117,22 +134,10 @@ async fn main() -> Result<()> {
 /// Media types for the files people feed this lab; anything else is a
 /// plain byte stream.
 fn guess_media_type(path: &Path) -> &'static str {
-    let extension = path
-        .extension()
+    path.extension()
         .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase);
-    match extension.as_deref() {
-        Some("arw") => "image/x-sony-arw",
-        Some("dng") => "image/x-adobe-dng",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("png") => "image/png",
-        Some("tif" | "tiff") => "image/tiff",
-        Some("webp") => "image/webp",
-        Some("xmp") => "application/rdf+xml",
-        Some("json") => "application/json",
-        Some("txt") => "text/plain",
-        _ => "application/octet-stream",
-    }
+        .and_then(media::from_extension)
+        .unwrap_or(media::OCTET_STREAM)
 }
 
 /// Loopback, or Tailscale's 100.64.0.0/10 range: reachable only from this
