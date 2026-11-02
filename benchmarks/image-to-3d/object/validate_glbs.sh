@@ -1,36 +1,27 @@
 #!/usr/bin/env bash
-# Validate GLB files with the Khronos glTF validator.
+# Validate GLB files with the Khronos glTF validator (npm gltf-validator,
+# a library without a CLI, so it is driven from a small node script).
 # Usage: validate_glbs.sh <directory>
 set -euo pipefail
 
 DIR="${1:?usage: validate_glbs.sh <directory>}"
+TOOL="${TMPDIR:-/tmp}/spl-gltf-validator"
+command -v node >/dev/null || { echo "node not found"; exit 1; }
+[ -d "$TOOL/node_modules/gltf-validator" ] || {
+  mkdir -p "$TOOL" && (cd "$TOOL" && npm init -y >/dev/null && npm i --silent gltf-validator >/dev/null)
+}
 
-if ! command -v npx &>/dev/null; then
-  echo "npx not found. Install Node.js or use: npm i -g gltf-validator"
-  exit 1
-fi
-
-TOTAL=0
-PASS=0
-FAIL=0
-
-for glb in "$DIR"/*.glb; do
-  [ -f "$glb" ] || continue
-  TOTAL=$((TOTAL + 1))
-  name=$(basename "$glb")
-
-  output=$(npx --yes gltf-validator "$glb" 2>&1)
-  errors=$(echo "$output" | grep -c '"severity":0' || true)
-
-  if [ "$errors" -eq 0 ]; then
-    echo "[PASS] $name"
-    PASS=$((PASS + 1))
-  else
-    echo "[FAIL] $name ($errors error(s))"
-    echo "$output" | grep '"message"' | head -3
-    FAIL=$((FAIL + 1))
-  fi
-done
-
-echo ""
-echo "=== $TOTAL GLBs: $PASS passed, $FAIL failed ==="
+NODE_PATH="$TOOL/node_modules" node - "$DIR"/*.glb <<'JS'
+const v = require('gltf-validator'), fs = require('fs');
+(async () => {
+  let fail = 0;
+  for (const f of process.argv.slice(2)) {
+    const r = await v.validateBytes(new Uint8Array(fs.readFileSync(f)), { maxIssues: 20 });
+    const i = r.issues;
+    console.log(`[${i.numErrors ? 'FAIL' : 'PASS'}] ${f} errors=${i.numErrors} warnings=${i.numWarnings} tris=${r.info.totalTriangleCount}`);
+    for (const m of i.messages.filter(m => m.severity === 0).slice(0, 3)) console.log('   ', m.code, m.message);
+    if (i.numErrors) fail++;
+  }
+  process.exit(fail ? 1 : 0);
+})();
+JS

@@ -42,7 +42,7 @@ for nv in 1 2 4; do
             -v "${obj_dir}:/input:ro" \
             -v "${WEIGHTS}:/weights:ro" \
             -v "${tmp_out}:/output" \
-            -v "${SIDECAR_PY}:/opt/spl-p3d/run_mv.py:ro" \
+            -v "$(dirname "${SIDECAR_PY}"):/opt/spl-p3d:ro" \
             ${IMAGE} python /opt/spl-p3d/run_mv.py \
             --input_dir /input \
             --weights_dir /weights \

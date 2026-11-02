@@ -79,6 +79,11 @@ def main():
         low_vram=args.low_vram,
     )
 
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import naf_lowmem
+    naf_lowmem.patch(pipeline)
+    naf_lowmem.patch_cumesh()
+
     torch.cuda.reset_peak_memory_stats()
     t_load = time.time() - t0
     stage_times.append({"name": "load", "seconds": t_load})
@@ -110,6 +115,17 @@ def main():
 
     t_post = time.time()
     mesh = mesh_list[0]
+    peak_inference = torch.cuda.max_memory_allocated() / 1e6
+    # CuMesh allocates with raw cudaMalloc, so blocks cached by PyTorch's
+    # allocator are invisible to it: drop the latents and return the cache
+    # before remeshing, or the 1024 remesh OOMs on a 12 GB card.
+    del mesh_list, shape_slat, tex_slat
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    progress("postprocessing_mem", 0.86,
+             allocated_mb=torch.cuda.memory_allocated() / 1e6,
+             peak_inference_mb=peak_inference)
 
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
