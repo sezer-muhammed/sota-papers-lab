@@ -9,7 +9,8 @@
 //! | `SPL_RECON_PRESET` | `quality` | `fast` or `quality` |
 //! | `SPL_RECON_CONFIG` | none | `PipelineConfig` JSON patch, or an array of patches run one after another on the same ingest (ablations; tags get `-<i>`) |
 //! | `SPL_RECON_HOLDOUT` | 8 | every n-th frame held out (0 = none) |
-//! | `SPL_RECON_TTR` | 200 | test-time pose refinement iterations per view |
+//! | `SPL_RECON_TTR` | coarse to fine | test-time pose refinement iterations per view at full resolution only (the old protocol) |
+//! | `SPL_RECON_TTR_SCHED` | `4:150,2:150,1:200` | coarse-to-fine stages `scale:iters[:lr]`, each scored |
 //! | `SPL_RECON_TTR_LR` | 1e-3 | its rotation LR (translation: same × extent). 3e-3: bicycle Fast +0.4-0.8 dB, garden Quality -0.6 dB; 1e-2 worse |
 //! | `SPL_RECON_MAX_FRAMES` | all | frames (video keyframes) |
 //! | `SPL_RECON_TAG` | `<scene>-<preset>` | output folder name |
@@ -292,7 +293,9 @@ fn run_one(
                     )
                 })
                 .collect(),
-            Err(_) => vec![(1, ttr, ttr_lr)],
+            Err(_) if std::env::var("SPL_RECON_TTR").is_ok() => vec![(1, ttr, ttr_lr)],
+            // Default: coarse to fine (bicycle Fast +1.05 dB, Quality +1.0 dB over 200 full-res steps).
+            Err(_) => vec![(4, 150, ttr_lr), (2, 150, ttr_lr), (1, 200, ttr_lr)],
         };
         let mut ttr_s = 0.0;
         let mut stages = Vec::new();
