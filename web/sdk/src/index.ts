@@ -7,6 +7,8 @@ import type { RunDetail } from "@spl/bindings/RunDetail";
 import type { RunRecord } from "@spl/bindings/RunRecord";
 import type { RunRequest } from "@spl/bindings/RunRequest";
 import type { RunStatus } from "@spl/bindings/RunStatus";
+import type { UploadRequest } from "@spl/bindings/UploadRequest";
+import type { UploadSession } from "@spl/bindings/UploadSession";
 
 export type {
   Announcement,
@@ -18,6 +20,8 @@ export type {
   RunRecord,
   RunRequest,
   RunStatus,
+  UploadRequest,
+  UploadSession,
 };
 export type { RunProgress } from "@spl/bindings/RunProgress";
 export type { GpuInfo } from "@spl/bindings/GpuInfo";
@@ -145,6 +149,52 @@ export class SplClient {
     });
   }
 
+  /** Opens a resumable chunked upload (`POST /v1/uploads`): the file goes up
+      in parts of `part_bytes`, so no request passes a proxy's body limit. */
+  createUpload(request: UploadRequest) {
+    return this.request<UploadSession>("POST", "/v1/uploads", request);
+  }
+
+  /** The parts the host already holds, to resume an upload. */
+  uploadStatus(id: string) {
+    return this.request<UploadSession>("GET", `/v1/uploads/${encodeURIComponent(id)}`);
+  }
+
+  /** Sends part `index` (exactly its bytes); a part sent again replaces itself. */
+  putUploadPart(
+    id: string,
+    index: number,
+    part: Blob,
+    options: { onProgress?: (loaded: number) => void; signal?: AbortSignal } = {},
+  ): Promise<UploadSession> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", `${this.baseUrl}/v1/uploads/${encodeURIComponent(id)}/parts/${index}`);
+      xhr.setRequestHeader("content-type", "application/octet-stream");
+      if (this.token) xhr.setRequestHeader("authorization", `Bearer ${this.token}`);
+      xhr.responseType = "json";
+      xhr.upload.onprogress = (event) => options.onProgress?.(event.loaded);
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response as UploadSession);
+        else reject(new SplError(xhr.status, xhr.response?.error ?? xhr.statusText));
+      };
+      xhr.onerror = () => reject(new TypeError("The host did not answer."));
+      xhr.onabort = () => reject(new DOMException("Upload cancelled", "AbortError"));
+      options.signal?.addEventListener("abort", () => xhr.abort(), { once: true });
+      xhr.send(part);
+    });
+  }
+
+  /** Assembles the parts into an artifact; 409 while parts are missing. */
+  completeUpload(id: string) {
+    return this.request<ArtifactRef>("POST", `/v1/uploads/${encodeURIComponent(id)}/complete`);
+  }
+
+  /** Drops an upload and its parts. */
+  abortUpload(id: string) {
+    return this.request<void>("DELETE", `/v1/uploads/${encodeURIComponent(id)}`);
+  }
+
   runs(filter: { op?: string; limit?: number } = {}) {
     const params = new URLSearchParams();
     if (filter.op) params.set("op", filter.op);
@@ -211,6 +261,7 @@ export class SplClient {
       const detail = await response.json().catch(() => null);
       throw new SplError(response.status, detail?.error ?? response.statusText);
     }
+    if (response.status === 204) return undefined as T;
     return response.json() as Promise<T>;
   }
 }

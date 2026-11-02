@@ -4,26 +4,34 @@ import type { Health } from "@spl/sdk";
 import { ButtonLink } from "@spl/ui";
 import type { Loaded } from "../api";
 import { PageIntro } from "../components/page-intro";
-import { RunPanel, SourcePanel } from "../splat/panels";
+import { RunPanel } from "../splat/panels";
+import { DEFAULT_RECONSTRUCT, type ReconstructOptions } from "../splat/reconstruct";
+import { NewScenePanel } from "../splat/reconstruct-panels";
+import { useReconstruct } from "../splat/use-reconstruct";
 import { DEFAULT_OPTIONS, useTrain, type TrainOptions } from "../splat/use-train";
 import { SplatViewer, type SplatSource } from "../splat/viewer";
 
-/* #/3d: a COLMAP dataset in, Gaussian splats out, viewed here while they
-   train. #/3d/<run> follows (or re-opens) one run of image_to_3d.train. */
+/* #/3d: photos or a phone video in (image_to_3d.reconstruct, no poses
+   needed), or a COLMAP dataset (image_to_3d.train); Gaussian splats out,
+   viewed here while they form. #/3d/<run> follows (or re-opens) one run. */
 export function SplatPage({ health, runId }: { health: Loaded<Health>; runId?: string }) {
-  const train = useTrain(runId);
-  const [options, setOptions] = useState<TrainOptions>(DEFAULT_OPTIONS);
+  const run = useReconstruct(runId);
+  // Only starts COLMAP runs; `run` watches every run.
+  const zip = useTrain(undefined);
+  const [options, setOptions] = useState<ReconstructOptions>(DEFAULT_RECONSTRUCT);
+  const [trainOptions, setTrainOptions] = useState<TrainOptions>(DEFAULT_OPTIONS);
   // A .ply / .spz opened from disk; shown instead of the run's splats.
   const [local, setLocal] = useState<SplatSource>();
-  const busy = Boolean(train.upload);
-  const source = local ?? train.splat;
+  const busy = Boolean(run.sending || zip.upload);
+  const source = local ?? run.splat;
+  const error = run.error ?? zip.error;
 
   return (
     <div className="space-y-6">
       <PageIntro
         eyebrow="image-to-3d"
         title="Image to 3D"
-        lead="Posed photos in, 3D Gaussian splats out, trained on this GPU. Watch the scene form while it trains, orbit it here, and download it as .spz or .ply."
+        lead="Photos or a phone video in, 3D Gaussian splats out, on this GPU. Cameras and a point cloud show within seconds, then the scene sharpens as it trains. Orbit it, compare any view with its photo, and download .spz, .ply or the cameras."
         action={
           runId ? (
             <ButtonLink icon={Plus} href="#/3d">
@@ -33,25 +41,38 @@ export function SplatPage({ health, runId }: { health: Loaded<Health>; runId?: s
         }
       />
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
-        <SplatViewer source={source} cameras={local ? [] : train.cameras} />
+        <SplatViewer
+          source={source}
+          points={local ? undefined : run.points}
+          cameras={local ? [] : run.cameras}
+          photoFor={local ? undefined : run.photoFor}
+        />
         <div className="space-y-6">
           {runId ? (
             <RunPanel
-              detail={train.detail}
-              error={train.error}
-              snapshot={local ? undefined : train.snapshot}
-              onCancel={() => void train.cancel()}
+              detail={run.detail}
+              error={run.error}
+              snapshot={local ? undefined : run.snapshot}
+              onCancel={() => void run.cancel()}
             />
           ) : (
-            <SourcePanel
+            <NewScenePanel
               busy={busy}
               maxUploadBytes={health.data?.max_upload_bytes}
               options={options}
               setOptions={setOptions}
-              upload={train.upload}
-              onStart={(file) => {
+              trainOptions={trainOptions}
+              setTrainOptions={setTrainOptions}
+              sending={run.sending}
+              onStopSending={run.stopSending}
+              zipUpload={zip.upload}
+              onReconstruct={(picked) => {
                 setLocal(undefined);
-                void train.start(file, options);
+                void run.start(picked, options);
+              }}
+              onTrainZip={(file) => {
+                setLocal(undefined);
+                void zip.start(file, trainOptions);
               }}
               onView={(file) => {
                 const format = file.name.toLowerCase().endsWith(".spz") ? "spz" : "ply";
@@ -61,9 +82,9 @@ export function SplatPage({ health, runId }: { health: Loaded<Health>; runId?: s
               }}
             />
           )}
-          {!runId && train.error ? (
+          {!runId && error ? (
             <p role="alert" className="text-[13px] text-[var(--ds-gray-900)]">
-              {train.error}
+              {error}
             </p>
           ) : null}
         </div>

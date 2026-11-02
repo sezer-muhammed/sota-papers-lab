@@ -109,5 +109,5 @@ SPL_API=http://localhost:7070 pnpm dev  # or the UI with hot reload
 | `SPL_WEB_DIR` | built UI to serve | unset |
 | `SPL_AUTH_TOKEN` | bearer token required on `/v1/*` (not `/v1/health`) | unset |
 | `SPL_MAX_CONCURRENT_RUNS` | ops executing at once; further runs wait as `queued`, in order | `3` |
-| `SPL_MAX_UPLOAD_MB` | largest `POST /v1/artifacts` body, in MiB. Uploads stream to `<data_dir>/staging` and are renamed into the artifact store, so they cost disk, not memory; keep both on one filesystem | `2048` |
+| `SPL_MAX_UPLOAD_MB` | largest `POST /v1/artifacts` body and largest chunked upload (`/v1/uploads`) file, in MiB. Uploads stream to `<data_dir>/staging` and are renamed into the artifact store, so they cost disk, not memory; keep both on one filesystem | `2048` |
 | `SPL_CLAUDE_BIN` | `claude` CLI that ops call; else `PATH`, then `~/.local/bin/claude` | unset (`compose.claude.yaml` sets it) |
