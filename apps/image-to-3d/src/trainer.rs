@@ -431,6 +431,14 @@ impl Trainer {
 
     /// Everything after the optimizer step of iteration `t` (spec-train 1).
     fn hooks(&mut self, t: u32) -> Result<Option<DensifyOutcome>> {
+        let views: Vec<IterParams> = if self.strategy.wants_views(t) {
+            let (deg, res) = (self.schedule.sh_degree(t), self.schedule.res_scale(t));
+            (0..self.scene.views.len())
+                .map(|v| self.iter_params(t, v, deg, res, AdamIterPlan::default()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut cx = DensifyCx {
             gpu: &self.gpu,
             g: &mut self.g,
@@ -443,6 +451,7 @@ impl Trainer {
             extent: self.scene.extent,
             res_scale: self.schedule.res_scale(t),
             rng: self.rng,
+            views: &views,
         };
         let outcome = self.strategy.after_step(&mut cx, t)?;
         let densify = outcome.changed.then_some(outcome);
