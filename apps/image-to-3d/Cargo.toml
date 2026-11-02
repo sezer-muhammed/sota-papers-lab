@@ -10,7 +10,9 @@ publish.workspace = true
 anyhow.workspace = true
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+meshopt = "0.7"
 mozjpeg = { version = "0.10", default-features = false, features = ["parallel"] }
+uvunwrap = { version = "0.3", default-features = false }
 rayon = "1"
 schemars.workspace = true
 serde.workspace = true
