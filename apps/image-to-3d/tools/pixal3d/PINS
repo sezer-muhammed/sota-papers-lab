@@ -1,0 +1,15 @@
+# Pinned commits for the spl-pixal3d image build.
+# Update here and rebuild when upgrading.
+
+PIXAL3D=f7cf384      # TencentARC/Pixal3D@master, MIT
+TRELLIS2=main         # microsoft/TRELLIS.2 (o-voxel + Eigen), MIT
+FLEXGEMM=main         # JeffreyXiang/FlexGEMM, MIT
+CUMESH=main           # JeffreyXiang/CuMesh, MIT
+NVDIFFRAST=v0.4.0     # NVlabs/nvdiffrast, NVIDIA non-commercial (sidecar only)
+NATTEN=0.21.5         # SHI-Labs/NATTEN prebuilt wheel, MIT
+
+# DINOv3 weights: facebook/dinov3-vitl16-pretrain-lvd1689m (gated)
+# or camenduru/dinov3-vitl16-pretrain-lvd1689m (ungated mirror).
+# DINOv3 License: commercial use OK, redistribution under same terms.
+
+# NAF weights: valeoai/NAF naf_release.pth, Apache-2.0

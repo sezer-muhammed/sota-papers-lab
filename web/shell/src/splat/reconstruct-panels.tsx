@@ -81,9 +81,11 @@ export function NewScenePanel({
   const zip = useRef<HTMLInputElement>(null);
   const splat = useRef<HTMLInputElement>(null);
 
+  const isObject = options.mode === "object";
+
   const take = (files: File[]) => {
     if (busy) return;
-    const picked = pickFiles(files);
+    const picked = pickFiles(files, isObject);
     if (picked.kind === "none") return setNote(picked.reason);
     const big = (picked.kind === "photos" ? picked.files : [picked.file]).find(
       (f) => maxUploadBytes && f.size > maxUploadBytes,
@@ -131,8 +133,9 @@ export function NewScenePanel({
           >
             <IconTile icon={Images} />
             <p className={text.caption}>
-              Drop 20 to 200 photos (JPEG, PNG, WebP) walking around the scene, or one phone video (MP4, MOV). No
-              poses needed.
+              {isObject
+                ? "Drop 1 to 4 photos of an object (JPEG, PNG, WebP). Background will be removed; a PBR mesh (.glb) is generated."
+                : "Drop 20 to 200 photos (JPEG, PNG, WebP) walking around the scene, or one phone video (MP4, MOV). No poses needed."}
             </p>
             <Button variant="primary" icon={Upload} disabled={busy} onClick={() => media.current?.click()}>
               Choose photos or video
@@ -240,28 +243,32 @@ export function NewScenePanel({
                 />
                 <p className={text.caption}>{MODE_NOTE[options.mode]}</p>
               </div>
-              <label className="flex flex-col gap-2">
-                <span className="flex items-baseline justify-between text-[14px] font-medium text-[var(--ds-gray-1000)]">
-                  Max images <span className="font-mono text-[13px] font-normal">{options.maxImages}</span>
-                </span>
-                <RangeInput
-                  min={10}
-                  max={400}
-                  step={10}
-                  value={options.maxImages}
+              {!isObject && (
+                <label className="flex flex-col gap-2">
+                  <span className="flex items-baseline justify-between text-[14px] font-medium text-[var(--ds-gray-1000)]">
+                    Max images <span className="font-mono text-[13px] font-normal">{options.maxImages}</span>
+                  </span>
+                  <RangeInput
+                    min={10}
+                    max={400}
+                    step={10}
+                    value={options.maxImages}
+                    disabled={busy}
+                    aria-label="Max images"
+                    onValueChange={(maxImages) => setOptions({ ...options, maxImages })}
+                  />
+                  <span className={text.caption}>Frames taken from a video, or photos kept from a larger set.</span>
+                </label>
+              )}
+              {!isObject && (
+                <Switch
+                  label="Mesh"
+                  description="Also bake a textured .glb mesh (slower)."
+                  checked={options.mesh}
                   disabled={busy}
-                  aria-label="Max images"
-                  onValueChange={(maxImages) => setOptions({ ...options, maxImages })}
+                  onCheckedChange={(mesh) => setOptions({ ...options, mesh })}
                 />
-                <span className={text.caption}>Frames taken from a video, or photos kept from a larger set.</span>
-              </label>
-              <Switch
-                label="Mesh"
-                description="Also bake a textured .glb mesh (slower)."
-                checked={options.mesh}
-                disabled={busy}
-                onCheckedChange={(mesh) => setOptions({ ...options, mesh })}
-              />
+              )}
             </>
           ) : (
             <>
