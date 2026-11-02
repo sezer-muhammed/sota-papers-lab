@@ -2158,6 +2158,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spl-nn"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "spl-core",
+ "spl-gpu",
+]
+
+[[package]]
 name = "sqlx"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
