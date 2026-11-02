@@ -475,12 +475,38 @@ fn gpu_normalize_matches_torch_formula() {
     }
 }
 
+/// Worst rotation angle, translation-direction angle and FoV difference
+/// (degrees) between two `[N][9]` pose encodings.
+fn cam_gates(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+    let n = |q: &[f64]| q.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let (mut rot, mut tdir, mut fov) = (0.0f64, 0.0f64, 0.0f64);
+    for (a, b) in a.chunks(9).zip(b.chunks(9)) {
+        let a: Vec<f64> = a.iter().map(|&v| v as f64).collect();
+        let b: Vec<f64> = b.iter().map(|&v| v as f64).collect();
+        let dot = a[3..7]
+            .iter()
+            .zip(&b[3..7])
+            .map(|(x, y)| x * y)
+            .sum::<f64>()
+            / (n(&a[3..7]) * n(&b[3..7]));
+        rot = rot.max(2.0 * dot.abs().min(1.0).acos().to_degrees());
+        if n(&b[..3]) > 1e-3 {
+            let c = a[..3].iter().zip(&b[..3]).map(|(x, y)| x * y).sum::<f64>()
+                / (n(&a[..3]) * n(&b[..3]));
+            tdir = tdir.max(c.clamp(-1.0, 1.0).acos().to_degrees());
+        }
+        fov = fov.max((a[7] - b[7]).abs().max((a[8] - b[8]).abs()).to_degrees());
+    }
+    (rot, tdir, fov)
+}
+
 struct Parity {
     set: &'static str,
 }
 
 impl Parity {
-    fn run(&self, e: &mut VggtEngine) {
+    /// Returns whether the camera gates hold (asserts everything else).
+    fn run(&self, e: &mut VggtEngine) -> bool {
         let p = prepared_from_oracle(self.set);
         let g = p.geom;
         let cancel = CancellationToken::new();
@@ -505,6 +531,49 @@ impl Parity {
             );
         };
         report("pose_enc.npy", &pe, 1e-2);
+        // Spec §8 absolute gates against the official bf16 path, next to the
+        // official path's own bf16-vs-fp32 distance on the same metric.
+        let (want, fp32) = (ld("bf16", "pose_enc.npy"), ld("fp32", "pose_enc.npy"));
+        let (rot, tdir, fov) = cam_gates(&pe, &want);
+        let (rot32, tdir32, fov32) = cam_gates(&pe, &fp32);
+        let (frot, ftdir, ffov) = cam_gates(&want, &fp32);
+        println!(
+            "{} cameras, ours vs official bf16 / ours vs fp32 / official bf16 vs fp32: rotation {rot:.4} / {rot32:.4} / {frot:.4} deg, translation direction {tdir:.4} / {tdir32:.4} / {ftdir:.4} deg, fov {fov:.4} / {fov32:.4} / {ffov:.4} deg",
+            self.set
+        );
+        // Absolute gate, or the spec's relative rule (no worse than 1.5x the
+        // official path's distance from fp32).
+        let ok =
+            |ours: f64, ours32: f64, floor: f64, gate: f64| ours < gate || ours32 <= 1.5 * floor;
+        let cam_ok =
+            ok(rot, rot32, frot, 0.1) && ok(tdir, tdir32, ftdir, 0.1) && ok(fov, fov32, ffov, 0.05);
+        let db = ld("bf16", "depth.npy");
+        let mut ar: Vec<f32> = dense
+            .depth
+            .iter()
+            .zip(&db)
+            .map(|(x, y)| (x - y).abs() / y.abs().max(1e-6))
+            .collect();
+        ar.sort_by(f32::total_cmp);
+        let cb = ld("bf16", "depth_conf.npy");
+        let mut cr: Vec<f32> = dense
+            .conf
+            .iter()
+            .zip(&cb)
+            .map(|(x, y)| (x - y).abs() / y.abs().max(1e-6))
+            .collect();
+        cr.sort_by(f32::total_cmp);
+        println!(
+            "{} dense: depth abs-rel median {:.3}% (p99 {:.2}%), conf rel median {:.3}%",
+            self.set,
+            100.0 * ar[ar.len() / 2],
+            100.0 * ar[ar.len() * 99 / 100],
+            100.0 * cr[cr.len() / 2]
+        );
+        assert!(
+            ar[ar.len() / 2] < 0.005 && cr[cr.len() / 2] < 0.01,
+            "dense gates"
+        );
         report("depth.npy", &dense.depth, 1e-2);
         report("depth_conf.npy", &dense.conf, 1e-2);
         // Layer by layer: the cached levels hold [F_i | G_i] for i = 4, 23.
@@ -524,12 +593,26 @@ impl Parity {
                     gv.extend(row[1024..].iter().map(|&b| spl_nn::host::bf16_to_f32(b)));
                 }
                 for (name, v) in [(format!("F_{i}.npy"), fv), (format!("G_{i}.npy"), gv)] {
-                    let (eb, _) = rel(&v, &ld("bf16", &name));
-                    println!("{} {name}: rel vs bf16 {eb:.2e}", self.set);
-                    assert!(eb < 1e-2, "{name}: {eb}");
+                    let (b, f) = (ld("bf16", &name), ld("fp32", &name));
+                    let (eb, _) = rel(&v, &b);
+                    let (ef, _) = rel(&v, &f);
+                    let (floor, _) = rel(&b, &f);
+                    // The patch tokens only (what the dense head reads).
+                    let patches = |x: &[f32]| -> Vec<f32> {
+                        x.chunks(t * 1024)
+                            .flat_map(|fr| fr[17 * 1024..].iter().copied())
+                            .collect()
+                    };
+                    let (ep, _) = rel(&patches(&v), &patches(&b));
+                    println!(
+                        "{} {name}: rel vs bf16 {eb:.2e} (patches {ep:.2e}), vs fp32 {ef:.2e}, official bf16-vs-fp32 {floor:.2e}",
+                        self.set
+                    );
+                    assert!(eb < 1e-2 || ef <= 1.5 * floor, "{name}: {eb}");
                 }
             }
         }
+        cam_ok
     }
 }
 
@@ -537,11 +620,13 @@ impl Parity {
 #[ignore]
 fn gpu_parity_with_oracle() {
     let mut e = engine();
+    let mut failed = Vec::new();
     for set in ["t1", "t2", "g8", "t32"] {
-        if oracle_dir().join(set).is_dir() {
-            Parity { set }.run(&mut e);
+        if oracle_dir().join(set).is_dir() && !(Parity { set }).run(&mut e) {
+            failed.push(set);
         }
     }
+    assert!(failed.is_empty(), "camera gates fail on {failed:?}");
 }
 
 /// Median of 10 runs after warm-up per set; prints stage times.
@@ -583,4 +668,45 @@ fn gpu_bench_engine() {
             torch.unwrap_or_default()
         );
     }
+}
+
+/// Camera head on the official `[F_23 | G_23]` rounded to bf16 (the cache
+/// format): separates cache rounding from trunk drift in `pose_enc`.
+#[test]
+#[ignore]
+fn gpu_camera_head_on_bf16_rounded_oracle_cache() {
+    let e = engine();
+    let o = oracle_dir().join("t1");
+    let (s, f) = npy(&o.join("bf16/F_23.npy"));
+    let (_, g) = npy(&o.join("bf16/G_23.npy"));
+    let rows = s[0] * s[1];
+    let mut cache = Vec::with_capacity(rows * 2048);
+    for r in 0..rows {
+        cache.extend(
+            f[r * 1024..(r + 1) * 1024]
+                .iter()
+                .map(|&v| spl_nn::host::bf16(v)),
+        );
+        cache.extend(
+            g[r * 1024..(r + 1) * 1024]
+                .iter()
+                .map(|&v| spl_nn::host::bf16(v)),
+        );
+    }
+    let (_, inp) = npy(&o.join("bf16/input.npy"));
+    let geom = Geometry::new(s[0], (inp.len() / s[0] / 3 / 512).max(1), 512);
+    let dev = e.nn.stream.clone_htod(&cache).unwrap();
+    let mut cams = heads::DeviceCams::new(&e.nn, s[0]).unwrap();
+    let pe = e
+        .camera
+        .run(&e.nn, &dev.slice(..), &geom, &mut cams)
+        .unwrap();
+    let pe: Vec<f32> = pe.iter().flatten().copied().collect();
+    let want = npy(&o.join("bf16/pose_enc.npy")).1;
+    let fp32 = npy(&o.join("fp32/pose_enc.npy")).1;
+    println!(
+        "camera head on bf16-rounded official cache: vs official bf16 {:?}, vs fp32 {:?}",
+        cam_gates(&pe, &want),
+        cam_gates(&pe, &fp32)
+    );
 }
