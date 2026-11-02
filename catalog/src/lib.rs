@@ -10,5 +10,7 @@ pub fn registry() -> Registry {
     spl_app_device_info::register(&mut registry);
     #[cfg(feature = "raw-retouch")]
     spl_app_raw_retouch::register(&mut registry);
+    #[cfg(feature = "image-to-3d")]
+    spl_app_image_to_3d::register(&mut registry);
     registry
 }

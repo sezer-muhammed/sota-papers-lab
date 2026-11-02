@@ -20,6 +20,7 @@ spl-host = { path = "platform/spl-host" }
 spl-catalog = { path = "catalog", default-features = false }
 
 # apps
+spl-app-image-to-3d = { path = "apps/image-to-3d" }
 spl-app-raw-retouch = { path = "apps/raw-retouch" }
 spl-app-device-info = { path = "apps/device-info" }
 
