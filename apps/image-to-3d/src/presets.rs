@@ -33,7 +33,7 @@ pub enum PresetName {
     FastgsBig,
     /// 3DGS-MCMC: quality ceiling and dense-init fallback.
     Mcmc,
-    /// Ours: FastGS-Big with generic thresholds, SH every 500, DashGaussian warm-up.
+    /// Ours: FastGS-Big with generic thresholds.
     #[default]
     Quality,
     /// Ours: Quality with a denser densification budget (target ≥ 27.9 dB in ≤ 6 min).
@@ -218,8 +218,8 @@ impl Preset {
                 ..base
             },
             // Generic thresholds: FastGS-Big medians as the starting point (6.2).
-            // SH every 500 (garden 27.755 vs 27.688 dB at 1000) and the DashGaussian
-            // warm-up (garden 212.6 s vs 252.7 s, same PSNR) from opt-train-2.
+            // The DashGaussian warm-up and SH every 500 cost 0.2-0.9 dB here on the
+            // 13-scene suite (opt-train-2), so Quality keeps round-1 settings.
             PresetName::Quality => Self {
                 densify: DensifyPreset::FastGs(FastGsConfig {
                     grad_abs_thresh: 4e-4,
@@ -231,11 +231,10 @@ impl Preset {
                 // bf16-SR moments: garden 178 s / 27.490 dB vs f32 193 s / 27.491 (opt-train).
                 adam: bf16_adam(),
                 compact_box_beta: 0.5,
-                sh_interval: 500,
-                warmup: true,
                 ..base
             },
-            // Quality with FastGS-Big's garden budget (grad 3e-4, τ 0.06).
+            // Quality with FastGS-Big's garden budget (grad 3e-4, τ 0.06) and SH every
+            // 500: garden 27.755 dB vs 27.688 at 1000 (opt-train-2). No warm-up.
             PresetName::Big => {
                 let mut p = Self::new(PresetName::Quality);
                 p.name = name;
@@ -243,6 +242,7 @@ impl Preset {
                     c.grad_abs_thresh = 3e-4;
                     c.loss_thresh = 0.06;
                 }
+                p.sh_interval = 500;
                 p
             }
             // T ablated over {10k, 15k, 20k}; 15k until measured.
@@ -796,7 +796,7 @@ mod tests {
             (b.name, c.grad_abs_thresh, c.loss_thresh),
             (PresetName::Big, 3e-4, 0.06)
         );
-        assert!(b.warmup && b.sh_interval == 500);
+        assert!(!b.warmup && b.sh_interval == 500);
     }
 
     #[test]
