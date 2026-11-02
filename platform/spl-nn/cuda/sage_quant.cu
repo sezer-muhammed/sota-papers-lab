@@ -24,7 +24,8 @@
 // right and bottom edges pool what they cover) and each pooled key gets a
 // +log(count) logit bias so it carries the attention mass of its members.
 // The `special` camera and register tokens at the start of each frame are
-// kept as they are. Queries are never merged.
+// kept as they are, and so is every token of the first `dense_frames` frames
+// (VGGT-Ω's reference frame). Queries are never merged.
 
 #define SG_CH (SG_D / 8)  // 16-byte bf16 chunks per head row
 
@@ -212,7 +213,13 @@ __device__ __forceinline__ int sg_members(const SgGeom& g, int j, int& base, int
         nx = 1;
         return 1;
     }
-    const int f = j / g.merged_frame, loc = j % g.merged_frame;
+    const int dense = g.dense_frames * g.frame_tokens;
+    if (j < dense) {
+        base = j;
+        nx = 1;
+        return 1;
+    }
+    const int f = g.dense_frames + (j - dense) / g.merged_frame, loc = (j - dense) % g.merged_frame;
     if (loc < g.special) {
         base = f * g.frame_tokens + loc;
         nx = 1;

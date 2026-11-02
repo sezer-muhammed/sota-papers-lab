@@ -32,7 +32,7 @@ pub(crate) fn run(
 ) -> Result<()> {
     let (n, p) = (g.frames, g.patches());
     let len = DINO_PREFIX + p;
-    let (x, xd, mut s) = bufs.split();
+    let (x, xd, _, mut s) = bufs.split();
 
     ops.k
         .patchify(nn, images, &mut *s.big, n, g.grid_h * 16, g.grid_w * 16)?;

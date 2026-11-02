@@ -60,7 +60,7 @@ struct SgGeom {
     float q_mul;       // softmax scale * log2(e), folded into the Q scales
     float ln_eps;
     float v_range;     // V is scaled so max |V - mean| maps to this
-    int pad_;
+    int dense_frames;  // leading frames kept unmerged
 };
 
 __device__ __forceinline__ float sg_bf16(sg_u32 bits16) { return __uint_as_float(bits16 << 16); }
