@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use spl_core::{CancellationToken, Context, Result, bail};
 use ts_rs::TS;
 
+use super::geom::{GeoRefine, consistent_points, refine_poses};
 use super::joint::{DepthPriorCfg, DepthPriors, Joint, JointConfig, PoseRefine, TestViews};
 use super::prune::{PruneReport, prune_first};
 use super::scene::{Posed, holdout_split, training_scene};
@@ -106,6 +107,33 @@ pub struct PipelineConfig {
     /// Trainer overrides (ablations).
     #[serde(default)]
     pub overrides: PresetOverrides,
+    /// Geometric pose refinement before training ([`geom::refine_poses`]):
+    /// Jacobi iterations (0 = off), samples per frame, per-frame depth scale.
+    #[serde(default)]
+    pub geo_iters: u32,
+    #[serde(default = "default_geo_samples")]
+    pub geo_samples: u32,
+    #[serde(default = "default_true")]
+    pub geo_scale: bool,
+    /// Above 0: init points must agree with this many neighbour depth maps
+    /// ([`geom::consistent_points`]); 0 = every confident pixel.
+    #[serde(default)]
+    pub init_min_views: u32,
+    /// Relative depth tolerance of that check.
+    #[serde(default = "default_init_tau")]
+    pub init_tau: f32,
+}
+
+fn default_geo_samples() -> u32 {
+    2000
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_init_tau() -> f32 {
+    0.01
 }
 
 impl PipelineConfig {
@@ -142,6 +170,11 @@ impl PipelineConfig {
             engine_max_frames: 200,
             keep_engine: false,
             overrides: PresetOverrides::default(),
+            geo_iters: 0,
+            geo_samples: default_geo_samples(),
+            geo_scale: true,
+            init_min_views: 0,
+            init_tau: default_init_tau(),
         };
         match p {
             // Pose bootstrap: +0.4 dB on garden for 17 s.
@@ -209,6 +242,8 @@ pub struct StageTimes {
     pub prune_s: f64,
     #[serde(default)]
     pub bootstrap_s: f64,
+    #[serde(default)]
+    pub geo_s: f64,
     pub train_s: f64,
     pub export_s: f64,
     /// From the call to the exports being encoded.
@@ -323,11 +358,22 @@ impl Reconstruction {
 
     /// Test-time pose refinement of the held-out views (frozen Gaussians).
     pub fn refine_test(&mut self, iters: u32, lr_rot: f32, lr_trans: f32) -> Result<f64> {
+        self.refine_test_at(1, iters, lr_rot, lr_trans)
+    }
+
+    /// [`Self::refine_test`] at `1/scale` render resolution.
+    pub fn refine_test_at(
+        &mut self,
+        scale: u32,
+        iters: u32,
+        lr_rot: f32,
+        lr_trans: f32,
+    ) -> Result<f64> {
         let (Some(joint), Some(tv)) = (self.joint.as_mut(), self.test.as_mut()) else {
             bail!("no held-out views");
         };
         let t = Instant::now();
-        joint.refine_test_poses(tv, iters, lr_rot, lr_trans)?;
+        joint.refine_test_poses_at(tv, scale, iters, lr_rot, lr_trans)?;
         joint.tr.gpu.sync()?;
         Ok(t.elapsed().as_secs_f64())
     }
@@ -654,6 +700,36 @@ pub fn reconstruct_with(
             posed.rescale(cfg.world_spread / s);
         }
     }
+    // The engine's training cameras: held-out cameras are carried from them.
+    let engine_train = {
+        let f = posed.shared_focal(&train, tw, th);
+        posed.views(&train, tw, th, f)
+    };
+    if cfg.geo_iters > 0 {
+        let rep = refine_poses(
+            &mut posed,
+            &train,
+            &GeoRefine {
+                iters: cfg.geo_iters,
+                samples: cfg.geo_samples as usize,
+                scale: cfg.geo_scale,
+                ..Default::default()
+            },
+        );
+        times.geo_s = rep.seconds;
+        events(Event::Log(format!(
+            "geometric refinement: {} frames, |r| {:.4} → {:.4}, inliers {:.2} → {:.2}, median rotation change {:.3}°, scale {:.3}-{:.3}, {:.1} s",
+            rep.frames,
+            rep.rms_before,
+            rep.rms_after,
+            rep.inliers_before,
+            rep.inliers_after,
+            rep.median_rot_change_deg,
+            rep.scale_min,
+            rep.scale_max,
+            rep.seconds
+        )));
+    }
     let focal = posed.shared_focal(&train, tw, th);
     {
         let all: Vec<usize> = (0..n).collect();
@@ -674,8 +750,6 @@ pub fn reconstruct_with(
     events(Event::Progress(0.16, "initializing".into()));
     let gpu = Gpu::open()?;
     let mut focal = focal;
-    // The engine's training cameras: held-out cameras are carried from them.
-    let engine_train = posed.views(&train, tw, th, focal);
     if cfg.bootstrap_iters > 0 {
         let t = Instant::now();
         let imgs: Vec<Rgb8Image> = train.iter().map(|&i| frames.trainer[i].clone()).collect();
@@ -696,11 +770,30 @@ pub fn reconstruct_with(
     // Images first: the trainer sizes its capacity from what is left.
     let cache = ImageCache::from_images(&gpu, (0..train.len()).collect(), &train_imgs, 0.0)?;
     drop(train_imgs);
-    let seed_points = posed.points(
-        &train,
-        cfg.init_conf_drop,
-        cfg.init_points.max(4096) as usize,
-    );
+    let seed_points = if cfg.init_min_views > 0 {
+        let t = Instant::now();
+        let pts = consistent_points(
+            &posed,
+            &train,
+            cfg.init_conf_drop,
+            4 * cfg.init_points.max(4096) as usize / train.len().max(1) + 64,
+            cfg.init_tau as f64,
+            cfg.init_min_views as usize,
+            cfg.init_points.max(4096) as usize,
+        );
+        events(Event::Log(format!(
+            "consistent init points: {} in {:.2} s",
+            pts.xyz.len(),
+            t.elapsed().as_secs_f64()
+        )));
+        pts
+    } else {
+        posed.points(
+            &train,
+            cfg.init_conf_drop,
+            cfg.init_points.max(4096) as usize,
+        )
+    };
     let mut scene = training_scene(train_views, seed_points)?;
     let all_train = scene.train.clone();
     scene.train = Vec::new();

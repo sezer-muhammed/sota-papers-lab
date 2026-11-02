@@ -9,7 +9,8 @@
 //! | `SPL_RECON_PRESET` | `quality` | `fast` or `quality` |
 //! | `SPL_RECON_CONFIG` | none | `PipelineConfig` JSON patch, or an array of patches run one after another on the same ingest (ablations; tags get `-<i>`) |
 //! | `SPL_RECON_HOLDOUT` | 8 | every n-th frame held out (0 = none) |
-//! | `SPL_RECON_TTR` | 200 | test-time pose refinement iterations per view |
+//! | `SPL_RECON_TTR` | coarse to fine | test-time pose refinement iterations per view at full resolution only (the old protocol) |
+//! | `SPL_RECON_TTR_SCHED` | `4:150,2:150,1:200` | coarse-to-fine stages `scale:iters[:lr]`, each scored |
 //! | `SPL_RECON_TTR_LR` | 1e-3 | its rotation LR (translation: same × extent). 3e-3: bicycle Fast +0.4-0.8 dB, garden Quality -0.6 dB; 1e-2 worse |
 //! | `SPL_RECON_MAX_FRAMES` | all | frames (video keyframes) |
 //! | `SPL_RECON_TAG` | `<scene>-<preset>` | output folder name |
@@ -278,7 +279,40 @@ fn run_one(
             "{tag}: held-out BEFORE test-time refinement: PSNR {:.3} SSIM {:.4}",
             before.psnr, before.ssim
         );
-        let ttr_s = r.refine_test(ttr, ttr_lr, ttr_lr).unwrap();
+        // `SPL_RECON_TTR_SCHED`: "scale:iters[:lr],..." stages (coarse to
+        // fine), each scored; replaces `SPL_RECON_TTR` when set.
+        let sched: Vec<(u32, u32, f32)> = match std::env::var("SPL_RECON_TTR_SCHED") {
+            Ok(s) => s
+                .split(',')
+                .map(|st| {
+                    let p: Vec<&str> = st.split(':').collect();
+                    (
+                        p[0].parse().unwrap(),
+                        p[1].parse().unwrap(),
+                        p.get(2).map_or(ttr_lr, |l| l.parse().unwrap()),
+                    )
+                })
+                .collect(),
+            Err(_) if std::env::var("SPL_RECON_TTR").is_ok() => vec![(1, ttr, ttr_lr)],
+            // Default: coarse to fine (bicycle Fast +1.05 dB, Quality +1.0 dB over 200 full-res steps).
+            Err(_) => vec![(4, 150, ttr_lr), (2, 150, ttr_lr), (1, 200, ttr_lr)],
+        };
+        let mut ttr_s = 0.0;
+        let mut stages = Vec::new();
+        for (k, &(scale, iters, lr)) in sched.iter().enumerate() {
+            ttr_s += r.refine_test_at(scale, iters, lr, lr).unwrap();
+            if k + 1 < sched.len() {
+                let (m, _) = r.evaluate_test(None).unwrap();
+                eprintln!(
+                    "{tag}: held-out after TTR stage {k} (1/{scale}, {iters} it, lr {lr}): PSNR {:.3}",
+                    m.psnr
+                );
+                stages.push(
+                    serde_json::json!({"scale": scale, "iters": iters, "lr": lr, "psnr": m.psnr}),
+                );
+            }
+        }
+        let ttr: u32 = sched.iter().map(|s| s.1).sum();
         let (after, per) = r.evaluate_test(Some(&out.join("renders"))).unwrap();
         eprintln!(
             "{tag}: held-out AFTER {ttr}-iteration test-time refinement ({ttr_s:.1} s): PSNR {:.3} SSIM {:.4}",
@@ -297,6 +331,8 @@ fn run_one(
         result["ttr_iters"] = ttr.into();
         result["ttr_lr"] = ttr_lr.into();
         result["ttr_s"] = ttr_s.into();
+        result["ttr_stages"] = stages.into();
+        result["ttr_sched"] = format!("{sched:?}").into();
         result["per_view_after"] = names
             .iter()
             .zip(&per)
@@ -311,4 +347,99 @@ fn run_one(
     )
     .unwrap();
     eprintln!("{}", serde_json::to_string(&result).unwrap());
+}
+
+/// Pose accuracy of the geometric refinement against COLMAP, engine only (no
+/// training): median pairwise relative rotation error of the training frames,
+/// raw and after each `SPL_GEO_CONFIG` patch (`GeoRefine` fields: iters,
+/// samples, neighbours, huber, reject, scale, conf_drop).
+#[test]
+#[ignore = "GPU, weights and dataset: run on the GPU host"]
+fn gpu_geo_pose_accuracy() {
+    use super::geom::{GeoRefine, refine_poses, relative_rotation_error};
+    let scene_name = env("SPL_RECON_SCENE", "mipnerf360/garden");
+    let images = env("SPL_RECON_IMAGES", "images_4");
+    let cancel = CancellationToken::new();
+    let root = PathBuf::from(env("SPL_DATASETS", "/datasets")).join(&scene_name);
+    let files = image_files(&root.join(&images)).unwrap();
+    let cfg = IngestConfig {
+        trainer_long_side: 100_000,
+        max_frames: 100_000,
+        ..Default::default()
+    };
+    let frames = to_frames(ingest_images(&files, &cfg, &cancel).unwrap());
+    let weights = PathBuf::from(env(
+        "SPL_VGGT_WEIGHTS",
+        "/models/vggt-omega/vggt_omega_1b_512.safetensors",
+    ));
+    let (mut posed, ..) =
+        super::pipeline::pose_frames(&weights, &frames, false, 200, &cancel, &mut |_| {}).unwrap();
+    let scene = load_colmap_scene(
+        &root,
+        &LoadOptions {
+            images_dir: images.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let by_name: std::collections::HashMap<&str, &crate::io::scene::View> =
+        scene.views.iter().map(|v| (v.name.as_str(), v)).collect();
+    let (train, _) = super::scene::holdout_split(posed.frames(), 8);
+    let gt: Vec<M3> = train
+        .iter()
+        .map(|&i| by_name[posed.names[i].as_str()].r_cw)
+        .collect();
+    let rots = |p: &Posed| -> Vec<M3> {
+        train
+            .iter()
+            .map(|&i| p.pose(i).0.map(|r| r.map(f64::from)))
+            .collect()
+    };
+    let raw = relative_rotation_error(&rots(&posed), &gt);
+    eprintln!(
+        "{scene_name}: raw engine RRE {raw:.4}° over {} frames",
+        train.len()
+    );
+    let saved = (
+        posed.cams.extrinsics.clone(),
+        posed.dense.depth.clone(),
+        posed.dense.world.clone(),
+    );
+    let patches: Vec<serde_json::Value> =
+        serde_json::from_str(&env("SPL_GEO_CONFIG", "[{\"iters\":10}]")).unwrap();
+    let mut rows = vec![serde_json::json!({"variant": "raw", "rre_deg": raw})];
+    for patch in patches {
+        posed.cams.extrinsics = saved.0.clone();
+        posed.dense.depth = saved.1.clone();
+        posed.dense.world = saved.2.clone();
+        let mut g = GeoRefine::default();
+        let o = patch.as_object().unwrap();
+        let num = |k: &str| o.get(k).and_then(|v| v.as_f64());
+        if let Some(v) = num("iters") {
+            g.iters = v as u32;
+        }
+        if let Some(v) = num("samples") {
+            g.samples = v as usize;
+        }
+        if let Some(v) = num("neighbours") {
+            g.neighbours = v as usize;
+        }
+        if let Some(v) = num("huber") {
+            g.huber = v;
+        }
+        if let Some(v) = num("reject") {
+            g.reject = v;
+        }
+        if let Some(v) = num("conf_drop") {
+            g.conf_drop = v as f32;
+        }
+        if let Some(v) = o.get("scale").and_then(|v| v.as_bool()) {
+            g.scale = v;
+        }
+        let rep = refine_poses(&mut posed, &train, &g);
+        let e = relative_rotation_error(&rots(&posed), &gt);
+        eprintln!("{scene_name}: {patch} → RRE {e:.4}° ({rep:?})");
+        rows.push(serde_json::json!({"variant": patch, "rre_deg": e, "report": rep}));
+    }
+    eprintln!("{}", serde_json::to_string(&rows).unwrap());
 }

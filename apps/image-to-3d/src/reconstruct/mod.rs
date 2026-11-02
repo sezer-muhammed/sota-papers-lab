@@ -15,6 +15,7 @@
 //! research licence (see [`crate::pose`]).
 
 pub mod align;
+pub mod geom;
 pub mod joint;
 pub mod pipeline;
 pub mod prune;
