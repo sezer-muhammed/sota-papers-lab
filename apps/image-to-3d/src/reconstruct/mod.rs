@@ -181,7 +181,13 @@ impl Op for Reconstruct {
                 let _ = tx.send(e);
             };
             let r = reconstruct(&weights, frames, &cfg, 0, &cancel, &mut send);
-            let r = r.inspect_err(|_| crate::vram::release_quietly())?;
+            let mut r = r.inspect_err(|_| crate::vram::release_quietly())?;
+            // The mesher only needs the host splat and the cameras: free the
+            // trainer (parameters, Adam moments, gradients, images, caches)
+            // and hand its pool blocks back before meshing.
+            drop(r.joint.take());
+            drop(r.test.take());
+            crate::vram::release_quietly();
             let glb = if let Some(ref mc) = mesh_cfg {
                 send(Event::Progress(0.92, "meshing".into()));
                 // A mesh failure never fails the run: the splat is the product.
@@ -210,9 +216,6 @@ impl Op for Reconstruct {
             crate::export::colmap::write_transforms_json(&r.views, &mut transforms)?;
             let colmap = colmap_zip(&r)?;
             let coexist = r.coexist.clone();
-            drop(r.joint);
-            drop(r.test);
-            crate::vram::release_quietly();
             Ok((
                 r.spz,
                 ply,

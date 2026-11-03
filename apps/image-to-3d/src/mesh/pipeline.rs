@@ -20,6 +20,7 @@ use super::mc::ExtractOptions;
 use super::tsdf::{DepthCamera, TsdfParams, TsdfVolume};
 use super::{BakeCamera, Mesh, TriMesh};
 use crate::frame::{CameraTable, FrameParams, IterParams};
+use crate::gpu::CudaResultExt;
 use crate::gpu::Gpu;
 use crate::io::images::load_view_image;
 use crate::io::scene::View;
@@ -27,6 +28,7 @@ use crate::kernels::layout::{EPS2D_DEFAULT, FLAG_AA};
 use crate::kernels::raster::{FrameSource, GpuRaster, SplatRaster};
 use crate::kernels::{Capacity, RasterVariant, RenderMode};
 use crate::model::{Gaussians, GaussiansHost};
+use spl_gpu::cudarc::driver::CudaSlice;
 
 fn d_res() -> u32 {
     1024
@@ -341,8 +343,7 @@ pub fn fuse_with(
     ensure!(n > 0, "the splat is empty");
     ensure!(!views.is_empty(), "no cameras to fuse");
     let cap = n.next_multiple_of(1024);
-    let mut g = Gaussians::alloc(gpu, cap, cloud.antialiased)?;
-    g.upload(gpu, cloud)?;
+    let mut g = upload_geometry(gpu, cloud, cap)?;
     let cams = CameraTable::upload(gpu, views)?;
     let (mw, mh) = views
         .iter()
@@ -466,6 +467,137 @@ pub fn fuse_with(
     Ok(vol)
 }
 
+/// The splat without its SH rest (geometry renders at SH degree 0, which never
+/// reads it): 270 MB less than [`Gaussians::alloc`] at 1.5M Gaussians.
+fn upload_geometry(gpu: &Gpu, cloud: &GaussiansHost, cap: usize) -> Result<Gaussians> {
+    cloud.validate()?;
+    let n = cloud.len();
+    let s = &gpu.stream;
+    let put = |host: &[f32], len: usize, what: &str| -> Result<CudaSlice<f32>> {
+        let mut d = s.alloc_zeros::<f32>(len).cuda(what)?;
+        s.memcpy_htod(host, &mut d.slice_mut(..host.len()))
+            .cuda(what)?;
+        Ok(d)
+    };
+    Ok(Gaussians {
+        n: n as u32,
+        cap: cap as u32,
+        mean: put(&cloud.means, cap * 3, "mesh: upload mean")?,
+        log_scale: put(&cloud.scales, cap * 3, "mesh: upload log_scale")?,
+        quat: put(&cloud.rotations, cap * 4, "mesh: upload quat")?,
+        opacity: put(&cloud.opacities, cap, "mesh: upload opacity")?,
+        sh_dc: put(&cloud.sh0, cap * 3, "mesh: upload sh_dc")?,
+        sh_rest: s.alloc_zeros::<f32>(1).cuda("mesh: alloc sh_rest")?,
+        filter3d: if cloud.antialiased {
+            Some(s.alloc_zeros::<f32>(cap).cuda("mesh: alloc filter3d")?)
+        } else {
+            None
+        },
+        last_visible: s.alloc_zeros::<u32>(cap).cuda("mesh: alloc last_visible")?,
+    })
+}
+
+/// Device bytes the depth renders need besides the TSDF pool (splat
+/// geometry, raster buffers at ~16 instances per Gaussian, per-pixel maps).
+pub fn fuse_need(n: usize, views: &[View]) -> u64 {
+    let px = views
+        .iter()
+        .map(|v| v.width as u64 * v.height as u64)
+        .max()
+        .unwrap_or(0);
+    let inst = (n as u64 * 16).clamp(1 << 20, 1 << 27);
+    n as u64 * 80 + inst * 16 + px * 96 + (256 << 20)
+}
+
+/// `views` rendered at `s` of their resolution (intrinsics scaled with them).
+pub fn scale_views(views: &[View], s: f64) -> Vec<View> {
+    views
+        .iter()
+        .map(|v| {
+            let (w, h) = crate::vram::scaled(v.width, v.height, s);
+            let (sx, sy) = (w as f64 / v.width as f64, h as f64 / v.height as f64);
+            View {
+                fx: v.fx * sx,
+                fy: v.fy * sy,
+                cx: v.cx * sx,
+                cy: v.cy * sy,
+                width: w,
+                height: h,
+                ..v.clone()
+            }
+        })
+        .collect()
+}
+
+/// Depth-render scales tried after an out-of-memory failure.
+const OOM_SCALES: [f64; 3] = [1.0, 0.5, 0.25];
+
+fn is_oom(e: &spl_core::Error) -> bool {
+    format!("{e:#}").contains("OUT_OF_MEMORY")
+}
+
+/// [`fuse`] on a shared card: on out-of-memory, hands freed blocks back,
+/// waits (bounded) for the free memory the renders need, then retries at a
+/// lower depth resolution. Every step lands in `summary.notes`.
+fn fuse_shared(
+    gpu: &Gpu,
+    cloud: &GaussiansHost,
+    views: &[View],
+    cfg: &MeshConfig,
+    summary: &mut MeshSummary,
+    notes: &mut Vec<String>,
+) -> Result<TsdfVolume> {
+    let mut policy = crate::vram::WaitPolicy::from_env();
+    policy.timeout = policy.timeout.min(std::time::Duration::from_secs(120));
+    let cancel = spl_core::CancellationToken::new();
+    let mut k = 0;
+    loop {
+        let s = OOM_SCALES[k];
+        let scaled;
+        let vs = if s < 1.0 {
+            scaled = scale_views(views, s);
+            &scaled[..]
+        } else {
+            views
+        };
+        match fuse(gpu, cloud, vs, cfg, summary) {
+            Err(e) if is_oom(&e) && k + 1 < OOM_SCALES.len() => {
+                crate::vram::release_quietly();
+                k += 1;
+                let next = scale_views(views, OOM_SCALES[k]);
+                let need = fuse_need(cloud.len(), &next) + (1 << 14) * 4108;
+                let waited = crate::vram::wait_until(
+                    &policy,
+                    &cancel,
+                    crate::vram::free_now,
+                    |f| {
+                        Ok(if f >= need {
+                            Ok(())
+                        } else {
+                            Err(crate::vram::Shortfall {
+                                what: "mesh depth renders".into(),
+                                need,
+                            })
+                        })
+                    },
+                    &mut |_| {},
+                );
+                let w = match waited {
+                    Ok((_, w)) => format!("waited {w:.0} s for memory"),
+                    Err(_) => "memory stayed short".to_string(),
+                };
+                notes.append(&mut summary.notes);
+                notes.push(format!(
+                    "{e:#}; {w}, depth renders at {:.0}% resolution",
+                    OOM_SCALES[k] * 100.0
+                ));
+                *summary = MeshSummary::default();
+            }
+            r => return r,
+        }
+    }
+}
+
 /// The full pipeline: fuse `views`, extract, clean, decimate, unwrap, bake
 /// from the photos of `views` (their `image_path`s), GLB.
 pub fn build(
@@ -483,7 +615,7 @@ pub fn build(
     let mut attempt = cfg.clone();
     let mut retries = 0;
     let vol = loop {
-        match fuse(gpu, cloud, views, &attempt, &mut summary) {
+        match fuse_shared(gpu, cloud, views, &attempt, &mut summary, &mut notes) {
             Err(e) if is_overflow(&e) && retries < MAX_RETRIES => {
                 retries += 1;
                 let v = summary.voxel * RETRY_COARSEN;
@@ -509,6 +641,7 @@ pub fn build(
         ..Default::default()
     })?;
     drop(vol);
+    crate::vram::release_quietly();
     summary.extract_ms = t.elapsed().as_secs_f64() * 1e3;
     summary.raw_triangles = raw.faces.len() as u32;
     let t = Instant::now();

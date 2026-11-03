@@ -57,6 +57,28 @@ pub fn write_ply(m: &Mesh, path: &std::path::Path) -> std::io::Result<()> {
     f.flush()
 }
 
+fn stride(c: &GaussiansHost, max: usize) -> GaussiansHost {
+    let n = c.len();
+    if n <= max {
+        return c.clone();
+    }
+    let idx: Vec<usize> = (0..max).map(|i| i * n / max).collect();
+    let pick = |v: &[f32], k: usize| {
+        idx.iter()
+            .flat_map(|&i| v[k * i..k * i + k].to_vec())
+            .collect()
+    };
+    GaussiansHost {
+        means: pick(&c.means, 3),
+        scales: pick(&c.scales, 3),
+        rotations: pick(&c.rotations, 4),
+        opacities: pick(&c.opacities, 1),
+        sh0: pick(&c.sh0, 3),
+        sh_rest: pick(&c.sh_rest, 45),
+        ..c.clone()
+    }
+}
+
 #[test]
 #[ignore = "GPU and dataset: run on the GPU host"]
 fn gpu_mesh_dataset() {
@@ -146,6 +168,11 @@ fn gpu_mesh_dataset() {
             std::fs::write(out.join("splat.ply"), &ply).unwrap();
             (cloud, summary.train_s, summary.iterations)
         }
+    };
+    // SPL_MESH_MAX_GAUSSIANS=n keeps an even stride of n (memory tests).
+    let cloud = match std::env::var("SPL_MESH_MAX_GAUSSIANS") {
+        Ok(v) => stride(&cloud, v.parse().unwrap()),
+        Err(_) => cloud,
     };
     eprintln!("train {train_s:.1}s, {} Gaussians", cloud.len());
     // Normal (camera space, RGB = (1 − n)/2) and median-depth maps of 3 views.
