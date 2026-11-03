@@ -136,7 +136,7 @@ pub fn router(host: Arc<Host>, config: &Config) -> Router {
     let protected = Router::new()
         .route("/ops", get(list_ops))
         .route("/runs", get(list_runs).post(create_run))
-        .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}", get(get_run).delete(delete_run))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/artifacts", post(upload_artifact))
         .route("/artifacts/{id}", get(get_artifact))
@@ -315,6 +315,31 @@ async fn cancel_run(
     }
     let run = store.get_run(&id).await?.unwrap_or(run);
     Ok((StatusCode::ACCEPTED, Json(run)))
+}
+
+/// Deletes a finished run, its records and the artifacts only it used.
+/// 409 while the run is queued or running.
+async fn delete_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let store = state.host.store();
+    let run = store
+        .get_run(&id)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no run `{id}`")))?;
+    if is_going(run.status) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("run `{id}` is {}; cancel it first", run.status.as_str()),
+        ));
+    }
+    for artifact in store.delete_run(&id).await? {
+        if let Err(e) = state.host.artifacts().delete(&artifact).await {
+            tracing::warn!(run = %id, "could not delete artifact {artifact}: {e:#}");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn is_going(status: RunStatus) -> bool {
