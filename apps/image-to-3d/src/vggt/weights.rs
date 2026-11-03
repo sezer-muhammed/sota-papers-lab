@@ -378,10 +378,9 @@ fn upload_regions(
     let n = STAGE_BYTES.min(total);
     let mut stages = Vec::new();
     for _ in 0..2 {
-        // SAFETY: the buffers are written on the host before every copy
-        // that reads them, and each refill waits for its previous copy.
-        let buf = unsafe { nn.ctx.alloc_pinned::<u8>(n) }
-            .map_err(|e| anyhow!("allocate pinned staging: {e:?}"))?;
+        // Pageable when pinning is refused; each refill waits for its
+        // previous copy either way.
+        let buf = super::hostbuf::HostBuf::<u8>::new(nn, n, "weight staging");
         let done = nn
             .ctx
             .new_event(None)
@@ -398,9 +397,7 @@ fn upload_regions(
                 done.synchronize()
                     .map_err(|e| anyhow!("wait for staging: {e:?}"))?;
             }
-            let host = buf
-                .as_mut_slice()
-                .map_err(|e| anyhow!("pinned staging: {e:?}"))?;
+            let host = buf.as_mut_slice()?;
             host[..piece.len()]
                 .par_chunks_mut(1 << 20)
                 .zip(piece.par_chunks(1 << 20))
@@ -415,6 +412,9 @@ fn upload_regions(
             turn += 1;
         }
     }
+    // Release the staging memory now, not with the engine.
+    nn.sync()?;
+    drop(stages);
     Ok(())
 }
 
