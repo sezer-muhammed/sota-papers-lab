@@ -214,3 +214,32 @@ export function focusPoint(frustums: Frustum[]): Vec3 | undefined {
     m[0]! * (m[4]! * m[8]! - m[5]! * m[7]!) - m[1]! * (m[3]! * m[8]! - m[5]! * m[6]!) + m[2]! * (m[3]! * m[7]! - m[4]! * m[6]!);
   return [det3(col(0, b)) / det, det3(col(1, b)) / det, det3(col(2, b)) / det];
 }
+
+/** How a capture was shot, for the viewer's default controls. `room` when
+    the cameras look outward from among themselves (a walk through a room or
+    street) or all the same way, rather than in at one object; `scale` is
+    the cameras' median distance from their centroid (or the neighbour gap),
+    the fly speed's unit. */
+export function sceneLayout(frustums: Frustum[]): { room: boolean; scale: number } {
+  if (frustums.length < 3) return { room: false, scale: frustumScale(frustums) / 0.6 };
+  const n = frustums.length;
+  const mid: Vec3 = [0, 0, 0];
+  for (const f of frustums) for (let k = 0; k < 3; k += 1) mid[k] = mid[k]! + f.center[k]! / n;
+  const radii = frustums.map((f) => len(sub(f.center, mid))).sort((x, y) => x - y);
+  const spread = radii[n >> 1]!;
+  const scale = spread > 0 ? spread : frustumScale(frustums) / 0.6;
+  // Mean cosine between each view and the way out from the centroid:
+  // about −1 circling an object, 0 or more walking about a room.
+  let outward = 0;
+  for (const f of frustums) {
+    const away = sub(f.center, mid);
+    const l = len(away);
+    if (l < 1e-9) continue;
+    const d = cameraView(f).forward;
+    outward += (d[0] * away[0] + d[1] * away[1] + d[2] * away[2]) / l / n;
+  }
+  const focus = focusPoint(frustums);
+  // An object sits well inside the ring of cameras that look at it.
+  const inward = focus !== undefined && len(sub(focus, mid)) < spread * 0.75;
+  return { room: outward > -0.35 || !inward, scale };
+}

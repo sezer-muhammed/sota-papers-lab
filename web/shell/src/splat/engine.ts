@@ -15,7 +15,8 @@ import {
   SplatFileType,
   SplatMesh,
 } from "@sparkjsdev/spark";
-import { cameraView, focusPoint, frustumScale, meanUp, type Frustum, type Vec3 } from "./cameras";
+import { cameraView, focusPoint, frustumScale, meanUp, sceneLayout, type Frustum, type Vec3 } from "./cameras";
+import { FlyControls } from "./fly";
 
 /** An axis-aligned box in the viewer's axes (y up, after the scene turn). */
 export type Box = { center: Vec3; half: Vec3 };
@@ -24,6 +25,9 @@ const DEFAULT_FOV = 55;
 const FLY_MS = 700;
 
 export type SplatFormat = "ply" | "spz";
+
+/** Orbit about a centre, or fly freely (WASD + drag to look). */
+export type ViewMode = "orbit" | "fly";
 
 /** An HSL token triplet ("212 100% 48%") as a three.js colour. */
 function tokenColor(name: string, fallback: THREE.Color): THREE.Color {
@@ -45,6 +49,9 @@ export class SplatEngine {
   private readonly scene = new THREE.Scene();
   private readonly camera = new THREE.PerspectiveCamera(55, 1, 0.01, 2000);
   private readonly controls: OrbitControls;
+  private readonly flyControls: FlyControls;
+  private mode: ViewMode = "orbit";
+  private lastTime?: number;
   private readonly world = new THREE.Group();
   private readonly resize: ResizeObserver;
   private readonly spark: SparkRenderer;
@@ -64,6 +71,8 @@ export class SplatEngine {
   private viewing?: number;
   /** Called when the view leaves a camera (the user orbits away). */
   onLeaveCamera?: () => void;
+  /** Called when the fly speed changes (wheel in fly mode). */
+  onFlySpeed?: (factor: number) => void;
   /** Called when a drag stops the turntable. */
   onTurntableStop?: () => void;
   private cameras: Frustum[] = [];
@@ -84,6 +93,9 @@ export class SplatEngine {
     this.controls = new OrbitControls(this.camera, canvas);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.12;
+    this.flyControls = new FlyControls(this.camera, canvas);
+    this.flyControls.onInput = () => this.leaveCamera();
+    this.flyControls.onSpeed = (f) => this.onFlySpeed?.(f);
     this.applyTheme();
     this.resize = new ResizeObserver(() => this.fit());
     this.resize.observe(canvas);
@@ -95,7 +107,10 @@ export class SplatEngine {
       this.onTurntableStop?.();
     });
     this.renderer.setAnimationLoop((time) => {
+      const dt = this.lastTime === undefined ? 0 : (time - this.lastTime) / 1000;
+      this.lastTime = time;
       if (this.fly) this.step(time);
+      else if (this.mode === "fly") this.flyControls.update(dt);
       else if (this.viewing === undefined) this.controls.update();
       this.renderer.render(this.scene, this.camera);
       this.frames += 1;
@@ -191,6 +206,8 @@ export class SplatEngine {
 
   setCameras(cameras: Frustum[]) {
     this.cameras = cameras;
+    // Cross the ring of cameras in about two seconds.
+    if (cameras.length) this.flyControls.baseSpeed = sceneLayout(cameras).scale * 0.5;
     this.clearThumbs();
     // Turn the scene so the cameras' up is the orbit's up; COLMAP's −y
     // without cameras.
@@ -343,12 +360,45 @@ export class SplatEngine {
     this.syncFrustums();
     this.camera.fov = DEFAULT_FOV;
     this.camera.updateProjectionMatrix();
-    this.controls.enabled = true;
+    this.controls.enabled = this.mode === "orbit";
     this.onLeaveCamera?.();
+  }
+
+  /** Switches between orbit and free fly, keeping the view. Orbit resumes
+      about a point ahead of the camera. */
+  setMode(mode: ViewMode) {
+    if (mode === this.mode) return;
+    this.mode = mode;
+    this.flyControls.enabled = mode === "fly";
+    if (mode === "fly") {
+      this.controls.enabled = false;
+      this.controls.autoRotate = false;
+    } else {
+      const ahead = Math.max(this.flyControls.baseSpeed * 2, this.camera.near * 10);
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+      this.controls.target.copy(this.camera.position).addScaledVector(forward, ahead);
+      this.controls.enabled = this.viewing === undefined;
+      if (this.viewing === undefined) this.controls.update();
+    }
+  }
+
+  get viewMode(): ViewMode {
+    return this.mode;
+  }
+
+  /** Whether the cameras look like a walk through a room or street (fly
+      suits it) rather than a circle about an object (orbit suits it). */
+  roomScale(): boolean {
+    return this.cameras.length >= 3 && sceneLayout(this.cameras).room;
+  }
+
+  setFlySpeed(factor: number) {
+    this.flyControls.speedFactor = factor;
   }
 
   setTurntable(on: boolean, speed = 2) {
     if (on) this.leaveCamera();
+    if (on) this.setMode("orbit");
     this.controls.autoRotate = on;
     this.controls.autoRotateSpeed = speed;
   }
@@ -449,6 +499,7 @@ export class SplatEngine {
     this.camera.near = radius / 1000;
     this.camera.far = radius * 100;
     this.camera.updateProjectionMatrix();
+    if (!this.cameras.length) this.flyControls.baseSpeed = radius * 0.25;
     this.controls.target.copy(center);
     this.controls.update();
     this.framed = true;
@@ -458,6 +509,7 @@ export class SplatEngine {
     this.renderer.setAnimationLoop(null);
     this.resize.disconnect();
     this.controls.dispose();
+    this.flyControls.dispose();
     this.clear();
     this.renderer.dispose();
   }

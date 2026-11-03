@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState, type PointerEvent } from "react";
-import { Box, ChevronLeft, ChevronRight, Crop, Eye, Maximize2, RotateCcw, RotateCw, X } from "lucide-react";
+import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import { Box, ChevronLeft, ChevronRight, Crop, Eye, Maximize2, Move3d, Orbit, RotateCcw, RotateCw, X } from "lucide-react";
 import { Button, IconTile, RangeInput, Switch, cn, text } from "@spl/ui";
 import type { Frustum } from "./cameras";
-import type { Box as CropBox, SplatEngine, SplatFormat } from "./engine";
+import type { Box as CropBox, SplatEngine, SplatFormat, ViewMode } from "./engine";
 import { Wipe } from "./wipe";
 
 /** Bytes to show. A new `key` replaces the scene; `live` keeps the view (a
@@ -22,7 +22,9 @@ const MAX_THUMBS = 300;
 const THUMB_PARALLEL = 4;
 const THUMB_WIDTH = 160;
 
-/* The in-browser viewer: drag to orbit, right-drag to pan, wheel to zoom.
+/* The in-browser viewer: drag to orbit, right-drag to pan, wheel to zoom;
+   or fly (F): WASD, Q/E, drag to look, Shift faster, wheel sets the speed.
+   Room-scale captures start in fly mode.
    Click a camera frustum (or step through them) to fly into it and wipe
    between the render and the photo. three.js and Spark load on first use
    (a separate chunk). */
@@ -53,6 +55,10 @@ export function SplatViewer({
   const [photo, setPhoto] = useState<string>();
   const lastKey = useRef<string>(undefined);
   const down = useRef<{ x: number; y: number }>(undefined);
+  const [mode, setMode] = useState<ViewMode>("orbit");
+  const [flySpeed, setFlySpeed] = useState(1);
+  /** The user picked a mode; stop choosing it from the camera layout. */
+  const chose = useRef(false);
 
   useEffect(() => {
     let live = true;
@@ -64,6 +70,7 @@ export function SplatViewer({
           made = new SplatEngine(canvas.current);
           made.onLeaveCamera = () => setViewing(undefined);
           made.onTurntableStop = () => setTurntable(false);
+          made.onFlySpeed = setFlySpeed;
           setEngine(made);
         } catch (e) {
           setState("failed");
@@ -145,6 +152,7 @@ export function SplatViewer({
     if (!engine) return;
     engine.setCameras(cameras);
     setViewing(undefined);
+    if (!chose.current && cameras.length) setMode(engine.roomScale() ? "fly" : "orbit");
     if (!photoFor || !cameras.length) return;
     let live = true;
     const queue = cameras.slice(0, MAX_THUMBS).map((_, i) => i);
@@ -172,7 +180,24 @@ export function SplatViewer({
 
   useEffect(() => {
     engine?.setTurntable(turntable);
+    if (turntable) setMode("orbit");
   }, [engine, turntable]);
+
+  useEffect(() => {
+    engine?.setMode(mode);
+    if (mode === "fly") setTurntable(false);
+  }, [engine, mode]);
+
+  const pickMode = (m: ViewMode) => {
+    chose.current = true;
+    setMode(m);
+  };
+
+  const onKeyDown = (e: KeyboardEvent<HTMLCanvasElement>) => {
+    if (e.code !== "KeyF" || e.metaKey || e.ctrlKey || e.altKey) return;
+    e.preventDefault();
+    pickMode(mode === "fly" ? "orbit" : "fly");
+  };
 
   useEffect(() => {
     if (!engine) return;
@@ -238,11 +263,28 @@ export function SplatViewer({
           data-splats={count ?? 0}
           data-points={pointCount ?? 0}
           data-viewing={viewing ?? ""}
-          aria-label="3D view. Drag to orbit, right-drag or shift-drag to pan, scroll to zoom. Click a camera to look through it."
+          data-mode={mode}
+          tabIndex={0}
+          aria-label={
+            mode === "fly"
+              ? "3D view, fly mode. W A S D to move, Q and E down and up, drag to look, Shift for speed, scroll for fly speed, F for orbit. Click a camera to look through it."
+              : "3D view. Drag to orbit, right-drag or shift-drag to pan, scroll to zoom, F to fly. Click a camera to look through it."
+          }
           className="block aspect-[4/3] w-full touch-none outline-none sm:aspect-[16/9]"
           onPointerDown={onPointerDown}
           onPointerUp={onPointerUp}
+          onKeyDown={onKeyDown}
         />
+        {hasScene ? (
+          <p
+            data-testid="splat-keys"
+            className="pointer-events-none absolute bottom-3 left-3 rounded-[6px] bg-black/60 px-2 py-1 font-mono text-[11px] text-white"
+          >
+            {mode === "fly"
+              ? `WASD move · Q/E down/up · drag look · Shift fast · wheel speed ×${flySpeed.toFixed(flySpeed < 1 ? 2 : 1)} · two fingers move · F orbit`
+              : "Drag orbit · right-drag pan · wheel zoom · F fly"}
+          </p>
+        ) : null}
         {viewing !== undefined && photo ? (
           <Wipe photo={photo} label={`Camera ${viewing + 1}`} onLeave={() => engine?.leaveCamera()} />
         ) : null}
@@ -309,6 +351,14 @@ export function SplatViewer({
           disabled={!pointCount || !count}
           onCheckedChange={setShowPoints}
         />
+        <div className="flex gap-1" role="group" aria-label="Camera controls">
+          <Button size="sm" icon={Orbit} aria-pressed={mode === "orbit"} disabled={!engine} onClick={() => pickMode("orbit")}>
+            Orbit
+          </Button>
+          <Button size="sm" icon={Move3d} aria-pressed={mode === "fly"} disabled={!engine} onClick={() => pickMode("fly")}>
+            Fly
+          </Button>
+        </div>
         <Switch className="justify-start gap-3" label="Turntable" checked={turntable} disabled={!engine} onCheckedChange={setTurntable} />
         <p className={cn(text.meta, "font-mono")}>{facts.join(" · ")}</p>
         <div className="ml-auto flex flex-wrap gap-2">
