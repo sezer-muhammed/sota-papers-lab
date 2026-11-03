@@ -108,6 +108,9 @@ function useArtifactUrl(id: string | undefined) {
   return url;
 }
 
+/** "clip.mp4#120" → "frame 120"; a photo path → its file name. */
+const viewLabel = (name: string) => (name.includes("#") ? `frame ${name.split("#").pop()}` : name.split(/[\\/]/).pop());
+
 function WorstView({ name, psnr, thumb }: { name: string; psnr: number; thumb?: string }) {
   const url = useArtifactUrl(thumb);
   return (
@@ -116,7 +119,7 @@ function WorstView({ name, psnr, thumb }: { name: string; psnr: number; thumb?: 
         {url ? <img src={url} alt={`Render (left) and photo (right) of ${name}`} className="h-full w-full object-cover" /> : null}
       </div>
       <figcaption className={cn(text.meta, "flex justify-between gap-2")}>
-        <span className="truncate">{name.split(/[\\/#]/).pop()}</span>
+        <span className="truncate">{viewLabel(name)}</span>
         <span className="shrink-0 font-mono">{psnr.toFixed(1)} dB</span>
       </figcaption>
     </figure>

@@ -11,7 +11,7 @@
 //!   cannot explain (parallax, zoom, rotation). Score = shift / width +
 //!   [`RESIDUAL_WEIGHT`] × (residual above the noise floor).
 //! - [`select_keyframes`]: drops very blurry frames (sharpness under
-//!   [`BLUR_RATIO`] of the local 75th percentile), cuts the cumulative motion
+//!   [`BLUR_RATIO`] of the local 90th percentile), cuts the cumulative motion
 //!   into `max` equal slices keeping the sharpest frame of each, splits the
 //!   widest remaining gaps when slices came out empty, and drops near
 //!   duplicates. A clip with almost no motion falls back to time slices.
@@ -162,7 +162,7 @@ pub struct Scored {
     pub motion: f64,
 }
 
-/// Blurry flags: sharpness under [`BLUR_RATIO`] × the 75th percentile of the
+/// Blurry flags: sharpness under [`BLUR_RATIO`] × the 90th percentile of the
 /// frames within ±`half` positions.
 pub fn blurry_flags(s: &[Scored], half: usize) -> Vec<bool> {
     (0..s.len())
@@ -171,8 +171,8 @@ pub fn blurry_flags(s: &[Scored], half: usize) -> Vec<bool> {
             let hi = (i + half + 1).min(s.len());
             let mut w: Vec<f64> = s[lo..hi].iter().map(|f| f.sharpness).collect();
             w.sort_by(f64::total_cmp);
-            let p75 = w[(w.len() * 3 / 4).min(w.len() - 1)];
-            s[i].sharpness < BLUR_RATIO * p75
+            let p90 = w[(w.len() * 9 / 10).min(w.len() - 1)];
+            s[i].sharpness < BLUR_RATIO * p90
         })
         .collect()
 }

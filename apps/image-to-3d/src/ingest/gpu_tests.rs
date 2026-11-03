@@ -85,6 +85,7 @@ async fn gpu_video_keyframes_pick_the_sharp_frame_of_each_bin() {
     let cfg = IngestConfig {
         max_frames: 12,
         sample_fps: None,
+        keyframes: KeyframeMode::Time,
         ..IngestConfig::default()
     };
     let r = ingest_video(&p, &cfg, &CancellationToken::new())
@@ -117,11 +118,55 @@ async fn gpu_video_keyframes_pick_the_sharp_frame_of_each_bin() {
     assert!(sharp > 2.0 * blurred);
 
     // Sampling at 10 fps of a 30 fps clip: every third frame, timestamps i/10.
-    let r = ingest_video(&p, &IngestConfig::default(), &CancellationToken::new())
+    let time = IngestConfig {
+        keyframes: KeyframeMode::Time,
+        ..IngestConfig::default()
+    };
+    let r = ingest_video(&p, &time, &CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(r.stats.decoded, 40);
     assert_eq!(r.frames.len(), 40, "fewer frames than bins keeps all");
+}
+
+#[tokio::test]
+#[ignore]
+async fn gpu_video_motion_keyframes_keep_sharp_frames_along_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("s.mp4");
+    if !synth_video(&p, 640, 360, 30, 4) {
+        return;
+    }
+    let cfg = IngestConfig {
+        max_frames: 12,
+        sample_fps: None,
+        ..IngestConfig::default()
+    };
+    assert_eq!(cfg.keyframes, KeyframeMode::Motion);
+    let r = ingest_video(&p, &cfg, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.stats.decoded, 120);
+    let kept: Vec<u32> = r.frames.iter().map(|f| f.index).collect();
+    println!("kept {kept:?}; capture {:?}", r.capture);
+    assert!(kept.len() >= 10 && kept.len() <= 12, "{kept:?}");
+    assert!(kept.windows(2).all(|w| w[0] < w[1]));
+    assert!(
+        kept.iter().all(|i| i % 5 == 2),
+        "a blurred frame was kept: {kept:?}"
+    );
+    assert!(kept[0] < 20 && *kept.last().unwrap() >= 100, "{kept:?}");
+    for f in &r.frames {
+        assert_eq!((f.engine.width, f.engine.height), (512, 288));
+        assert_eq!((f.trainer.width, f.trainer.height), (640, 360));
+    }
+    assert_eq!(r.capture.keyframes, "motion");
+    assert!(
+        (r.capture.blurry_share - 0.8).abs() < 0.05,
+        "{:?}",
+        r.capture
+    );
+    assert_eq!(r.capture.kept_blurry_share, 0.0);
 }
 
 #[tokio::test]
