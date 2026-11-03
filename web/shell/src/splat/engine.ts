@@ -15,7 +15,7 @@ import {
   SplatFileType,
   SplatMesh,
 } from "@sparkjsdev/spark";
-import { cameraView, focusPoint, frustumScale, meanUp, sceneLayout, type Frustum, type Vec3 } from "./cameras";
+import { cameraView, focusPoint, frustumScale, meanUp, pinholeProjection, sceneLayout, type Frustum, type Pinhole, type Vec3 } from "./cameras";
 import { FlyControls } from "./fly";
 
 /** An axis-aligned box in the viewer's axes (y up, after the scene turn). */
@@ -65,10 +65,15 @@ export class SplatEngine {
   private fly?: {
     from: { position: THREE.Vector3; quaternion: THREE.Quaternion; fov: number };
     to: { position: THREE.Vector3; quaternion: THREE.Quaternion; fov: number; target: THREE.Vector3 };
+    lens?: Pinhole;
     start: number;
   };
   /** Looking through camera `viewing`: orbit is off until the user drags. */
   private viewing?: number;
+  /** The camera's exact intrinsics, applied once the fly-in lands. */
+  private lens?: Pinhole;
+  /** The view before entering camera view, for `exitCamera`. */
+  private before?: { position: THREE.Vector3; quaternion: THREE.Quaternion; fov: number; target: THREE.Vector3 };
   /** Called when the view leaves a camera (the user orbits away). */
   onLeaveCamera?: () => void;
   /** Called when the fly speed changes (wheel in fly mode). */
@@ -134,7 +139,17 @@ export class SplatEngine {
     if (!w || !h) return;
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
+    this.updateProjection();
+  }
+
+  /** The perspective projection, or the viewed camera's exact one. */
+  private updateProjection() {
     this.camera.updateProjectionMatrix();
+    const w = this.canvas.clientWidth;
+    const h = this.canvas.clientHeight;
+    if (!this.lens || !w || !h) return;
+    this.camera.projectionMatrix.fromArray(pinholeProjection(this.lens, w, h, this.camera.near, this.camera.far));
+    this.camera.projectionMatrixInverse.copy(this.camera.projectionMatrix).invert();
   }
 
   /** Swaps in a splat file. Keeps the view once one has been framed (live
@@ -321,6 +336,14 @@ export class SplatEngine {
     const up = new THREE.Vector3(...view.up).transformDirection(m);
     const look = new THREE.Matrix4().lookAt(position, position.clone().add(forward), up);
     const distance = Math.max(this.controls.target.distanceTo(this.camera.position), 1e-3);
+    if (this.viewing === undefined)
+      this.before = {
+        position: this.camera.position.clone(),
+        quaternion: this.camera.quaternion.clone(),
+        fov: this.camera.fov,
+        target: this.controls.target.clone(),
+      };
+    this.lens = undefined;
     this.fly = {
       from: { position: this.camera.position.clone(), quaternion: this.camera.quaternion.clone(), fov: this.camera.fov },
       to: {
@@ -329,6 +352,7 @@ export class SplatEngine {
         fov: view.fovY,
         target: position.clone().add(forward.multiplyScalar(distance)),
       },
+      lens: cam.pinhole,
       start: performance.now(),
     };
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) this.fly.start = -Infinity;
@@ -345,11 +369,12 @@ export class SplatEngine {
     this.camera.position.lerpVectors(fly.from.position, fly.to.position, e);
     this.camera.quaternion.slerpQuaternions(fly.from.quaternion, fly.to.quaternion, e);
     this.camera.fov = fly.from.fov + (fly.to.fov - fly.from.fov) * e;
-    this.camera.updateProjectionMatrix();
     if (t >= 1) {
       this.controls.target.copy(fly.to.target);
+      this.lens = fly.lens;
       this.fly = undefined;
     }
+    this.updateProjection();
   }
 
   /** Back to orbiting (keeps the position; restores the field of view). */
@@ -357,11 +382,25 @@ export class SplatEngine {
     if (this.viewing === undefined) return;
     this.viewing = undefined;
     this.fly = undefined;
+    this.lens = undefined;
+    this.before = undefined;
     this.syncFrustums();
     this.camera.fov = DEFAULT_FOV;
-    this.camera.updateProjectionMatrix();
+    this.updateProjection();
     this.controls.enabled = this.mode === "orbit";
     this.onLeaveCamera?.();
+  }
+
+  /** Leaves camera view and flies back to the view from before it. */
+  exitCamera() {
+    const back = this.before;
+    this.leaveCamera();
+    if (!back) return;
+    this.fly = {
+      from: { position: this.camera.position.clone(), quaternion: this.camera.quaternion.clone(), fov: this.camera.fov },
+      to: { ...back, fov: DEFAULT_FOV },
+      start: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? -Infinity : performance.now(),
+    };
   }
 
   /** Switches between orbit and free fly, keeping the view. Orbit resumes

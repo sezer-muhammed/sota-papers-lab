@@ -17,11 +17,13 @@ export type Frustum = {
   aspect: number;
   /** The photo's file name, when the cameras artifact gives one. */
   name?: string;
+  /** The exact pose and intrinsics, for looking through the camera. */
+  pinhole?: Pinhole;
 };
 
 type M3 = [number, number, number, number, number, number, number, number, number];
 
-type Pinhole = {
+export type Pinhole = {
   r_cw: M3;
   t_cw: Vec3;
   fx: number;
@@ -69,6 +71,7 @@ export function pinholeFrustum(c: Pinhole): Frustum {
     center: camToWorld(c.r_cw, c.t_cw, [0, 0, 0]),
     corners: pts.map((p) => camToWorld(c.r_cw, c.t_cw, p)) as Frustum["corners"],
     aspect: c.width / c.height,
+    pinhole: c,
     ...(c.name ? { name: c.name } : {}),
   };
 }
@@ -160,6 +163,16 @@ const unit = (a: Vec3): Vec3 => {
     direction, the image's up (−y), and the vertical field of view in
     degrees (assuming a centred principal point). */
 export function cameraView(f: Frustum): { forward: Vec3; up: Vec3; fovY: number } {
+  const p = f.pinhole;
+  if (p) {
+    // World → camera rows are the camera's axes in world coordinates.
+    const r = p.r_cw;
+    return {
+      forward: unit([r[6], r[7], r[8]]),
+      up: unit([-r[3], -r[4], -r[5]]),
+      fovY: (2 * Math.atan(p.height / (2 * p.fy)) * 180) / Math.PI,
+    };
+  }
   const mid = (a: Vec3, b: Vec3): Vec3 => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
   const [c0, c1, c2, c3] = f.corners;
   const top = sub(mid(c0, c1), f.center);
@@ -242,4 +255,19 @@ export function sceneLayout(frustums: Frustum[]): { room: boolean; scale: number
   // An object sits well inside the ring of cameras that look at it.
   const inward = focus !== undefined && len(sub(focus, mid)) < spread * 0.75;
   return { room: outward > -0.35 || !inward, scale };
+}
+
+/** A three.js-style projection matrix (column-major) that shows camera `p`
+    exactly, its image fitted (letterboxed) and centred in a `w` × `h`
+    canvas: the same place `object-fit: contain` puts the photo. */
+export function pinholeProjection(p: Pinhole, w: number, h: number, near: number, far: number): number[] {
+  const k = Math.min(w / p.width, h / p.height);
+  const sx = (2 * p.fx * k) / w;
+  const sy = (2 * p.fy * k) / h;
+  // Principal point offset from the image centre, in NDC (image v runs down).
+  const ox = (2 * (p.cx - p.width / 2) * k) / w;
+  const oy = (-2 * (p.cy - p.height / 2) * k) / h;
+  const a = -(far + near) / (far - near);
+  const b = (-2 * far * near) / (far - near);
+  return [sx, 0, 0, 0, 0, sy, 0, 0, -ox, -oy, a, -1, 0, 0, b, 0];
 }

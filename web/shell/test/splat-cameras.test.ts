@@ -1,7 +1,7 @@
 /* Unit tests for the 3D viewer's camera frustums: `pnpm --filter @spl/shell test`. */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { frustumScale, parseCameras, pinholeFrustum, sceneLayout } from "../src/splat/cameras.ts";
+import { cameraView, frustumScale, parseCameras, pinholeFrustum, pinholeProjection, sceneLayout } from "../src/splat/cameras.ts";
 
 const close = (a: number[], b: number[]) =>
   a.forEach((v, i) => assert.ok(Math.abs(v - (b[i] ?? NaN)) < 1e-9, `${a} vs ${b}`));
@@ -96,4 +96,21 @@ test("sceneLayout: a ring looking in is an object, looking out is a room", () =>
   // A forward-facing walk (all one way) has no focus point: fly.
   const walk = Array.from({ length: 8 }, (_, i) => looking([i, 0, 0], [0, 0, 1]));
   assert.equal(sceneLayout(walk).room, true);
+});
+
+test("pinhole projection puts the principal point and image corners where contain-fit draws them", () => {
+  const p = { ...cam([0, 0, 0]), cx: 60 };
+  // 100 × 50 image in a 200 × 200 canvas: k = 2, image spans y ∈ [50, 150].
+  const m = pinholeProjection(p, 200, 200, 0.1, 100);
+  const ndc = (u: number, v: number) => {
+    // Camera ray through pixel (u, v), in three.js axes (y up, z back).
+    const x = (u - p.cx) / p.fx, y = -(v - p.cy) / p.fy, z = -1;
+    const cx = m[0]! * x + m[8]! * z, cy = m[5]! * y + m[9]! * z, w = m[11]! * z;
+    return [cx / w, cy / w];
+  };
+  close(ndc(0, 0), [-1, 0.5]);
+  close(ndc(100, 50), [1, -0.5]);
+  const f = pinholeFrustum(p);
+  close(cameraView(f).forward, [0, 0, 1]);
+  close(cameraView(f).up, [0, -1, 0]);
 });
