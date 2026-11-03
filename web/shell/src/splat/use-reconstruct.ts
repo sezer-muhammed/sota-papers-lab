@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { MEDIA, isFinished, type Announcement, type RunDetail } from "@spl/sdk";
 import { client, describeError, fetchArtifact } from "../api";
 import { parseCameras, type Frustum } from "./cameras";
@@ -9,8 +9,11 @@ import {
   generateInput,
   matchPhotos,
   mediaTypeOf,
+  readCapture,
   reconstructInput,
   sampleInput,
+  trainLongerInput,
+  type CaptureReport,
   type Picked,
   type ReconstructInput,
   type ReconstructOptions,
@@ -36,6 +39,41 @@ const FILES_PARALLEL = 3;
 
 const formatOf = (a: { media_type: string }) => (a.media_type === MEDIA.ply ? "ply" : "spz");
 
+/* What the run panel's cards need beyond the run detail: the capture report
+   (announced before training starts), which splat the viewer shows, and the
+   actions. The page shell renders the cards without passing these, so the
+   one live run of the #/3d page publishes them here. */
+export type RunExtras = {
+  runId?: string;
+  capture?: CaptureReport;
+  /** The viewer shows the floater-free splat. */
+  clean: boolean;
+  showClean?: (on: boolean) => void;
+  /** Starts the same input one preset up and opens it; undefined at Big. */
+  trainLonger?: () => Promise<void>;
+  cancel?: () => void;
+  actionError?: string;
+};
+
+const NO_EXTRAS: RunExtras = { clean: false };
+let extras: RunExtras = NO_EXTRAS;
+const listeners = new Set<() => void>();
+const subscribe = (l: () => void) => {
+  listeners.add(l);
+  return () => {
+    listeners.delete(l);
+  };
+};
+function publish(next: RunExtras) {
+  extras = next;
+  for (const l of listeners) l();
+}
+
+/** The live run's capture report, splat choice and actions. */
+export function useRunExtras(): RunExtras {
+  return useSyncExternalStore(subscribe, () => extras);
+}
+
 /* One run of the #/3d page, addressed by the route (#/3d/<run>), so a reload
    or a shared link re-attaches to it. Works for `image_to_3d.reconstruct`
    and the COLMAP `image_to_3d.train` alike: it fetches each newly announced
@@ -51,6 +89,9 @@ export function useReconstruct(runId: string | undefined) {
   const [points, setPoints] = useState<PointsSource>();
   const [cameras, setCameras] = useState<Frustum[]>([]);
   const [snapshot, setSnapshot] = useState<{ revision: number; info: unknown }>();
+  const [capture, setCapture] = useState<CaptureReport>();
+  const [clean, setClean] = useState(false);
+  const [actionError, setActionError] = useState<string>();
   const sendAbort = useRef<AbortController>(undefined);
 
   useEffect(() => {
@@ -59,6 +100,9 @@ export function useReconstruct(runId: string | undefined) {
     setPoints(undefined);
     setCameras([]);
     setSnapshot(undefined);
+    setCapture(undefined);
+    setClean(false);
+    setActionError(undefined);
     if (!runId) return;
     setError(undefined);
     const abort = new AbortController();
@@ -72,7 +116,10 @@ export function useReconstruct(runId: string | undefined) {
       });
 
     const onAnnounce = (a: Announcement) => {
-      if (a.slot === "mesh") {
+      if (a.slot === "capture") {
+        const c = readCapture(a.info);
+        if (c) setCapture(c);
+      } else if (a.slot === "mesh") {
         // Generate op announces the GLB mesh.
         gotSplat = true;
         setSnapshot({ revision: a.revision, info: a.info });
@@ -96,6 +143,8 @@ export function useReconstruct(runId: string | undefined) {
       .watchRun(runId, { signal, onDetail: setDetail, onAnnounce })
       .then((last) => {
         const out = last.run.output as ReconstructOutput | null;
+        const c = readCapture(out?.capture);
+        if (c) setCapture(c);
         const final = out?.spz ?? out?.ply;
         if (last.run.status === "succeeded" && final && !gotSplat) {
           return loadSplat(final.id, formatOf(final), false);
@@ -207,6 +256,55 @@ export function useReconstruct(runId: string | undefined) {
       return cache.get(i)!;
     };
   }, [runId, cameras, remoteKey]);
+
+  // The floater-free splat or the trained one, on request.
+  const output = detail?.run.status === "succeeded" ? (detail.run.output as ReconstructOutput | null) : null;
+  const cleanId = output?.quality?.floaters?.spz;
+  const finalRef = output?.spz;
+  const showClean = useCallback(
+    (on: boolean) => {
+      const id = on ? cleanId : finalRef?.id;
+      if (!runId || !id) return;
+      setActionError(undefined);
+      fetchArtifact(id)
+        .then((blob) => blob.arrayBuffer())
+        .then((bytes) => {
+          setSplat({ key: runId, bytes, format: "spz", live: true });
+          setClean(on);
+        })
+        .catch((e: unknown) => setActionError(describeError(e)));
+    },
+    [runId, cleanId, finalRef?.id],
+  );
+
+  const isReconstruct = detail?.run.op_id === RECONSTRUCT_OP;
+  const longer = useMemo(() => (isReconstruct ? trainLongerInput(input) : undefined), [isReconstruct, input]);
+  const trainLonger = useCallback(async () => {
+    if (!longer || !runId) return;
+    setActionError(undefined);
+    try {
+      const run = await client.startRun(RECONSTRUCT_OP, longer);
+      const files = localPhotos.get(runId);
+      if (files) localPhotos.set(run.id, files);
+      window.location.hash = `#/3d/${encodeURIComponent(run.id)}`;
+    } catch (e) {
+      setActionError(describeError(e));
+    }
+  }, [longer, runId]);
+
+  const hasLonger = Boolean(longer);
+  useEffect(() => {
+    publish({
+      runId,
+      capture,
+      clean,
+      showClean: cleanId ? showClean : undefined,
+      trainLonger: hasLonger ? trainLonger : undefined,
+      cancel: () => void cancel(),
+      actionError,
+    });
+  }, [runId, capture, clean, cleanId, showClean, hasLonger, trainLonger, cancel, actionError]);
+  useEffect(() => () => publish(NO_EXTRAS), []);
 
   return { sending, error, detail, splat, points, cameras, snapshot, photoFor, start, startSample, stopSending, cancel };
 }

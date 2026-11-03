@@ -18,7 +18,8 @@ import {
   type ReconstructOutput,
 } from "./reconstruct";
 import type { TrainOptions } from "./use-train";
-import type { Sending } from "./use-reconstruct";
+import { CaptureCard, ResultCard } from "./quality";
+import { useRunExtras, type Sending } from "./use-reconstruct";
 
 type Input = "media" | "colmap";
 
@@ -365,6 +366,7 @@ export function NewScenePanel({
 
 /** ingest → posing → init → refine → mesh → export, with the live numbers. */
 export function StageBar({ finished, live, mesh }: { finished: boolean; live: LiveNumbers; mesh: boolean }) {
+  const extras = useRunExtras();
   const states = stageStates(live.stage, { mesh, finished });
   const shown = STAGES.filter((s) => states[s] !== "skipped");
   return (
@@ -410,6 +412,7 @@ export function StageBar({ finished, live, mesh }: { finished: boolean; live: Li
         <Fact k="held-out PSNR" v={live.psnr === undefined ? "–" : `${live.psnr.toFixed(2)} dB`} />
         <Fact k="gaussians" v={live.gaussians === undefined ? "–" : live.gaussians.toLocaleString()} />
       </dl>
+      {extras.capture ? <CaptureCard capture={extras.capture} going={!finished} onStop={extras.cancel} /> : null}
     </div>
   );
 }
@@ -425,10 +428,14 @@ function Fact({ k, v }: { k: string; v: string }) {
 
 /** Numbers and downloads of a finished reconstruction. */
 export function ReconstructResult({ out }: { out: ReconstructOutput }) {
+  const extras = useRunExtras();
   const rows: [string, string][] = [];
   if (out.summary?.images) rows.push(["images", out.summary.images.toLocaleString()]);
   if (out.summary?.total_s) rows.push(["time", `${out.summary.total_s.toFixed(1)} s`]);
   if (out.summary?.final_gaussians) rows.push(["gaussians", out.summary.final_gaussians.toLocaleString()]);
+  if (out.frames) rows.push(["frames", out.frames.toLocaleString()]);
+  if (out.gaussians) rows.push(["gaussians", out.gaussians.toLocaleString()]);
+  if (out.wall_s) rows.push(["time", `${out.wall_s.toFixed(1)} s`]);
   if (out.eval?.psnr !== undefined) rows.push(["PSNR", `${out.eval.psnr.toFixed(2)} dB`]);
   if (out.eval?.ssim !== undefined) rows.push(["SSIM", out.eval.ssim.toFixed(4)]);
   if (out.eval?.lpips !== undefined) rows.push(["LPIPS", out.eval.lpips.toFixed(3)]);
@@ -445,6 +452,15 @@ export function ReconstructResult({ out }: { out: ReconstructOutput }) {
   const files = all.filter((f): f is [string, string, ArtifactRef] => Boolean(f[2]));
   return (
     <div className="space-y-4 border-t border-[var(--ds-gray-alpha-400)] pt-4">
+      {out.quality ? (
+        <ResultCard
+          quality={out.quality}
+          clean={extras.clean}
+          onShowClean={extras.showClean}
+          onTrainLonger={extras.trainLonger}
+          error={extras.actionError}
+        />
+      ) : null}
       {rows.length ? (
         <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3">
           {rows.map(([k, v]) => (
