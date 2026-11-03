@@ -17,11 +17,13 @@ export type Frustum = {
   aspect: number;
   /** The photo's file name, when the cameras artifact gives one. */
   name?: string;
+  /** The exact pose and intrinsics, for looking through the camera. */
+  pinhole?: Pinhole;
 };
 
 type M3 = [number, number, number, number, number, number, number, number, number];
 
-type Pinhole = {
+export type Pinhole = {
   r_cw: M3;
   t_cw: Vec3;
   fx: number;
@@ -69,6 +71,7 @@ export function pinholeFrustum(c: Pinhole): Frustum {
     center: camToWorld(c.r_cw, c.t_cw, [0, 0, 0]),
     corners: pts.map((p) => camToWorld(c.r_cw, c.t_cw, p)) as Frustum["corners"],
     aspect: c.width / c.height,
+    pinhole: c,
     ...(c.name ? { name: c.name } : {}),
   };
 }
@@ -160,6 +163,16 @@ const unit = (a: Vec3): Vec3 => {
     direction, the image's up (−y), and the vertical field of view in
     degrees (assuming a centred principal point). */
 export function cameraView(f: Frustum): { forward: Vec3; up: Vec3; fovY: number } {
+  const p = f.pinhole;
+  if (p) {
+    // World → camera rows are the camera's axes in world coordinates.
+    const r = p.r_cw;
+    return {
+      forward: unit([r[6], r[7], r[8]]),
+      up: unit([-r[3], -r[4], -r[5]]),
+      fovY: (2 * Math.atan(p.height / (2 * p.fy)) * 180) / Math.PI,
+    };
+  }
   const mid = (a: Vec3, b: Vec3): Vec3 => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
   const [c0, c1, c2, c3] = f.corners;
   const top = sub(mid(c0, c1), f.center);
@@ -213,4 +226,48 @@ export function focusPoint(frustums: Frustum[]): Vec3 | undefined {
   const det3 = (m: number[]) =>
     m[0]! * (m[4]! * m[8]! - m[5]! * m[7]!) - m[1]! * (m[3]! * m[8]! - m[5]! * m[6]!) + m[2]! * (m[3]! * m[7]! - m[4]! * m[6]!);
   return [det3(col(0, b)) / det, det3(col(1, b)) / det, det3(col(2, b)) / det];
+}
+
+/** How a capture was shot, for the viewer's default controls. `room` when
+    the cameras look outward from among themselves (a walk through a room or
+    street) or all the same way, rather than in at one object; `scale` is
+    the cameras' median distance from their centroid (or the neighbour gap),
+    the fly speed's unit. */
+export function sceneLayout(frustums: Frustum[]): { room: boolean; scale: number } {
+  if (frustums.length < 3) return { room: false, scale: frustumScale(frustums) / 0.6 };
+  const n = frustums.length;
+  const mid: Vec3 = [0, 0, 0];
+  for (const f of frustums) for (let k = 0; k < 3; k += 1) mid[k] = mid[k]! + f.center[k]! / n;
+  const radii = frustums.map((f) => len(sub(f.center, mid))).sort((x, y) => x - y);
+  const spread = radii[n >> 1]!;
+  const scale = spread > 0 ? spread : frustumScale(frustums) / 0.6;
+  // Mean cosine between each view and the way out from the centroid:
+  // about −1 circling an object, 0 or more walking about a room.
+  let outward = 0;
+  for (const f of frustums) {
+    const away = sub(f.center, mid);
+    const l = len(away);
+    if (l < 1e-9) continue;
+    const d = cameraView(f).forward;
+    outward += (d[0] * away[0] + d[1] * away[1] + d[2] * away[2]) / l / n;
+  }
+  const focus = focusPoint(frustums);
+  // An object sits well inside the ring of cameras that look at it.
+  const inward = focus !== undefined && len(sub(focus, mid)) < spread * 0.75;
+  return { room: outward > -0.35 || !inward, scale };
+}
+
+/** A three.js-style projection matrix (column-major) that shows camera `p`
+    exactly, its image fitted (letterboxed) and centred in a `w` × `h`
+    canvas: the same place `object-fit: contain` puts the photo. */
+export function pinholeProjection(p: Pinhole, w: number, h: number, near: number, far: number): number[] {
+  const k = Math.min(w / p.width, h / p.height);
+  const sx = (2 * p.fx * k) / w;
+  const sy = (2 * p.fy * k) / h;
+  // Principal point offset from the image centre, in NDC (image v runs down).
+  const ox = (2 * (p.cx - p.width / 2) * k) / w;
+  const oy = (-2 * (p.cy - p.height / 2) * k) / h;
+  const a = -(far + near) / (far - near);
+  const b = (-2 * far * near) / (far - near);
+  return [sx, 0, 0, 0, 0, sy, 0, 0, -ox, -oy, a, -1, 0, 0, b, 0];
 }

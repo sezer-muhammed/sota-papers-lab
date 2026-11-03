@@ -5,11 +5,24 @@ import { cn } from "@spl/ui";
 const clamp = (n: number) => Math.min(100, Math.max(0, n));
 
 /* Over the viewer while it looks through a camera: the photo on the left
-   of a movable split, the render on the right. The photo fills the height
-   and is centred, which lines up with the render because the viewer took
-   the camera's vertical field of view. Drag, click or use the handle (a
+   of a movable split, the render on the right. The photo is fitted inside
+   the frame (contain), where the viewer draws the camera's exact
+   intrinsics, so the two line up; its opacity is adjustable. Drag, click or use the handle (a
    slider: arrows, Page Up/Down, Home, End), like the Home page's compare. */
-export function Wipe({ label, onLeave, photo }: { label: string; onLeave: () => void; photo: string }) {
+export function Wipe({
+  label,
+  onKeyDown: onOuterKey,
+  onLeave,
+  opacity = 1,
+  photo,
+}: {
+  label: string;
+  /** Keys the slider does not use (camera stepping). */
+  onKeyDown?: (e: KeyboardEvent<HTMLDivElement>) => void;
+  onLeave: () => void;
+  opacity?: number;
+  photo: string;
+}) {
   const [split, setSplit] = useState(50);
   const frame = useRef<HTMLDivElement>(null);
   const dragging = useRef<number>(undefined);
@@ -41,7 +54,7 @@ export function Wipe({ label, onLeave, photo }: { label: string; onLeave: () => 
       End: 100,
     };
     if (e.key === "Escape") return onLeave();
-    if (!(e.key in next)) return;
+    if (!(e.key in next)) return onOuterKey?.(e);
     e.preventDefault();
     setSplit(clamp(next[e.key]!));
   };
@@ -65,7 +78,8 @@ export function Wipe({ label, onLeave, photo }: { label: string; onLeave: () => 
           src={photo}
           alt={`${label}: the photo`}
           draggable={false}
-          className="absolute left-1/2 top-0 h-full w-auto max-w-none -translate-x-1/2 select-none"
+          style={{ opacity }}
+          className="absolute inset-0 h-full w-full select-none object-contain"
         />
       </div>
       <span aria-hidden="true" className={cn(chip, "left-3", split < 14 && "opacity-0")}>
@@ -81,7 +95,7 @@ export function Wipe({ label, onLeave, photo }: { label: string; onLeave: () => 
         className="absolute right-3 top-3 grid h-8 w-8 place-items-center rounded-[6px] bg-black/60 text-white outline-none focus-visible:shadow-[var(--ds-focus-ring)]"
       >
         <X aria-hidden="true" className="h-4 w-4" />
-        <span className="sr-only">Close the comparison and orbit</span>
+        <span className="sr-only">Leave camera view</span>
       </button>
       <div
         aria-hidden="true"
