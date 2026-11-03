@@ -22,7 +22,7 @@ use super::{BakeCamera, Mesh, TriMesh};
 use crate::frame::{CameraTable, FrameParams, IterParams};
 use crate::gpu::CudaResultExt;
 use crate::gpu::Gpu;
-use crate::io::images::load_view_image;
+use crate::io::images::{Rgb8Image, downscale_area, load_view_image};
 use crate::io::scene::View;
 use crate::kernels::layout::{EPS2D_DEFAULT, FLAG_AA};
 use crate::kernels::raster::{FrameSource, GpuRaster, SplatRaster};
@@ -606,6 +606,20 @@ pub fn build(
     views: &[View],
     cfg: &MeshConfig,
 ) -> Result<MeshResult> {
+    build_with(gpu, cloud, views, cfg, None)
+}
+
+/// [`build`] with optional pre-loaded images (one per view, same order).
+/// When `images` is `Some`, the bake reads from them instead of
+/// `view.image_path` — required for video inputs whose keyframes exist
+/// only in memory.
+pub fn build_with(
+    gpu: &Gpu,
+    cloud: &GaussiansHost,
+    views: &[View],
+    cfg: &MeshConfig,
+    images: Option<&[Rgb8Image]>,
+) -> Result<MeshResult> {
     let started = Instant::now();
     let mut summary = MeshSummary::default();
     // On a pool overflow keep the box and coarsen the samples (blocks fall
@@ -668,10 +682,33 @@ pub fn build(
     let atlas = if cfg.texture && !views.is_empty() {
         let k = (cfg.bake_views.max(1) as usize).min(views.len());
         let picks: Vec<usize> = (0..k).map(|i| i * views.len() / k).collect();
-        let imgs = picks
-            .iter()
-            .map(|&i| load_view_image(&views[i]))
-            .collect::<Result<Vec<_>>>()?;
+        let imgs = match images {
+            Some(all) => picks
+                .iter()
+                .map(|&i| {
+                    let img = &all[i];
+                    let v = &views[i];
+                    if (img.width, img.height) == (v.width, v.height) {
+                        Ok(img.clone())
+                    } else {
+                        ensure!(
+                            img.width >= v.width && img.height >= v.height,
+                            "image {} is {}x{}, smaller than its view {}x{}",
+                            v.name,
+                            img.width,
+                            img.height,
+                            v.width,
+                            v.height
+                        );
+                        Ok(downscale_area(img, v.width, v.height))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => picks
+                .iter()
+                .map(|&i| load_view_image(&views[i]))
+                .collect::<Result<Vec<_>>>()?,
+        };
         let cams: Vec<BakeCamera> = picks.iter().map(|&i| bake_camera(&views[i])).collect();
         let data: Vec<&[u8]> = imgs.iter().map(|m| m.data.as_slice()).collect();
         let (a, ms) = super::fastbake::bake(&uv, &cams, &data)?;

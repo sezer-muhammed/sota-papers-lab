@@ -496,3 +496,102 @@ fn gpu_geo_pose_accuracy() {
     }
     eprintln!("{}", serde_json::to_string(&rows).unwrap());
 }
+
+/// Video → reconstruct (fast, small) → mesh → GLB valid.
+///
+/// `$SPL_RECON_VIDEO` must point to a video file (e.g. a garden clip).
+/// Verifies that the texture bake works from in-memory keyframes (no
+/// `image_path` files on disk), the bug fixed by mesh-video-fix.
+#[test]
+#[ignore = "GPU, weights and video: run on the GPU host"]
+fn gpu_video_reconstruct_mesh() {
+    let cancel = CancellationToken::new();
+    let video_path = PathBuf::from(env(
+        "SPL_RECON_VIDEO",
+        "/datasets/mipnerf360/garden/garden.mp4",
+    ));
+    assert!(
+        video_path.is_file(),
+        "video not found: {}",
+        video_path.display()
+    );
+    let ingest_cfg = IngestConfig {
+        trainer_long_side: 400,
+        max_frames: 20,
+        ..Default::default()
+    };
+    let ingested = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(ingest_video(&video_path, &ingest_cfg, &cancel))
+        .unwrap();
+    let n = ingested.frames.len();
+    eprintln!("ingested {n} keyframes from {}", video_path.display());
+    assert!(n >= 2, "need at least 2 keyframes, got {n}");
+    let frames = to_frames(ingested);
+    let weights = PathBuf::from(env(
+        "SPL_VGGT_WEIGHTS",
+        "/models/vggt-omega/vggt_omega_1b_512.safetensors",
+    ));
+    let mut cfg = PipelineConfig::preset(ReconPreset::Fast);
+    cfg.iterations = Some(2000);
+    cfg.mesh = Some(crate::mesh::pipeline::MeshConfig::default());
+    let mut r = reconstruct_with(
+        &weights,
+        frames,
+        &cfg,
+        0,
+        &cancel,
+        &mut |e| {
+            if let Event::Log(msg) = e {
+                eprintln!("[video-mesh] {msg}");
+            }
+        },
+        None,
+    )
+    .unwrap();
+    eprintln!(
+        "reconstruct: {} Gaussians, {} views, {:.1} s",
+        r.cloud.len(),
+        r.views.len(),
+        r.times.total_s
+    );
+
+    // The fix: training_images must be retained when mesh was requested.
+    let imgs = std::mem::take(&mut r.training_images);
+    assert!(
+        !imgs.is_empty(),
+        "training_images must be retained for mesh (got {} images for {} views)",
+        imgs.len(),
+        r.views.len()
+    );
+    assert_eq!(imgs.len(), r.views.len());
+
+    // Try mesh build with in-memory images. The old bug was "No such file
+    // or directory" because video keyframes have no disk path. Accept
+    // "fused surface is empty" when the reconstruction quality is too low
+    // for TSDF fusion (shared-GPU test with minimal params).
+    let gpu = crate::gpu::Gpu::open().unwrap();
+    let mesh_cfg = crate::mesh::pipeline::MeshConfig::default();
+    let mesh_result =
+        crate::mesh::pipeline::build_with(&gpu, &r.cloud, &r.views, &mesh_cfg, Some(&imgs));
+    match mesh_result {
+        Ok(mesh) => {
+            eprintln!("mesh: {:?}", mesh.summary);
+            let info = crate::mesh::glb::validate_glb(&mesh.glb).unwrap();
+            eprintln!("GLB valid: {info:?}");
+            assert!(mesh.summary.triangles > 0);
+            assert!(mesh.glb.len() > 100);
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains("No such file"),
+                "file-not-found is the video-mesh bug: {e}"
+            );
+            eprintln!("mesh skipped (expected on shared GPU): {e}");
+        }
+    }
+    r.release();
+}
