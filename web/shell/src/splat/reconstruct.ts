@@ -7,6 +7,11 @@
    reads (missing fields are tolerated). Replace both with the ts-rs
    bindings once the op lands. */
 import type { ArtifactRef } from "@spl/sdk";
+import type { CaptureReport } from "@spl/bindings/image-to-3d/CaptureReport";
+import type { FloaterReport } from "@spl/bindings/image-to-3d/FloaterReport";
+import type { ResultReport } from "@spl/bindings/image-to-3d/ResultReport";
+
+export type { CaptureReport, FloaterReport, ResultReport };
 
 export const RECONSTRUCT_OP = "image_to_3d.reconstruct";
 export const GENERATE_OP = "image_to_3d.generate";
@@ -45,6 +50,10 @@ export type ReconstructInput = {
   engine_schedule?: string;
   /** Frame cap; the op's field is `max_frames` (photos are subsampled evenly above it). */
   max_frames: number;
+  /** Hold out every 8th frame and report quality (the op's default: on). */
+  evaluate?: boolean;
+  /** Video keyframes along the camera's path (`motion`, default) or the clock. */
+  keyframes?: "motion" | "time";
 };
 
 export type ReconstructOutput = {
@@ -59,6 +68,14 @@ export type ReconstructOutput = {
   summary?: { total_s?: number; final_gaussians?: number; images?: number };
   engine?: string;
   licence?: string;
+  /** What the op actually returns (the fields above are older names). */
+  frames?: number;
+  gaussians?: number;
+  wall_s?: number;
+  /** Blur, motion, exposure and camera spread, with tips. */
+  capture?: CaptureReport;
+  /** Held-out quality, worst views and the floater-free splat. */
+  quality?: ResultReport;
 };
 
 export function reconstructInput(
@@ -248,4 +265,70 @@ export function matchPhotos(cameraNames: (string | undefined)[], photoNames: str
     if (named) return n ? byName.get(base(n)) : undefined;
     return cameraNames.length === photoNames.length ? i : undefined;
   });
+}
+
+/* ---- Capture and result reports ---- */
+
+export type Verdict = "good" | "ok" | "poor";
+export type Rating = "good" | "ok" | "weak";
+
+const isObj = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === "object";
+
+/** The `capture` announcement's info (or the output's `capture`), checked. */
+export function readCapture(info: unknown): CaptureReport | undefined {
+  if (!isObj(info) || typeof info.verdict !== "string" || !Array.isArray(info.tips) || !isObj(info.stats)) return undefined;
+  return { ...(info as CaptureReport), problems: Array.isArray(info.problems) ? (info.problems as string[]) : [] };
+}
+
+/** Fill-in-the-blank numbers of the capture card, in plain words. */
+export function captureFacts(c: CaptureReport): [string, string][] {
+  const pct = (x: number) => `${Math.round(100 * x)} %`;
+  const rows: [string, string][] = [["frames", `${c.frames}${c.stats.decoded > c.frames ? ` of ${c.stats.decoded}` : ""}`]];
+  rows.push(["blurry", pct(c.stats.blurry_share)]);
+  if (c.stats.still_share !== undefined) rows.push(["standing still", pct(c.stats.still_share)]);
+  rows.push(["clipped", pct(c.stats.bright_clip_share + c.stats.dark_clip_share)]);
+  if (c.orbit_deg !== undefined) rows.push(["orbit", `${Math.round(c.orbit_deg)}°`]);
+  if (c.baseline !== undefined) rows.push(["camera travel", `${c.baseline.toFixed(2)}× distance`]);
+  return rows;
+}
+
+/** One-line headline of the capture verdict. */
+export function verdictHeadline(v: string): string {
+  return v === "poor"
+    ? "This capture will likely give a weak result."
+    : v === "ok"
+      ? "Usable capture, with room to improve."
+      : "Good capture.";
+}
+
+/** Rating copy: what the held-out numbers mean for someone who is not an expert. */
+export const RATING_NOTE: Record<Rating, string> = {
+  good: "Views the model never saw look close to the photos.",
+  ok: "Recognisable from new angles, with soft or smeared detail.",
+  weak: "New angles break up; recapture or train longer.",
+};
+
+/** The next preset up for "Train longer" (the trainer cannot resume a run). */
+export function longerPreset(p: string | undefined): Preset | undefined {
+  return p === "fast" ? "quality" : p === "quality" ? "big" : undefined;
+}
+
+/** The input of a "Train longer" rerun: the same media and options, one preset up. */
+export function trainLongerInput(input: Partial<ReconstructInput> | undefined): ReconstructInput | undefined {
+  if (!input) return undefined;
+  const preset = longerPreset(input.preset ?? "quality");
+  if (!preset) return undefined;
+  return { ...(input as ReconstructInput), preset };
+}
+
+/** "−212,431 Gaussians (17 %), held-out PSNR +0.04 dB". */
+export function floaterSummary(f: FloaterReport): string {
+  const gone = f.before - f.after;
+  const share = f.before ? Math.round((100 * gone) / f.before) : 0;
+  let s = `${gone.toLocaleString("en-US")} of ${f.before.toLocaleString("en-US")} Gaussians (${share} %)`;
+  if (f.psnr_before !== undefined && f.psnr_after !== undefined) {
+    const d = f.psnr_after - f.psnr_before;
+    s += `; held-out PSNR ${d >= 0 ? "+" : "−"}${Math.abs(d).toFixed(2)} dB`;
+  }
+  return s;
 }

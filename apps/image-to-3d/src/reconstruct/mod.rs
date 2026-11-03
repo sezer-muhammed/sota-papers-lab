@@ -20,6 +20,7 @@ pub mod geom;
 pub mod joint;
 pub mod pipeline;
 pub mod prune;
+pub mod report;
 pub mod scene;
 
 #[cfg(test)]
@@ -36,7 +37,7 @@ use ts_rs::TS;
 use crate::engine::LicenceProfile;
 use crate::export::ply::write_inria_ply;
 use crate::export::{MEDIA_JSON, MEDIA_PLY, MEDIA_SPZ, MEDIA_ZIP};
-use crate::ingest::{IngestConfig, IngestResult, ingest_images, ingest_video};
+use crate::ingest::{IngestConfig, IngestResult, KeyframeMode, ingest_images, ingest_video};
 use crate::io::images::Rgb8Image;
 use crate::vggt::VggtEngine;
 pub use pipeline::{Event, Frames, PipelineConfig, ReconPreset, StageTimes, reconstruct};
@@ -47,6 +48,10 @@ fn default_max_frames() -> u32 {
 
 fn default_long_side() -> u32 {
     1600
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, TS)]
@@ -87,6 +92,13 @@ pub struct ReconstructInput {
     /// Build a mesh (.glb) from the trained splat; `false` by default.
     #[serde(default)]
     pub mesh: bool,
+    /// Hold out every 8th frame (from 24 frames up) and report held-out
+    /// quality, the worst views and a floater-free splat; `true` by default.
+    #[serde(default = "default_true")]
+    pub evaluate: bool,
+    /// How video keyframes are spread (`motion` by default).
+    #[serde(default)]
+    pub keyframes: KeyframeMode,
 }
 
 #[derive(Debug, Serialize, JsonSchema, TS)]
@@ -116,6 +128,12 @@ pub struct ReconstructOutput {
     /// Why the requested mesh is missing; the splat outputs are still valid.
     #[ts(optional)]
     pub mesh_error: Option<String>,
+    /// Blur, motion, exposure and camera spread, with tips.
+    #[ts(optional)]
+    pub capture: Option<report::CaptureReport>,
+    /// Held-out quality, worst views and floater removal.
+    #[ts(optional)]
+    pub quality: Option<report::ResultReport>,
     /// The front end that produced the poses.
     pub engine: String,
     /// SPDX licence of the engine's weights.
@@ -152,6 +170,7 @@ impl Op for Reconstruct {
         let ingest_cfg = IngestConfig {
             trainer_long_side: input.long_side,
             max_frames: input.max_frames,
+            keyframes: input.keyframes,
             ..Default::default()
         };
         let ingested = ingest(cx, &input, &ingest_cfg).await?;
@@ -162,8 +181,18 @@ impl Op for Reconstruct {
             ingested.stats.decoded
         ));
         cx.metric("ingest_time", ingest_s, "s");
+        let mut relay_state = report::CaptureRelay::new(ingested.capture.clone());
         let frames = to_frames(ingested);
         let n_frames = frames.names.len() as u32;
+        let holdout = if input.evaluate && n_frames as usize >= report::HOLDOUT_MIN_FRAMES {
+            report::HOLDOUT_EVERY
+        } else {
+            0
+        };
+        let preset_name = serde_json::to_value(input.preset)?
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let (engine_name, engine_licence) = match profile {
             LicenceProfile::Research => ("vggt-omega-1b-512".to_string(), "FAIR-NC".to_string()),
             LicenceProfile::Commercial => ("da3-base".to_string(), "Apache-2.0".to_string()),
@@ -180,8 +209,17 @@ impl Op for Reconstruct {
             let mut send = |e: Event| {
                 let _ = tx.send(e);
             };
-            let r = reconstruct(&weights, frames, &cfg, 0, &cancel, &mut send);
+            let r = reconstruct(&weights, frames, &cfg, holdout, &cancel, &mut send);
             let mut r = r.inspect_err(|_| crate::vram::release_quietly())?;
+            // A failed report never fails the run: the splat is the product.
+            send(Event::Progress(0.9, "evaluating".into()));
+            let evaluated = match report::evaluate(&mut r, &preset_name) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    send(Event::Log(format!("result report failed: {e:#}")));
+                    None
+                }
+            };
             // The mesher only needs the host splat and the cameras: free the
             // trainer (parameters, Adam moments, gradients, images, caches)
             // and hand its pool blocks back before meshing.
@@ -234,18 +272,34 @@ impl Op for Reconstruct {
                 r.cloud.len(),
                 coexist,
                 glb,
+                evaluated,
             ))
         });
         let relay = async {
             while let Some(e) = rx.recv().await {
-                if let Err(err) = relay_event(cx, e).await {
+                if let Err(err) = relay_event(cx, e, &mut relay_state).await {
                     cx.log(format!("could not store an intermediate result: {err:#}"));
                 }
             }
         };
         let (res, ()) = tokio::join!(job, relay);
-        let (spz, ply, cameras, transforms, colmap, times, iterations, n, coexist, glb_bytes) =
-            res??;
+        let (
+            spz,
+            ply,
+            cameras,
+            transforms,
+            colmap,
+            times,
+            iterations,
+            n,
+            coexist,
+            glb_bytes,
+            evaluated,
+        ) = res??;
+        let quality = match evaluated {
+            Some(e) => Some(report::store(cx, e).await?),
+            None => None,
+        };
         cx.progress(0.98, "storing exports");
         let spz = cx
             .artifacts
@@ -311,18 +365,21 @@ impl Op for Reconstruct {
             gpu_wait_s: coexist.waited_s,
             glb,
             mesh_error,
+            capture: relay_state.report,
+            quality,
             engine: engine_name,
             licence: engine_licence,
         })
     }
 }
 
-async fn relay_event(cx: &RunCx, e: Event) -> Result<()> {
+async fn relay_event(cx: &RunCx, e: Event, capture: &mut report::CaptureRelay) -> Result<()> {
     match e {
         Event::Progress(f, msg) => cx.progress(f, msg),
         Event::Log(msg) => cx.log(msg),
         Event::Waiting(f, msg, data) => cx.progress_with(f, msg, data),
         Event::Cameras(json) => {
+            capture.cameras = Some(json.clone());
             let a = cx
                 .artifacts
                 .put(json, ArtifactKind::Cameras, MEDIA_JSON)
@@ -330,6 +387,7 @@ async fn relay_event(cx: &RunCx, e: Event) -> Result<()> {
             cx.announce("cameras", &a, serde_json::Value::Null);
         }
         Event::Points(ply, n) => {
+            capture.announce(cx, &ply).await?;
             let a = cx
                 .artifacts
                 .put(ply, ArtifactKind::Splat, MEDIA_PLY)

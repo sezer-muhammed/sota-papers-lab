@@ -10,8 +10,8 @@ use spl_core::{CancellationToken, Context, Result, bail};
 
 use super::gpu::{IngestGpu, Resident};
 use super::{
-    FocalPrior, IngestConfig, IngestFrame, IngestResult, IngestStats, Rgb8, SharpnessSample, exif,
-    fit_size, median_prior,
+    CaptureStats, FocalPrior, IngestConfig, IngestFrame, IngestResult, IngestStats, Rgb8,
+    SharpnessSample, exif, fit_size, median_prior,
 };
 
 /// Decodes one JPEG, PNG or WebP with its EXIF orientation applied; returns
@@ -122,6 +122,7 @@ pub fn ingest_images(
     let n = frames.len() as u32;
     Ok(IngestResult {
         focal_prior: median_prior(&frames),
+        capture: CaptureStats::from_photos(&frames),
         frames,
         sharpness,
         stats: IngestStats {

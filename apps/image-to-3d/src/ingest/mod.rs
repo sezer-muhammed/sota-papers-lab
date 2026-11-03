@@ -8,21 +8,31 @@
 //! - Video ([`ingest_video`]): `ffprobe` for size, rotation and duration, then
 //!   `ffmpeg` decodes packed RGB to a pipe as a child process that dies with
 //!   the future (`kill_on_drop`) and stops on the run's cancel token.
-//!   Keyframes: the timeline is cut into `max_frames` equal bins; each bin
-//!   keeps its sharpest frame (Laplacian variance of luma, one CUDA kernel),
-//!   so frames are spread uniformly in time and blurred ones lose. Only a
-//!   frame that becomes its bin's best is resized and downloaded.
+//!   Keyframes ([`KeyframeMode::Motion`], the default): every decoded frame
+//!   gets a sharpness score (Laplacian variance of luma, one CUDA kernel)
+//!   and a global motion estimate on a small luma thumbnail ([`motion`]);
+//!   the camera's path is cut into `max_frames` equal slices of motion, each
+//!   keeping its sharpest frame, so standing still costs no frames, fast
+//!   pans keep coverage, and blurry frames and near duplicates lose. The
+//!   picks are resized in a second decode. [`KeyframeMode::Time`] keeps the
+//!   older one-pass policy (equal time bins).
 //! - Resizing to both resolutions is an area (box) filter on the GPU.
 //!
 //! The ffmpeg binary must exist in the runtime image: see
 //! `apps/image-to-3d/src/ingest/DOCKERFILE_PATCH.md`.
 
+pub mod capture;
 mod decode;
 pub mod exif;
 pub mod gpu;
+pub mod motion;
 mod video;
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
+pub use capture::CaptureStats;
 
 pub use decode::{decode_image, ingest_images};
 pub use video::{VideoInfo, ingest_video, probe_video};
@@ -42,6 +52,20 @@ pub struct IngestConfig {
     pub sample_fps: Option<f64>,
     /// Extra `ffmpeg` input options, e.g. `["-hwaccel", "cuda"]`.
     pub ffmpeg_input_args: Vec<String>,
+    /// How video keyframes are spread.
+    pub keyframes: KeyframeMode,
+}
+
+/// How video keyframes are spread over the clip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "image-to-3d/")]
+pub enum KeyframeMode {
+    /// Equal slices of camera motion (two decodes).
+    #[default]
+    Motion,
+    /// Equal slices of time (one decode).
+    Time,
 }
 
 impl Default for IngestConfig {
@@ -53,6 +77,7 @@ impl Default for IngestConfig {
             max_frames: 300,
             sample_fps: Some(10.0),
             ffmpeg_input_args: Vec::new(),
+            keyframes: KeyframeMode::default(),
         }
     }
 }
@@ -130,6 +155,8 @@ pub struct IngestResult {
     /// Median of the per-frame priors (photos), or `None`.
     pub focal_prior: Option<FocalPrior>,
     pub stats: IngestStats,
+    /// Blur, motion and exposure, for the capture report.
+    pub capture: CaptureStats,
 }
 
 impl IngestResult {

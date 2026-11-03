@@ -17,10 +17,13 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use super::capture::CaptureStats;
 use super::decode::resize_both;
 use super::gpu::{IngestGpu, Resident};
+use super::motion::{LumaThumb, Scored, Selection, frame_motion, select_keyframes};
 use super::{
-    IngestConfig, IngestFrame, IngestResult, IngestStats, KeyframeBins, Rgb8, SharpnessSample,
+    IngestConfig, IngestFrame, IngestResult, IngestStats, KeyframeBins, KeyframeMode, Rgb8,
+    SharpnessSample,
 };
 
 /// What ffprobe reports about the first video stream.
@@ -126,86 +129,39 @@ struct Decoded {
     data: Vec<u8>,
 }
 
-/// Video ingest: up to `cfg.max_frames` keyframes, one per equal time bin,
-/// each the sharpest decoded frame of its bin.
-pub async fn ingest_video(
+/// One decoded frame handed to a pass's step; `None` after the last one.
+type Step<S> = dyn FnMut(&mut S, &mut IngestGpu, Option<(u32, f64, &[u8])>) -> Result<()> + Send;
+
+/// One ffmpeg decode of `path`: every frame goes through `step` on a
+/// blocking GPU worker. Returns the state, frames decoded and GPU seconds.
+async fn decode_pass<S: Send + 'static>(
     path: &Path,
     cfg: &IngestConfig,
+    info: VideoInfo,
     cancel: &CancellationToken,
-) -> Result<IngestResult> {
-    let started = Instant::now();
-    let info = probe_video(path).await?;
+    mut state: S,
+    mut step: Box<Step<S>>,
+) -> Result<(S, u32, f64)> {
     let rate = cfg.sample_fps.unwrap_or(info.fps);
     let frame_len = info.width as usize * info.height as usize * 3;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-
     let (tx, mut rx) = mpsc::channel::<Decoded>(3);
     let (free_tx, free_rx) = std_mpsc::channel::<Vec<u8>>();
-    let worker_cfg = cfg.clone();
     let worker_cancel = cancel.clone();
     let worker = tokio::task::spawn_blocking(move || -> Result<_> {
         let mut g = IngestGpu::open()?;
-        let mut bins = KeyframeBins::new(info.duration_s, worker_cfg.max_frames);
-        let mut slots: Vec<Option<IngestFrame>> = vec![None; worker_cfg.max_frames.max(1) as usize];
-        let mut samples = Vec::new();
-        // The best frame of the open bin stays on the device; it is resized
-        // when a later bin opens (frames arrive in time order), so at most
-        // `max_frames` frames are resized and downloaded.
-        let mut open: Option<(usize, IngestFrame)> = None;
-        let mut finish = |g: &mut IngestGpu, open: Option<(usize, IngestFrame)>| -> Result<()> {
-            if let Some((b, mut f)) = open {
-                let r = Resident {
-                    width: f.source_size.0,
-                    height: f.source_size.1,
-                };
-                (f.engine, f.trainer) = resize_both(g, &worker_cfg, r, true)?;
-                slots[b] = Some(f);
-            }
-            Ok(())
-        };
         while let Some(d) = rx.blocking_recv() {
             if worker_cancel.is_cancelled() {
                 bail!("cancelled");
             }
-            let r = g.upload(info.width, info.height, &d.data)?;
-            let s = g.sharpness(r)?;
-            samples.push(SharpnessSample {
-                index: d.index,
-                timestamp_s: Some(d.t),
-                sharpness: s,
-            });
-            if let Some(b) = bins.offer(d.t, s, d.index) {
-                if open.as_ref().is_some_and(|(ob, _)| *ob != b) {
-                    finish(&mut g, open.take())?;
-                }
-                g.keep();
-                let empty = Rgb8 {
-                    width: 0,
-                    height: 0,
-                    data: Vec::new(),
-                };
-                open = Some((
-                    b,
-                    IngestFrame {
-                        source: String::new(),
-                        index: d.index,
-                        timestamp_s: Some(d.t),
-                        sharpness: s,
-                        source_size: (info.width, info.height),
-                        focal_prior: None,
-                        engine: empty.clone(),
-                        trainer: empty,
-                    },
-                ));
-            }
+            step(&mut state, &mut g, Some((d.index, d.t, &d.data)))?;
             let _ = free_tx.send(d.data);
         }
-        finish(&mut g, open.take())?;
-        drop(finish);
-        Ok((slots, samples, g.seconds))
+        step(&mut state, &mut g, None)?;
+        Ok((state, g.seconds))
     });
 
     let mut child = Command::new("ffmpeg")
@@ -258,7 +214,7 @@ pub async fn ingest_video(
     }
     let worker_result = worker.await.map_err(|e| anyhow!("ingest worker: {e}"))?;
     read_result?;
-    let (slots, sharpness, gpu_seconds) = worker_result?;
+    let (state, gpu_seconds) = worker_result?;
     let status = child.wait().await.context("wait for ffmpeg")?;
     let err = stderr_task.await.unwrap_or_default();
     if !status.success() {
@@ -267,22 +223,202 @@ pub async fn ingest_video(
     if index == 0 {
         bail!("ffmpeg decoded no frames from {name}");
     }
-    let mut frames: Vec<IngestFrame> = slots.into_iter().flatten().collect();
+    Ok((state, index, gpu_seconds))
+}
+
+/// Per-frame scores every pass collects: sharpness (GPU) and the global
+/// motion from the previous frame (CPU, on a 160 px luma thumbnail).
+#[derive(Default)]
+struct Scan {
+    samples: Vec<SharpnessSample>,
+    scored: Vec<Scored>,
+    prev: Option<LumaThumb>,
+}
+
+impl Scan {
+    fn score(
+        &mut self,
+        g: &mut IngestGpu,
+        info: VideoInfo,
+        index: u32,
+        t: f64,
+        data: &[u8],
+    ) -> Result<(Resident, f64)> {
+        let r = g.upload(info.width, info.height, data)?;
+        let s = g.sharpness(r)?;
+        let thumb = LumaThumb::from_rgb(info.width, info.height, data);
+        let motion = self
+            .prev
+            .as_ref()
+            .map_or(0.0, |p| frame_motion(p, &thumb).score());
+        self.prev = Some(thumb);
+        self.samples.push(SharpnessSample {
+            index,
+            timestamp_s: Some(t),
+            sharpness: s,
+        });
+        self.scored.push(Scored {
+            index,
+            t,
+            sharpness: s,
+            motion,
+        });
+        Ok((r, s))
+    }
+}
+
+fn blank_frame(index: u32, t: f64, s: f64, info: VideoInfo) -> IngestFrame {
+    let empty = Rgb8 {
+        width: 0,
+        height: 0,
+        data: Vec::new(),
+    };
+    IngestFrame {
+        source: String::new(),
+        index,
+        timestamp_s: Some(t),
+        sharpness: s,
+        source_size: (info.width, info.height),
+        focal_prior: None,
+        engine: empty.clone(),
+        trainer: empty,
+    }
+}
+
+/// Time slices, one pass: the best frame of the open slice stays on the
+/// device and is resized when a later slice opens (frames arrive in time
+/// order), so at most `max_frames` frames are resized and downloaded.
+async fn time_keyframes(
+    path: &Path,
+    cfg: &IngestConfig,
+    info: VideoInfo,
+    cancel: &CancellationToken,
+) -> Result<(Vec<IngestFrame>, Scan, u32, f64)> {
+    struct St {
+        scan: Scan,
+        bins: KeyframeBins,
+        slots: Vec<Option<IngestFrame>>,
+        open: Option<(usize, IngestFrame)>,
+    }
+    let st = St {
+        scan: Scan::default(),
+        bins: KeyframeBins::new(info.duration_s, cfg.max_frames),
+        slots: vec![None; cfg.max_frames.max(1) as usize],
+        open: None,
+    };
+    let c = cfg.clone();
+    let finish = move |st: &mut St, g: &mut IngestGpu, c: &IngestConfig| -> Result<()> {
+        if let Some((b, mut f)) = st.open.take() {
+            let r = Resident {
+                width: f.source_size.0,
+                height: f.source_size.1,
+            };
+            (f.engine, f.trainer) = resize_both(g, c, r, true)?;
+            st.slots[b] = Some(f);
+        }
+        Ok(())
+    };
+    let step: Box<Step<St>> = Box::new(move |st, g, d| {
+        let Some((index, t, data)) = d else {
+            return finish(st, g, &c);
+        };
+        let (_, s) = st.scan.score(g, info, index, t, data)?;
+        if let Some(b) = st.bins.offer(t, s, index) {
+            if st.open.as_ref().is_some_and(|(ob, _)| *ob != b) {
+                finish(st, g, &c)?;
+            }
+            g.keep();
+            st.open = Some((b, blank_frame(index, t, s, info)));
+        }
+        Ok(())
+    });
+    let (st, decoded, gpu_s) = decode_pass(path, cfg, info, cancel, st, step).await?;
+    Ok((
+        st.slots.into_iter().flatten().collect(),
+        st.scan,
+        decoded,
+        gpu_s,
+    ))
+}
+
+/// Motion slices, two passes: score every frame, pick along the camera's
+/// path ([`select_keyframes`]), then decode again and resize the picks.
+async fn motion_keyframes(
+    path: &Path,
+    cfg: &IngestConfig,
+    info: VideoInfo,
+    cancel: &CancellationToken,
+) -> Result<(Vec<IngestFrame>, Scan, Selection, u32, f64)> {
+    let step: Box<Step<Scan>> = Box::new(move |scan, g, d| {
+        if let Some((index, t, data)) = d {
+            scan.score(g, info, index, t, data)?;
+        }
+        Ok(())
+    });
+    let (scan, decoded, gpu_a) =
+        decode_pass(path, cfg, info, cancel, Scan::default(), step).await?;
+    let sel = select_keyframes(&scan.scored, cfg.max_frames as usize);
+    let by_index: std::collections::HashMap<u32, f64> =
+        scan.scored.iter().map(|f| (f.index, f.sharpness)).collect();
+    let keep = sel.kept.clone();
+    let c = cfg.clone();
+    let step: Box<Step<Vec<IngestFrame>>> = Box::new(move |out, g, d| {
+        let Some((index, t, data)) = d else {
+            return Ok(());
+        };
+        if keep.binary_search(&index).is_ok() {
+            let r = g.upload(info.width, info.height, data)?;
+            let mut f = blank_frame(index, t, by_index.get(&index).copied().unwrap_or(0.0), info);
+            (f.engine, f.trainer) = resize_both(g, &c, r, false)?;
+            out.push(f);
+        }
+        Ok(())
+    });
+    let (frames, _, gpu_b) = decode_pass(path, cfg, info, cancel, Vec::new(), step).await?;
+    Ok((frames, scan, sel, decoded, gpu_a + gpu_b))
+}
+
+/// Video ingest: up to `cfg.max_frames` sharp keyframes, spread along the
+/// camera's path ([`KeyframeMode::Motion`], two decodes) or evenly in time
+/// ([`KeyframeMode::Time`], one decode).
+pub async fn ingest_video(
+    path: &Path,
+    cfg: &IngestConfig,
+    cancel: &CancellationToken,
+) -> Result<IngestResult> {
+    let started = Instant::now();
+    let info = probe_video(path).await?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (mut frames, scan, sel, decoded, gpu_seconds) = match cfg.keyframes {
+        KeyframeMode::Time => {
+            let (frames, scan, decoded, gpu_s) = time_keyframes(path, cfg, info, cancel).await?;
+            // The same statistics as the motion path, for the capture report.
+            let mut sel = select_keyframes(&scan.scored, cfg.max_frames as usize);
+            sel.kept = frames.iter().map(|f| f.index).collect();
+            (frames, scan, sel, decoded, gpu_s)
+        }
+        KeyframeMode::Motion => motion_keyframes(path, cfg, info, cancel).await?,
+    };
     for f in &mut frames {
         f.source = format!("{name}#{}", f.index);
     }
+    let capture = CaptureStats::from_video(&scan.scored, &sel, &frames, cfg.keyframes);
     let seconds = started.elapsed().as_secs_f64();
     Ok(IngestResult {
         stats: IngestStats {
-            decoded: index,
+            decoded,
             kept: frames.len() as u32,
             seconds,
-            decode_fps: index as f64 / seconds.max(1e-9),
+            decode_fps: decoded as f64 / seconds.max(1e-9),
             gpu_seconds,
         },
         frames,
-        sharpness,
+        sharpness: scan.samples,
         focal_prior: None,
+        capture,
     })
 }
 
