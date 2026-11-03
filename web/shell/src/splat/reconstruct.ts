@@ -43,7 +43,8 @@ export type ReconstructInput = {
   mesh: boolean;
   profile: LicenceProfile;
   engine_schedule?: string;
-  max_images: number;
+  /** Frame cap; the op's field is `max_frames` (photos are subsampled evenly above it). */
+  max_frames: number;
 };
 
 export type ReconstructOutput = {
@@ -76,7 +77,7 @@ export function reconstructInput(
     mesh: o.mesh,
     profile: o.profile,
     engine_schedule: o.engineSchedule === "dense" ? undefined : o.engineSchedule,
-    max_images: o.maxImages,
+    max_frames: o.maxImages,
   };
 }
 

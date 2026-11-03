@@ -169,7 +169,9 @@ test("the op input carries photos or a video and the options", () => {
     mode: "auto",
     preset: "quality",
     mesh: false,
-    max_images: 200,
+    profile: "research",
+    engine_schedule: undefined,
+    max_frames: 200,
   });
   const v = reconstructInput({ video: "v" }, { ...DEFAULT_RECONSTRUCT, mesh: true, mode: "object" });
   assert.equal(v.video, "v");
