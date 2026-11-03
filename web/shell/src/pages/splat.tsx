@@ -8,6 +8,7 @@ import { RunPanel } from "../splat/panels";
 import { BenchPage } from "../splat/bench";
 import { DEFAULT_RECONSTRUCT, type ReconstructOptions } from "../splat/reconstruct";
 import { NewScenePanel } from "../splat/reconstruct-panels";
+import { CaptureTips, SampleScenes } from "../splat/samples";
 import { useReconstruct } from "../splat/use-reconstruct";
 import { DEFAULT_OPTIONS, useTrain, type TrainOptions } from "../splat/use-train";
 import { SplatViewer, type SplatSource } from "../splat/viewer";
@@ -94,6 +95,18 @@ export function SplatPage({ health, runId }: { health: Loaded<Health>; runId?: s
           ) : null}
         </div>
       </div>
+      {runId ? null : (
+        <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+          <SampleScenes
+            busy={busy}
+            onStart={(scene, preset) => {
+              setLocal(undefined);
+              void run.startSample(scene, preset, options);
+            }}
+          />
+          <CaptureTips />
+        </div>
+      )}
     </div>
   );
 }
