@@ -203,6 +203,12 @@ export class SplClient {
     return this.request<RunRecord[]>("GET", `/v1/runs${query}`);
   }
 
+  /** Deletes a finished run with the artifacts only it used; 409 while it
+      is queued or running (cancel it first). */
+  deleteRun(id: string) {
+    return this.request<void>("DELETE", `/v1/runs/${encodeURIComponent(id)}`);
+  }
+
   runDetail(id: string) {
     return this.request<RunDetail>("GET", `/v1/runs/${encodeURIComponent(id)}`);
   }

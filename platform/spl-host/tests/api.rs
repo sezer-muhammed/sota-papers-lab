@@ -1181,3 +1181,30 @@ async fn downloads_answer_byte_ranges() {
     let name = format!("attachment; filename=\"blob-{}.mov\"", &id[..12]);
     assert_eq!(headers[header::CONTENT_DISPOSITION], name.as_str());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_run_can_be_deleted_with_the_artifacts_only_it_used() {
+    let lab = lab(|_| {}).await;
+    let holder = id(&lab.start(json!({ "hold": true })).await);
+    let (code, _) = lab
+        .json("DELETE", &format!("/v1/runs/{holder}"), None)
+        .await;
+    assert_eq!(code, StatusCode::CONFLICT, "a running run stays");
+
+    let run = lab.run(json!({ "store": ["only mine"] })).await;
+    let artifact: Vec<String> = serde_json::from_value(run["output"]["artifacts"].clone()).unwrap();
+    let run = id(&run);
+    let (code, _) = lab.json("DELETE", &format!("/v1/runs/{run}"), None).await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    let (code, _) = lab.json("GET", &format!("/v1/runs/{run}"), None).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    let (code, _) = lab
+        .json("GET", &format!("/v1/artifacts/{}", artifact[0]), None)
+        .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "its output went with it");
+    let (code, _) = lab.json("DELETE", &format!("/v1/runs/{run}"), None).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+
+    lab.cancel(&holder).await;
+    lab.wait_finished(&holder).await;
+}

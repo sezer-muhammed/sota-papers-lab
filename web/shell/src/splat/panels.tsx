@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Download, Square } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronDown, Clock, Download, Square } from "lucide-react";
 import type { ArtifactRef, RunDetail } from "@spl/sdk";
 import { isFinished } from "@spl/sdk";
 import type { TrainOutput } from "@spl/bindings/image-to-3d/TrainOutput";
@@ -9,6 +9,8 @@ import { RunStatusSignal, runDuration } from "../components/run-status";
 import { downloadArtifact } from "../retouch/artifact";
 import { RECONSTRUCT_OP, liveNumbers, type ReconstructOutput } from "./reconstruct";
 import { ReconstructResult, StageBar } from "./reconstruct-panels";
+import { useRuns } from "./history";
+import { duration, framesOf, gpuWait, presetOf, queuePosition, remainingSeconds, stageModel, stageOf, waitHeadline, type FlowStage } from "./progress";
 
 export const mib = (bytes: number) =>
   bytes < 2 ** 20 ? `${Math.max(1, Math.round(bytes / 1024))} KiB` : `${(bytes / 2 ** 20).toFixed(bytes < 10 * 2 ** 20 ? 1 : 0)} MiB`;
@@ -72,18 +74,16 @@ export function RunPanel({
             <span className={text.meta}>{runDuration(run)}</span>
           </div>
         ) : null}
-        {detail?.waiting_for ? (
-          <p className={text.caption}>
-            Queued: waiting for {detail.waiting_for === "gpu" ? "the GPU (another op holds it)" : "a free run slot"}.
-          </p>
-        ) : null}
+        {detail && going ? <RunWait detail={detail} /> : null}
         {reconstruct && (going || succeeded) ? <StageBar live={live} mesh={wantsMesh} finished={succeeded} /> : null}
         {going && detail?.progress ? (
           <div className="space-y-1.5">
             <ProgressBar label="Overall progress" value={detail.progress.fraction} />
-            <p className={text.meta}>
-              {detail.progress.message} · {Math.round(detail.progress.fraction * 100)}%
-            </p>
+            {gpuWait(detail.progress.data) ? null : (
+              <p className={text.meta}>
+                {detail.progress.message} · {Math.round(detail.progress.fraction * 100)}%
+              </p>
+            )}
           </div>
         ) : going ? (
           <ProgressBar label="Overall progress" />
@@ -112,7 +112,10 @@ export function RunPanel({
           </pre>
         ) : null}
         {out ? <Result out={out} /> : null}
-        {rout ? <ReconstructResult out={rout} /> : null}
+        {rout ? (
+          // Its files are in the Downloads panel next to this one.
+          <ReconstructResult out={{ ...rout, spz: undefined, ply: undefined, glb: undefined, cameras: undefined, colmap: undefined, transforms: undefined }} />
+        ) : null}
       </div>
     </Surface>
   );
@@ -145,23 +148,10 @@ function Result({ out }: { out: TrainOutput }) {
     );
   }
   if (out.eval) rows.push(["PSNR", `${out.eval.psnr.toFixed(2)} dB`], ["SSIM", out.eval.ssim.toFixed(4)]);
-  const all: [string, string, ArtifactRef | undefined][] = [
-    ["SPZ", "scene.spz", out.spz],
-    ["PLY", "scene.ply", out.ply],
-    ["COLMAP", "cameras.zip", out.colmap],
-  ];
-  const files = all.filter((f): f is [string, string, ArtifactRef] => Boolean(f[2]));
 
   return (
     <div className="space-y-4 border-t border-[var(--ds-gray-alpha-400)] pt-4">
       <Facts rows={rows} />
-      {files.length ? (
-        <div className="flex flex-wrap gap-2">
-          {files.map(([label, name, ref]) => (
-            <ArtifactDownload key={label} label={label} name={name} file={ref} />
-          ))}
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -185,5 +175,78 @@ export function ArtifactDownload({ file, label, name }: { file: ArtifactRef; lab
     >
       {label} <span className={text.meta}>{mib(file.size_bytes)}</span>
     </ButtonLink>
+  );
+}
+
+const GB = 1e9;
+
+/** What a going run waits for, in plain words, with the elapsed time and an
+    ETA from this host's finished runs; the raw numbers sit behind Details. */
+function RunWait({ detail }: { detail: RunDetail }) {
+  const run = detail.run;
+  const { runs } = useRuns();
+  const [open, setOpen] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const wait = gpuWait(detail.progress?.data);
+  const queued = run.status === "queued";
+  const position = queued && runs ? queuePosition(runs, run.id) : undefined;
+  const stage = queued ? undefined : stageOf(detail.progress?.message, detail.progress?.data);
+  // When the current stage began, as this page saw it.
+  const since = useRef<{ stage?: FlowStage; at: number }>({ at: Date.now() });
+  if (since.current.stage !== stage) since.current = { stage, at: Date.now() };
+  const headline = waitHeadline({ queued, reason: detail.waiting_for, wait, position });
+  const waitedS = wait?.waitedS ?? (queued ? (now - run.created_at_ms) / 1000 : undefined);
+  const left =
+    runs && !queued && !wait
+      ? remainingSeconds({
+          model: stageModel(runs.filter((r) => r.id !== run.id), presetOf(run)),
+          frames: framesOf(run) ?? 100,
+          stage,
+          stageElapsedS: (now - since.current.at) / 1000,
+          message: detail.progress?.message,
+          mesh: Boolean((run.input as { mesh?: boolean } | null)?.mesh),
+        })
+      : undefined;
+  const elapsedS = run.started_at_ms ? (now - run.started_at_ms) / 1000 : undefined;
+
+  return (
+    <div data-testid="splat-run-wait" className="space-y-1.5">
+      {headline ? (
+        <p role="status" className="text-[14px] text-[var(--ds-gray-1000)]">
+          {headline}
+        </p>
+      ) : null}
+      <p className={cn(text.meta, "flex flex-wrap items-center gap-x-3 gap-y-1")}>
+        <Clock aria-hidden="true" className="h-3.5 w-3.5" />
+        {headline && waitedS !== undefined ? <span>Waiting {duration(waitedS)}</span> : null}
+        {!headline && elapsedS !== undefined ? <span>Elapsed {duration(elapsedS)}</span> : null}
+        {left !== undefined ? <span data-testid="splat-eta">About {duration(left)} left</span> : null}
+        {left === undefined && !headline ? <span>Time left appears once this host has finished a run</span> : null}
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+          className={cn(text.link, "ml-auto inline-flex items-center gap-1")}
+        >
+          Details <ChevronDown aria-hidden="true" className={cn("h-3.5 w-3.5 transition-transform", open && "rotate-180")} />
+        </button>
+      </p>
+      {open ? (
+        <dl data-testid="splat-run-details" className="grid grid-cols-2 gap-x-4 gap-y-1 rounded-[6px] bg-[var(--ds-background-200)] p-2 font-mono text-[12px] text-[var(--ds-gray-900)]">
+          <dt>status</dt>
+          <dd>{run.status}{detail.waiting_for ? ` (waits for ${detail.waiting_for})` : ""}</dd>
+          {stage ? (<><dt>stage</dt><dd>{stage}</dd></>) : null}
+          {detail.progress?.message ? (<><dt>message</dt><dd className="break-words">{detail.progress.message}</dd></>) : null}
+          {wait?.needBytes !== undefined ? (<><dt>needs</dt><dd>{(wait.needBytes / GB).toFixed(2)} GB</dd></>) : null}
+          {wait?.freeBytes !== undefined ? (<><dt>free now</dt><dd>{(wait.freeBytes / GB).toFixed(2)} GB</dd></>) : null}
+          {wait?.timeoutS !== undefined ? (<><dt>gives up after</dt><dd>{duration(wait.timeoutS)}</dd></>) : null}
+          {position ? (<><dt>queue position</dt><dd>{position}</dd></>) : null}
+        </dl>
+      ) : null}
+    </div>
   );
 }

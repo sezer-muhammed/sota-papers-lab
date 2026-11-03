@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
-import { Box, ChevronLeft, ChevronRight, Crop, Eye, Maximize2, Move3d, Orbit, RotateCcw, RotateCw, X } from "lucide-react";
+import { Box, ChevronLeft, ChevronRight, Crop, Eye, Keyboard, Maximize2, Move3d, Orbit, RotateCcw, RotateCw, X, type LucideIcon } from "lucide-react";
 import { Button, IconTile, RangeInput, Switch, cn, text } from "@spl/ui";
 import type { Frustum } from "./cameras";
 import type { Box as CropBox, SplatEngine, SplatFormat, ViewMode } from "./engine";
@@ -76,6 +76,8 @@ export function SplatViewer({
   const [flySpeed, setFlySpeed] = useState(1);
   /** The user picked a mode; stop choosing it from the camera layout. */
   const chose = useRef(false);
+  const [help, setHelp] = useState(false);
+  const touch = useCoarsePointer();
 
   useEffect(() => {
     let live = true;
@@ -245,6 +247,12 @@ export function SplatViewer({
     } else if (cameras.length && (e.key === "[" || (arrows && e.key === "ArrowLeft"))) {
       e.preventDefault();
       look((viewing ?? 0) - 1);
+    } else if (e.key === "?" || (e.key === "Escape" && help)) {
+      e.preventDefault();
+      setHelp(e.key === "?" ? !help : false);
+    } else if ((e.key === "r" || e.key === "R") && e.target === canvas.current) {
+      e.preventDefault();
+      resetView();
     } else if (e.key === "Escape" && viewing !== undefined) {
       e.preventDefault();
       engine?.exitCamera();
@@ -280,6 +288,14 @@ export function SplatViewer({
       if (url) URL.revokeObjectURL(url);
     };
   }, [viewing, photoFor]);
+
+  const resetView = () => {
+    if (!engine) return;
+    setTurntable(false);
+    engine.exitCamera();
+    engine.frame();
+    setViewing(undefined);
+  };
 
   const look = (i: number) => {
     if (!engine || !cameras.length) return;
@@ -339,12 +355,31 @@ export function SplatViewer({
         {hasScene ? (
           <p
             data-testid="splat-keys"
-            className="pointer-events-none absolute bottom-3 left-3 rounded-[6px] bg-black/60 px-2 py-1 font-mono text-[11px] text-white"
+            className="pointer-events-none absolute bottom-3 left-3 right-14 truncate rounded-[6px] bg-black/60 px-2 py-1 font-mono text-[11px] text-white sm:right-auto sm:max-w-[calc(100%-4.5rem)]"
           >
-            {mode === "fly"
-              ? `WASD move · Q/E down/up · drag look · Shift fast · wheel speed ×${flySpeed.toFixed(flySpeed < 1 ? 2 : 1)} · two fingers move · F orbit`
-              : "Drag orbit · right-drag pan · wheel zoom · F fly"}
+            {touch
+              ? mode === "fly"
+                ? "Drag look · two fingers move"
+                : "Drag orbit · pinch zoom · two fingers pan"
+              : mode === "fly"
+                ? `WASD move · Q/E down/up · drag look · Shift fast · wheel speed ×${flySpeed.toFixed(flySpeed < 1 ? 2 : 1)} · F orbit · ? keys`
+                : "Drag orbit · right-drag pan · wheel zoom · F fly · R reset · ? keys"}
           </p>
+        ) : null}
+        {hasScene ? (
+          <div className="absolute right-2 top-2 flex flex-col gap-2" role="group" aria-label="View">
+            <OverlayButton icon={RotateCcw} label="Reset view (R)" testId="splat-reset" disabled={!engine} onClick={resetView} />
+            <OverlayButton icon={Keyboard} label="Controls (?)" testId="splat-help-toggle" pressed={help} onClick={() => setHelp(!help)} />
+            <OverlayButton
+              icon={Maximize2}
+              label="Full screen"
+              disabled={!engine}
+              onClick={() => void canvas.current?.parentElement?.requestFullscreen?.()}
+            />
+          </div>
+        ) : null}
+        {help ? (
+          <ControlsHelp mode={mode} onClose={() => (setHelp(false), canvas.current?.focus())} onKeyDown={onKeyDown} />
         ) : null}
         {viewing !== undefined && photo ? (
           <Wipe
@@ -491,12 +526,6 @@ export function SplatViewer({
           >
             {crop ? "Remove crop" : "Crop"}
           </Button>
-          <Button size="sm" icon={RotateCcw} disabled={!engine} onClick={() => engine?.frame()}>
-            Reset view
-          </Button>
-          <Button size="sm" icon={Maximize2} disabled={!engine} onClick={() => void canvas.current?.parentElement?.requestFullscreen?.()}>
-            Full screen
-          </Button>
         </div>
       </div>
 
@@ -528,6 +557,133 @@ export function SplatViewer({
           <RotateCw aria-hidden="true" className="h-3.5 w-3.5" /> Turning about the scene centre; drag to stop.
         </p>
       ) : null}
+    </div>
+  );
+}
+
+/** Phones and tablets: show gestures rather than keys. */
+function useCoarsePointer() {
+  const [coarse, setCoarse] = useState(() => typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches);
+  useEffect(() => {
+    const media = window.matchMedia("(pointer: coarse)");
+    const on = () => setCoarse(media.matches);
+    media.addEventListener("change", on);
+    return () => media.removeEventListener("change", on);
+  }, []);
+  return coarse;
+}
+
+/** A 40 px round control over the canvas, big enough for a thumb. */
+function OverlayButton({
+  disabled,
+  icon: Icon,
+  label,
+  onClick,
+  pressed,
+  testId,
+}: {
+  disabled?: boolean;
+  icon: LucideIcon;
+  label: string;
+  onClick: () => void;
+  pressed?: boolean;
+  testId?: string;
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      aria-pressed={pressed}
+      data-testid={testId}
+      disabled={disabled}
+      onClick={onClick}
+      className={cn(
+        "grid h-10 w-10 place-items-center rounded-full bg-black/60 text-white outline-none hover:bg-black/75 focus-visible:shadow-[var(--ds-focus-ring)] disabled:opacity-50",
+        pressed && "ring-2 ring-[var(--ds-blue-700)]",
+      )}
+    >
+      <Icon aria-hidden="true" className="h-4 w-4" />
+    </button>
+  );
+}
+
+const HELP: { title: string; rows: [string, string][] }[] = [
+  {
+    title: "Orbit",
+    rows: [
+      ["Drag", "orbit"],
+      ["Right-drag / Shift-drag", "pan"],
+      ["Wheel", "zoom"],
+    ],
+  },
+  {
+    title: "Fly",
+    rows: [
+      ["W A S D", "move"],
+      ["Q / E", "down / up"],
+      ["Drag", "look"],
+      ["Shift", "faster"],
+      ["Wheel", "fly speed"],
+    ],
+  },
+  {
+    title: "Anywhere",
+    rows: [
+      ["F", "orbit / fly"],
+      ["R", "reset view"],
+      ["[ / ]", "previous / next camera"],
+      ["Esc", "leave the camera"],
+      ["?", "this help"],
+    ],
+  },
+  {
+    title: "Touch",
+    rows: [
+      ["One finger", "orbit (look in fly)"],
+      ["Pinch", "zoom"],
+      ["Two fingers", "pan (move in fly)"],
+      ["Tap a camera", "look through it"],
+    ],
+  },
+];
+
+function ControlsHelp({ mode, onClose, onKeyDown }: { mode: ViewMode; onClose: () => void; onKeyDown: (e: KeyboardEvent<HTMLElement>) => void }) {
+  const close = useRef<HTMLButtonElement>(null);
+  useEffect(() => close.current?.focus(), []);
+  return (
+    <div
+      role="dialog"
+      aria-label="Viewer controls"
+      data-testid="splat-help"
+      onKeyDown={onKeyDown}
+      className="absolute inset-2 overflow-auto rounded-[8px] bg-black/80 p-4 text-white sm:inset-auto sm:left-3 sm:top-3 sm:max-w-[30rem]"
+    >
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <p className="text-[14px] font-medium">Controls{mode === "fly" ? " (fly mode)" : ""}</p>
+        <button
+          ref={close}
+          type="button"
+          aria-label="Close controls"
+          onClick={onClose}
+          className="grid h-8 w-8 place-items-center rounded-full outline-none hover:bg-white/15 focus-visible:shadow-[var(--ds-focus-ring)]"
+        >
+          <X aria-hidden="true" className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="grid grid-cols-1 gap-4 min-[420px]:grid-cols-2">
+        {HELP.map((g) => (
+          <dl key={g.title} className="space-y-1">
+            <dt className="font-mono text-[11px] uppercase text-white/70">{g.title}</dt>
+            {g.rows.map(([k, v]) => (
+              <dd key={k} className="flex justify-between gap-3 text-[12px]">
+                <kbd className="font-mono">{k}</kbd>
+                <span className="text-right text-white/80">{v}</span>
+              </dd>
+            ))}
+          </dl>
+        ))}
+      </div>
     </div>
   );
 }

@@ -6,6 +6,8 @@ import type { Loaded } from "../api";
 import { PageIntro } from "../components/page-intro";
 import { RunPanel } from "../splat/panels";
 import { BenchPage } from "../splat/bench";
+import { DownloadsPanel } from "../splat/downloads";
+import { RunsGallery } from "../splat/history";
 import { DEFAULT_RECONSTRUCT, type ReconstructOptions } from "../splat/reconstruct";
 import { NewScenePanel } from "../splat/reconstruct-panels";
 import { CaptureTips, SampleScenes } from "../splat/samples";
@@ -88,6 +90,7 @@ export function SplatPage({ health, runId }: { health: Loaded<Health>; runId?: s
               }}
             />
           )}
+          {runId && !local && run.detail?.run.status === "succeeded" ? <DownloadsPanel output={run.detail.run.output} /> : null}
           {!runId && error ? (
             <p role="alert" className="text-[13px] text-[var(--ds-gray-900)]">
               {error}
@@ -95,6 +98,7 @@ export function SplatPage({ health, runId }: { health: Loaded<Health>; runId?: s
           ) : null}
         </div>
       </div>
+      <RunsGallery current={runId} />
       {runId ? null : (
         <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
           <SampleScenes

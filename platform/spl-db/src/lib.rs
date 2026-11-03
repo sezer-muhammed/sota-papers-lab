@@ -68,6 +68,11 @@ pub trait Store: Send + Sync {
     /// that run's links to it. False, and nothing changed, otherwise. The
     /// caller then deletes the bytes.
     async fn forget_artifact(&self, run_id: &str, artifact_id: &str) -> Result<bool>;
+    /// Deletes a run with its links, announcements and metrics, and the
+    /// records of the artifacts it linked or announced that nothing else
+    /// references any more; returns those artifact ids (the caller then
+    /// deletes the bytes). Empty when there is no such run.
+    async fn delete_run(&self, run_id: &str) -> Result<Vec<String>>;
 
     /// Makes `announcement` the run's current artifact for its slot,
     /// replacing the previous one. The artifact must be recorded.

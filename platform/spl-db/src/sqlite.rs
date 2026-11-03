@@ -306,6 +306,47 @@ impl Store for SqliteStore {
         Ok(true)
     }
 
+    async fn delete_run(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut tx = self.pool.begin().await?;
+        let touched: Vec<(String,)> = sqlx::query_as(
+            "SELECT artifact_id FROM spl_run_artifacts WHERE run_id = ?1
+             UNION SELECT artifact_id FROM spl_run_announcements WHERE run_id = ?1",
+        )
+        .bind(run_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for sql in [
+            "DELETE FROM spl_run_announcements WHERE run_id = ?1",
+            "DELETE FROM spl_run_artifacts WHERE run_id = ?1",
+            "DELETE FROM spl_metrics WHERE run_id = ?1",
+        ] {
+            sqlx::query(sql).bind(run_id).execute(&mut *tx).await?;
+        }
+        let gone = sqlx::query("DELETE FROM spl_runs WHERE id = ?1")
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+        if gone.rows_affected() == 0 {
+            return Ok(Vec::new());
+        }
+        let mut forgotten = Vec::new();
+        for (id,) in touched {
+            let deleted = sqlx::query(
+                "DELETE FROM spl_artifacts WHERE id = ?1
+                   AND NOT EXISTS (SELECT 1 FROM spl_run_artifacts WHERE artifact_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM spl_run_announcements WHERE artifact_id = ?1)",
+            )
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            if deleted.rows_affected() > 0 {
+                forgotten.push(id);
+            }
+        }
+        tx.commit().await?;
+        Ok(forgotten)
+    }
+
     async fn announce(&self, run_id: &str, a: &Announcement) -> Result<()> {
         sqlx::query(
             "INSERT INTO spl_run_announcements
@@ -649,6 +690,37 @@ mod tests {
             .map(|l| l.slot_name)
             .collect();
         assert_eq!(slots, ["out-1", "out-2"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_a_run_keeps_what_others_reference() -> Result<()> {
+        let store = crate::connect("sqlite::memory:").await?;
+        for run in ["r1", "r2"] {
+            store.create_run(&new_run(run)).await?;
+        }
+        for id in ["mine", "shared", "shown"] {
+            store.put_artifact(&artifact(id, "splat")).await?;
+        }
+        store.link_artifact("r1", "mine", "output", "out-0").await?;
+        store.link_artifact("r1", "shared", "input", "a").await?;
+        store.link_artifact("r2", "shared", "input", "a").await?;
+        store
+            .announce("r1", &announcement("splat", "shown", 1))
+            .await?;
+        store
+            .announce("r2", &announcement("splat", "shown", 1))
+            .await?;
+
+        let mut gone = store.delete_run("r1").await?;
+        gone.sort();
+        assert_eq!(gone, ["mine"]);
+        assert!(store.get_run("r1").await?.is_none());
+        assert!(store.get_artifact("mine").await?.is_none());
+        assert!(store.get_artifact("shared").await?.is_some());
+        assert!(store.get_artifact("shown").await?.is_some());
+        assert!(store.get_run("r2").await?.is_some());
+        assert!(store.delete_run("r1").await?.is_empty(), "already gone");
         Ok(())
     }
 }

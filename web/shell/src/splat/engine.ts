@@ -514,32 +514,53 @@ export class SplatEngine {
 
 
 
-  /** Orbit around the splats' centre; look from the first camera when there
-      is one, else from a distance that fits the centres' box. */
+  /** The default view. With cameras: from the first training camera, its
+      up kept, backed off along the line to the scene's centre until the
+      cameras' ring fits the field of view (a walk-through starts exactly at
+      the first camera). Without: from a distance that fits the splats' box.
+      The splat box only sets the clip planes, so floaters do not shrink the
+      scene. */
   frame() {
     this.world.updateMatrixWorld(true);
+    const m = this.world.matrixWorld;
     const box = new THREE.Box3();
     const shown = this.mesh ?? this.points;
     if (shown) box.copy(shown.getBoundingBox(true)).applyMatrix4(shown.matrixWorld);
-    for (const cam of this.cameras) box.expandByPoint(new THREE.Vector3(...cam.center).applyMatrix4(this.world.matrixWorld));
+    const centers = this.cameras.map((cam) => new THREE.Vector3(...cam.center).applyMatrix4(m));
+    for (const c of centers) box.expandByPoint(c);
     if (box.isEmpty()) return;
     this.leaveCamera();
     const focus = focusPoint(this.cameras);
-    const center = focus ? new THREE.Vector3(...focus).applyMatrix4(this.world.matrixWorld) : box.getCenter(new THREE.Vector3());
+    const center = focus ? new THREE.Vector3(...focus).applyMatrix4(m) : box.getCenter(new THREE.Vector3());
     const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-3);
     const first = this.cameras[0];
-    if (first) {
-      // Behind the first camera, so the cameras show around the scene.
-      const from = new THREE.Vector3(...first.center).applyMatrix4(this.world.matrixWorld);
-      this.camera.position.copy(center).add(from.sub(center).multiplyScalar(1.6));
-    } else {
-      this.camera.position.copy(center).add(new THREE.Vector3(0, radius * 0.3, radius * 1.2));
-    }
     this.camera.near = radius / 1000;
     this.camera.far = radius * 100;
+    this.camera.fov = DEFAULT_FOV;
+    if (first) {
+      const from = centers[0]!;
+      const view = cameraView(first);
+      const forward = new THREE.Vector3(...view.forward).transformDirection(m);
+      if (this.roomScale()) {
+        this.camera.position.copy(from);
+        this.controls.target.copy(from).addScaledVector(forward, Math.max(this.flyControls.baseSpeed * 2, 1e-3));
+      } else {
+        const ring = centers.map((c) => c.distanceTo(center)).sort((x, y) => x - y)[centers.length >> 1]!;
+        const half = THREE.MathUtils.degToRad(this.camera.fov / 2) * Math.min(1, this.camera.aspect || 1);
+        // The content sits inside the ring; fit about three quarters of it.
+        const fit = Math.max((ring * 0.75) / Math.sin(half), ring * 1.2);
+        const dir = from.clone().sub(center);
+        if (dir.lengthSq() < 1e-12) dir.copy(forward).negate();
+        this.camera.position.copy(center).addScaledVector(dir.normalize(), fit);
+        this.controls.target.copy(center);
+      }
+    } else {
+      this.camera.position.copy(center).add(new THREE.Vector3(0, radius * 0.3, radius * 1.2));
+      this.controls.target.copy(center);
+      this.flyControls.baseSpeed = radius * 0.25;
+    }
     this.camera.updateProjectionMatrix();
-    if (!this.cameras.length) this.flyControls.baseSpeed = radius * 0.25;
-    this.controls.target.copy(center);
+    this.camera.lookAt(this.controls.target);
     this.controls.update();
     this.framed = true;
   }
