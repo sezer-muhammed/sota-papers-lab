@@ -29,7 +29,8 @@ printf 'COMPOSE_FILE=compose.yaml:compose.tailnet.yaml\nSPL_TAILNET_IP=%s\n' "$(
 SPL_GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
 ```
 
-Open `http://<machine>.<tailnet>.ts.net:7070`. Update with `git pull && docker compose up -d --build`
+Open `http://<machine>.<tailnet>.ts.net:7070`. Update with `git pull && BUILDX_BUILDER=default docker compose up -d --build`
+(`BUILDX_BUILDER=default` keeps the build on Docker's own builder when another project has made its docker-container builder the current one; that builder may not resolve Docker Hub).
 (Rust and pnpm caches persist between builds).
 
 Data (SQLite file + artifacts) lives in `./data` (bind-mounted to `/var/lib/spl`).
