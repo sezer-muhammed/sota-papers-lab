@@ -92,7 +92,7 @@ pub struct ReconstructInput {
     /// Build a mesh (.glb) from the trained splat; `false` by default.
     #[serde(default)]
     pub mesh: bool,
-    /// Hold out every 8th frame (from 24 frames up) and report held-out
+    /// Hold out every 8th frame (from 80 frames up) and report held-out
     /// quality, the worst views and a floater-free splat; `true` by default.
     #[serde(default = "default_true")]
     pub evaluate: bool,

@@ -184,7 +184,7 @@ export function ResultCard({
           />
         </>
       ) : (
-        <p className={text.caption}>Too few frames to hold some out, so there is no quality score.</p>
+        <p className={text.caption}>Under 80 frames every frame trains the model, so there is no held-out quality score.</p>
       )}
       {quality.worst.length ? (
         <div className="space-y-1.5">

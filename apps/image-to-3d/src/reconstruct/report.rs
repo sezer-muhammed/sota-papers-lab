@@ -42,8 +42,9 @@ pub const WEAK_PSNR: f64 = 21.0;
 pub const WEAK_SSIM: f64 = 0.55;
 /// Hold out every n-th frame for the result report.
 pub const HOLDOUT_EVERY: usize = 8;
-/// Fewest frames for a held-out evaluation (leaves ≥ 21 training frames).
-pub const HOLDOUT_MIN_FRAMES: usize = 24;
+/// Fewest frames for a held-out evaluation. Smaller captures train on every
+/// frame (each one matters more than the score), so they get no rating.
+pub const HOLDOUT_MIN_FRAMES: usize = 80;
 
 /// How the capture went, before training.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
