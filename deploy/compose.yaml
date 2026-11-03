@@ -21,6 +21,11 @@ services:
       - ../data:/var/lib/spl
       - ${SPL_DATASETS_HOST:-../data/datasets}:/data/datasets:ro
       - ${SPL_MODELS_HOST:-./models}:/models:ro
+    # Pinned (page-locked) host memory for CUDA uploads counts against memlock.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         reservations:

@@ -15,6 +15,7 @@
 
 pub mod graph;
 pub mod heads;
+pub mod hostbuf;
 pub mod preprocess;
 pub mod trunk;
 pub mod weights;
@@ -569,7 +570,7 @@ fn normalize_launch(
 fn chunk_levels<'a>(
     nn: &Nn,
     cache: &'a [Option<CudaSlice<u16>>; 4],
-    host: &'a Option<[spl_nn::cudarc::driver::PinnedHostSlice<u16>; 3]>,
+    host: &'a Option<[hostbuf::HostBuf<u16>; 3]>,
     stage: &'a mut Option<[CudaSlice<u16>; 3]>,
     g: Geometry,
     frames: std::ops::Range<usize>,
@@ -583,7 +584,7 @@ fn chunk_levels<'a>(
     };
     if let (Some(host), Some(stage)) = (host.as_ref(), stage.as_mut()) {
         for (h, s) in host.iter().zip(stage.iter_mut()) {
-            let src = &h.as_slice().map_err(|e| anyhow!("pinned: {e:?}"))?[a..b];
+            let src = &h.as_slice()?[a..b];
             let mut dst = s.slice_mut(..b - a);
             nn.stream
                 .memcpy_htod(src, &mut dst)

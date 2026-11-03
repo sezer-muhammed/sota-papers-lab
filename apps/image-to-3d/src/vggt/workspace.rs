@@ -19,7 +19,9 @@ use std::ops::Range;
 use anyhow::ensure;
 use spl_core::{Result, anyhow};
 use spl_nn::Nn;
-use spl_nn::cudarc::driver::{CudaSlice, CudaView, CudaViewMut, PinnedHostSlice};
+
+use super::hostbuf::HostBuf;
+use spl_nn::cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
 
 pub const SPECIAL: usize = 17;
 pub const DIM: usize = 1024;
@@ -226,7 +228,7 @@ pub struct Workspace {
     /// `None` while a level is offloaded (dropped from the device).
     pub cache: [Option<CudaSlice<u16>>; 4],
     /// Pinned host copies of levels 0..3 when offloading.
-    pub host_cache: Option<[PinnedHostSlice<u16>; 3]>,
+    pub host_cache: Option<[HostBuf<u16>; 3]>,
     /// Device staging for one dense chunk of an offloaded level.
     pub stage: Option<[CudaSlice<u16>; 3]>,
     /// f16 bits `[N][H][W]`.
@@ -262,18 +264,15 @@ impl Workspace {
             let mut host = Vec::new();
             let mut st = Vec::new();
             for _ in 0..3 {
-                // SAFETY: pinned memory is written by the device before any
-                // host read (copies are stream-ordered and synchronised).
-                host.push(
-                    unsafe { nn.ctx.alloc_pinned::<u16>(level) }
-                        .map_err(alloc_err("pinned cache"))?,
-                );
+                // Written by the device before any read (copies are
+                // stream-ordered and synchronised).
+                host.push(HostBuf::new(nn, level, "offloaded cache"));
                 st.push(
                     s.alloc_zeros::<u16>(chunk)
                         .map_err(alloc_err("cache stage"))?,
                 );
             }
-            let h: [PinnedHostSlice<u16>; 3] = host.try_into().map_err(|_| anyhow!("pinned"))?;
+            let h: [HostBuf<u16>; 3] = host.try_into().map_err(|_| anyhow!("pinned"))?;
             let st: [CudaSlice<u16>; 3] = st.try_into().map_err(|_| anyhow!("stage"))?;
             (Some(h), Some(st))
         } else {
@@ -338,7 +337,7 @@ impl Workspace {
         for (h, d) in host.iter_mut().zip(&self.cache[..3]) {
             if let Some(d) = d {
                 nn.stream
-                    .memcpy_dtoh(d, h)
+                    .memcpy_dtoh(d, h.as_mut_slice()?)
                     .map_err(|e| anyhow!("offload cache: {e:?}"))?;
             }
         }
