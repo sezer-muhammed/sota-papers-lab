@@ -36,6 +36,8 @@ export type ReconstructInput = {
   images?: string[];
   /** One video artifact. */
   video?: string;
+  /** A photo folder under the host's dataset root (a sample scene). */
+  dataset?: string;
   mode: Mode;
   preset: Preset;
   mesh: boolean;
@@ -59,11 +61,16 @@ export type ReconstructOutput = {
 };
 
 export function reconstructInput(
-  artifacts: { images?: string[]; video?: string },
+  artifacts: { images?: string[]; video?: string; dataset?: string },
   o: ReconstructOptions,
 ): ReconstructInput {
+  const source = artifacts.dataset
+    ? { dataset: artifacts.dataset }
+    : artifacts.video
+      ? { video: artifacts.video }
+      : { images: artifacts.images ?? [] };
   return {
-    ...(artifacts.video ? { video: artifacts.video } : { images: artifacts.images ?? [] }),
+    ...source,
     mode: o.mode,
     preset: o.preset,
     mesh: o.mesh,
@@ -71,6 +78,27 @@ export function reconstructInput(
     engine_schedule: o.engineSchedule === "dense" ? undefined : o.engineSchedule,
     max_images: o.maxImages,
   };
+}
+
+/* ---- Sample scenes ---- */
+
+/** Scenes the GPU host keeps under its dataset root (research-use
+    datasets; never in the repo). Thumbnails are small WebPs of each
+    folder's first photo, in `public/samples/<key>.webp`. */
+export type SampleScene = { key: string; title: string; source: string; dataset: string; photos: number };
+
+export const SAMPLE_SCENES: SampleScene[] = [
+  { key: "garden", title: "Garden", source: "Mip-NeRF 360", dataset: "mipnerf360/garden/images_4", photos: 185 },
+  { key: "bicycle", title: "Bicycle", source: "Mip-NeRF 360", dataset: "mipnerf360/bicycle/images_4", photos: 194 },
+  { key: "kitchen", title: "Kitchen", source: "Mip-NeRF 360", dataset: "mipnerf360/kitchen/images_2", photos: 279 },
+  { key: "room", title: "Room", source: "Mip-NeRF 360", dataset: "mipnerf360/room/images_2", photos: 311 },
+  { key: "truck", title: "Truck", source: "Tanks and Temples", dataset: "tandt/truck/images", photos: 251 },
+  { key: "playroom", title: "Playroom", source: "Deep Blending", dataset: "db/playroom/images", photos: 225 },
+];
+
+/** The run input for a sample scene: the page's options with the chosen preset. */
+export function sampleInput(scene: SampleScene, preset: Preset, o: ReconstructOptions): ReconstructInput {
+  return reconstructInput({ dataset: scene.dataset }, { ...o, mode: "scene", preset });
 }
 
 /* ---- Object generation (Pixal3D-mv sidecar) ---- */

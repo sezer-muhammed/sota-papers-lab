@@ -245,3 +245,14 @@ test("a ring of inward-looking cameras focuses on its centre with their shared u
   const row = [0, 1, 2].map((k) => pinholeFrustum({ r_cw: I, t_cw: [-k, 0, 0], fx: 50, fy: 50, cx: 50, cy: 50, width: 100, height: 100 }));
   assert.equal(focusPoint(row), undefined);
 });
+
+test("a sample scene runs the reconstruct op on its dataset folder", async () => {
+  const { SAMPLE_SCENES, sampleInput } = await import("../src/splat/reconstruct.ts");
+  const garden = SAMPLE_SCENES.find((s) => s.key === "garden")!;
+  const input = sampleInput(garden, "fast", DEFAULT_RECONSTRUCT);
+  assert.equal(input.dataset, "mipnerf360/garden/images_4");
+  assert.equal(input.preset, "fast");
+  assert.equal(input.images, undefined);
+  assert.equal(input.video, undefined);
+  for (const s of SAMPLE_SCENES) assert.ok(!s.dataset.startsWith("/") && !s.dataset.includes(".."));
+});

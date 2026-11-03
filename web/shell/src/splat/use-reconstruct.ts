@@ -10,10 +10,13 @@ import {
   matchPhotos,
   mediaTypeOf,
   reconstructInput,
+  sampleInput,
   type Picked,
   type ReconstructInput,
   type ReconstructOptions,
   type ReconstructOutput,
+  type Preset,
+  type SampleScene,
 } from "./reconstruct";
 import type { PhotoFor, PointsSource, SplatSource } from "./viewer";
 
@@ -156,6 +159,17 @@ export function useReconstruct(runId: string | undefined) {
     }
   }, []);
 
+  /** A sample scene: nothing to upload, the host reads the folder. */
+  const startSample = useCallback(async (scene: SampleScene, preset: Preset, options: ReconstructOptions) => {
+    setError(undefined);
+    try {
+      const run = await client.startRun(RECONSTRUCT_OP, sampleInput(scene, preset, options));
+      window.location.hash = `#/3d/${encodeURIComponent(run.id)}`;
+    } catch (e) {
+      setError(describeError(e));
+    }
+  }, []);
+
   const stopSending = useCallback(() => sendAbort.current?.abort(), []);
 
   const cancel = useCallback(async () => {
@@ -194,5 +208,5 @@ export function useReconstruct(runId: string | undefined) {
     };
   }, [runId, cameras, remoteKey]);
 
-  return { sending, error, detail, splat, points, cameras, snapshot, photoFor, start, stopSending, cancel };
+  return { sending, error, detail, splat, points, cameras, snapshot, photoFor, start, startSample, stopSending, cancel };
 }
