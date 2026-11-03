@@ -363,6 +363,8 @@ pub struct Reconstruction {
     /// Held-out frames (benchmark protocol), engine-posed.
     pub test: Option<TestViews>,
     pub test_images: Vec<Rgb8Image>,
+    /// Training images for the mesh bake (video inputs have no files on disk).
+    pub training_images: Vec<Rgb8Image>,
 }
 
 impl Reconstruction {
@@ -1204,7 +1206,12 @@ pub fn reconstruct_with(
     drop(frames);
     // Images first: the trainer sizes its capacity from what is left.
     let cache = ImageCache::from_images(&gpu, (0..train.len()).collect(), &train_imgs, 0.0)?;
-    drop(train_imgs);
+    let mesh_images = if cfg.mesh.is_some() {
+        train_imgs
+    } else {
+        drop(train_imgs);
+        Vec::new()
+    };
     let seed_points = if let Some(p) = posed.seed.take() {
         p
     } else if let (1, Some(p)) = (cfg.init_ba, ba_points.take()) {
@@ -1435,6 +1442,7 @@ pub fn reconstruct_with(
         joint: Some(joint),
         test,
         test_images: test_imgs,
+        training_images: mesh_images,
     })
 }
 

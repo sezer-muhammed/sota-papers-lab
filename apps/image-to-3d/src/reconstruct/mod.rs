@@ -190,9 +190,16 @@ impl Op for Reconstruct {
             crate::vram::release_quietly();
             let glb = if let Some(ref mc) = mesh_cfg {
                 send(Event::Progress(0.92, "meshing".into()));
+                let imgs = std::mem::take(&mut r.training_images);
+                let img_ref = if imgs.is_empty() {
+                    None
+                } else {
+                    Some(imgs.as_slice())
+                };
                 // A mesh failure never fails the run: the splat is the product.
-                let built = crate::gpu::Gpu::open()
-                    .and_then(|gpu| crate::mesh::pipeline::build(&gpu, &r.cloud, &r.views, mc));
+                let built = crate::gpu::Gpu::open().and_then(|gpu| {
+                    crate::mesh::pipeline::build_with(&gpu, &r.cloud, &r.views, mc, img_ref)
+                });
                 match built {
                     Ok(mesh) => {
                         for n in &mesh.summary.notes {
