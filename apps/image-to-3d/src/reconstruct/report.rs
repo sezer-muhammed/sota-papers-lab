@@ -338,11 +338,16 @@ pub struct FloaterRule {
 }
 
 impl FloaterRule {
-    pub fn for_views(n: usize) -> Self {
+    /// Conservative on purpose: on garden video runs (48 keyframes, Fast)
+    /// dropping splats seen by < 3 cameras or wider than 0.1 × the camera
+    /// extent removed real edges and background and cost 1.3-1.5 dB
+    /// held-out PSNR; only splats no training camera sees, nearly
+    /// transparent ones and ones wider than the whole camera rig go.
+    pub fn for_views(_n: usize) -> Self {
         Self {
-            min_views: if n >= 20 { 3 } else { 2 },
+            min_views: 1,
             min_opacity: 0.01,
-            max_scale: 0.1,
+            max_scale: 1.0,
         }
     }
 }
@@ -763,7 +768,12 @@ mod tests {
         g.scales = vec![-5.0; 12];
         g.scales[9] = 2.0;
         g.opacities = vec![2.0, 2.0, -8.0, 2.0];
-        let why = floaters(&g, &views, FloaterRule::for_views(4));
+        let rule = FloaterRule {
+            min_views: 2,
+            min_opacity: 0.01,
+            max_scale: 0.1,
+        };
+        let why = floaters(&g, &views, rule);
         assert_eq!(why, vec![0, 1, 2, 3]);
         let kept = keep_only(&g, &why);
         assert_eq!(kept.len(), 1);
