@@ -181,7 +181,10 @@ fn gpu_mesh_dataset() {
         Ok(())
     };
     let mut sum = MeshSummary::default();
-    drop(fuse_with(&gpu, &cloud, &views, &mesh_cfg, &mut sum, &mut dump).unwrap());
+    // Diagnostics only: `build` below retries an overflow, this pass does not.
+    if let Err(e) = fuse_with(&gpu, &cloud, &views, &mesh_cfg, &mut sum, &mut dump) {
+        eprintln!("diagnostic fuse failed: {e:#}");
+    }
     let t = Instant::now();
     let res = build(&gpu, &cloud, &views, &mesh_cfg).unwrap();
     let mesh_s = t.elapsed().as_secs_f64();

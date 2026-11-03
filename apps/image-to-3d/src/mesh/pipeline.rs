@@ -256,8 +256,9 @@ pub fn scene_bounds(cloud: &GaussiansHost, views: &[View]) -> ([f32; 6], bool) {
 
 /// Splat boxes wider than this many camera extents are clipped.
 const CLIP_RATIO: f32 = 3.0;
-/// Voxel growth for the one retry after a TSDF pool overflow.
+/// Voxel growth for each retry after a TSDF pool overflow.
 const RETRY_COARSEN: f32 = 1.75;
+const MAX_RETRIES: usize = 3;
 
 /// glTF requires unit normals: degenerate faces leave zero vectors.
 pub fn unit_normals(normals: &mut [[f32; 3]]) {
@@ -475,28 +476,33 @@ pub fn build(
 ) -> Result<MeshResult> {
     let started = Instant::now();
     let mut summary = MeshSummary::default();
-    let vol = match fuse(gpu, cloud, views, cfg, &mut summary) {
-        Err(e) if is_overflow(&e) => {
-            // Same box, coarser samples: blocks fall by about RETRY_COARSEN².
-            let mut retry = cfg.clone();
-            retry.voxel = Some(summary.voxel * RETRY_COARSEN);
-            let note = format!(
-                "{e:#}; retried with voxel {:.4} (was {:.4})",
-                summary.voxel * RETRY_COARSEN,
-                summary.voxel
-            );
-            let mut notes = std::mem::take(&mut summary.notes);
-            notes.push(note);
-            if retry.bounds.is_none() {
-                retry.bounds = Some(scene_bounds(cloud, views).0);
+    // On a pool overflow keep the box and coarsen the samples (blocks fall
+    // by about RETRY_COARSEN² per step); the overflow count is only a lower
+    // bound of the need, so allow further steps.
+    let mut notes = Vec::new();
+    let mut attempt = cfg.clone();
+    let mut retries = 0;
+    let vol = loop {
+        match fuse(gpu, cloud, views, &attempt, &mut summary) {
+            Err(e) if is_overflow(&e) && retries < MAX_RETRIES => {
+                retries += 1;
+                let v = summary.voxel * RETRY_COARSEN;
+                notes.append(&mut summary.notes);
+                notes.push(format!(
+                    "{e:#}; retried with voxel {v:.4} (was {:.4})",
+                    summary.voxel
+                ));
+                attempt.voxel = Some(v);
+                if attempt.bounds.is_none() {
+                    attempt.bounds = Some(scene_bounds(cloud, views).0);
+                }
+                summary = MeshSummary::default();
             }
-            summary = MeshSummary::default();
-            let vol = fuse(gpu, cloud, views, &retry, &mut summary)?;
-            summary.notes = notes;
-            vol
+            r => break r?,
         }
-        r => r?,
     };
+    notes.append(&mut summary.notes);
+    summary.notes = notes;
     let t = Instant::now();
     let mut raw = vol.extract(ExtractOptions {
         min_weight: cfg.min_weight,
