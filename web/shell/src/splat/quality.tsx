@@ -164,6 +164,8 @@ export function ResultCard({
   const next = longerPreset(quality.preset);
   const f = quality.floaters;
   const [starting, setStarting] = useState(false);
+  // Cleaning that costs held-out quality is reported, not offered.
+  const hurts = f?.psnr_before !== undefined && f.psnr_after !== undefined && f.psnr_after < f.psnr_before - 0.1;
   return (
     <section aria-label="Result report" className="space-y-3 rounded-[8px] border border-[var(--ds-gray-alpha-400)] p-3">
       <div className="flex items-center justify-between gap-2">
@@ -197,7 +199,7 @@ export function ResultCard({
       {f && f.after < f.before ? (
         <p className={text.caption}>
           {clean ? "Showing without floaters: removed " : "Floaters found: "}
-          {floaterSummary(f)}.
+          {floaterSummary(f)}.{hurts && !clean ? " Removing them would lower quality, so it is not offered." : ""}
         </p>
       ) : null}
       <div className="flex flex-wrap gap-2">
@@ -214,7 +216,7 @@ export function ResultCard({
             Train longer ({next})
           </Button>
         ) : null}
-        {onShowClean && f?.spz ? (
+        {onShowClean && f?.spz && (!hurts || clean) ? (
           <Button size="sm" icon={Eraser} onClick={() => onShowClean(!clean)}>
             {clean ? "Show with floaters" : "Remove floaters"}
           </Button>
