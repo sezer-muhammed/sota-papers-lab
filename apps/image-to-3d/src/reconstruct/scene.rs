@@ -401,6 +401,74 @@ pub fn voxel_merge(points: &InitPoints, center: [f32; 3], extent: f32, voxel: f3
     out
 }
 
+/// Drops 3D points whose per-axis coordinate lies outside the
+/// `[lo_pct, hi_pct]` percentile range, then points farther than
+/// `k_mad` × MAD from the per-axis median (on any axis). This removes
+/// extreme depth outliers that would otherwise inflate the voxel grid.
+/// Returns the filtered points and the number dropped.
+pub fn clip_outliers(
+    points: InitPoints,
+    lo_pct: f32,
+    hi_pct: f32,
+    k_mad: f32,
+) -> (InitPoints, usize) {
+    let n = points.xyz.len();
+    if n < 4 {
+        return (points, 0);
+    }
+    // Per-axis sorted values.
+    let mut sorted: [Vec<f32>; 3] = std::array::from_fn(|k| {
+        let mut v: Vec<f32> = points.xyz.iter().map(|p| p[k]).collect();
+        v.sort_by(f32::total_cmp);
+        v
+    });
+
+    // Percentile bounds.
+    let pct_idx =
+        |frac: f32| -> usize { ((frac.clamp(0.0, 1.0) * (n - 1) as f32) as usize).min(n - 1) };
+    let lo: [f32; 3] = std::array::from_fn(|k| sorted[k][pct_idx(lo_pct)]);
+    let hi: [f32; 3] = std::array::from_fn(|k| sorted[k][pct_idx(hi_pct)]);
+
+    // Keep points inside the percentile box.
+    let mut keep: Vec<bool> = points
+        .xyz
+        .iter()
+        .map(|p| (0..3).all(|k| p[k] >= lo[k] && p[k] <= hi[k]))
+        .collect();
+
+    // Median and MAD of the surviving points (per axis).
+    let surviving: Vec<usize> = (0..n).filter(|&i| keep[i]).collect();
+    if surviving.len() >= 4 && k_mad > 0.0 {
+        for (ax, s) in sorted.iter_mut().enumerate() {
+            s.clear();
+            s.extend(surviving.iter().map(|&i| points.xyz[i][ax]));
+            s.sort_by(f32::total_cmp);
+        }
+        let sn = sorted[0].len();
+        let median: [f32; 3] = std::array::from_fn(|k| sorted[k][sn / 2]);
+        let mad: [f32; 3] = std::array::from_fn(|k| {
+            let mut d: Vec<f32> = sorted[k].iter().map(|&v| (v - median[k]).abs()).collect();
+            d.sort_by(f32::total_cmp);
+            d[d.len() / 2].max(1e-12)
+        });
+        for (i, kept) in keep.iter_mut().enumerate() {
+            if *kept && (0..3).any(|k| (points.xyz[i][k] - median[k]).abs() > k_mad * mad[k]) {
+                *kept = false;
+            }
+        }
+    }
+
+    let mut out = InitPoints::default();
+    for (i, &kept) in keep.iter().enumerate() {
+        if kept {
+            out.xyz.push(points.xyz[i]);
+            out.rgb.push(points.rgb[i]);
+        }
+    }
+    let dropped = n - out.xyz.len();
+    (out, dropped)
+}
+
 /// Every `stride`-th point so at most `max` remain.
 pub fn subsample(points: InitPoints, max: usize) -> InitPoints {
     let stride = points.xyz.len().div_ceil(max.max(1)).max(1);
@@ -608,5 +676,82 @@ mod tests {
         let (tr, te) = holdout_split(17, 8);
         assert_eq!(te, vec![0, 8, 16]);
         assert_eq!(tr.len(), 14);
+    }
+
+    #[test]
+    fn clip_outliers_removes_extreme_points() {
+        let mut pts = InitPoints::default();
+        // 1000 well-behaved points clustered around the origin.
+        for i in 0..1000 {
+            let v = (i as f32 - 500.0) * 0.01;
+            pts.xyz.push([v, v * 0.5, v * 0.3]);
+            pts.rgb.push([128, 128, 128]);
+        }
+        // 5 extreme outliers (orders of magnitude beyond the good set).
+        let outlier_coords: Vec<[f32; 3]> = vec![
+            [10000.0, 0.0, 0.0],
+            [-10000.0, 0.0, 0.0],
+            [0.0, 5000.0, 0.0],
+            [0.0, -5000.0, 0.0],
+            [0.0, 0.0, 8000.0],
+        ];
+        for c in &outlier_coords {
+            pts.xyz.push(*c);
+            pts.rgb.push([255, 0, 0]);
+        }
+        let total = pts.xyz.len();
+        assert_eq!(total, 1005);
+
+        let (clipped, dropped) = clip_outliers(pts.clone(), 0.01, 0.99, 5.0);
+        // All 5 outliers must be gone; at most a few percent of good points
+        // near the edges of the distribution may also be trimmed.
+        assert!(
+            dropped >= 5,
+            "at least the 5 outliers removed, got {dropped}"
+        );
+        assert!(
+            clipped.xyz.len() >= 950,
+            "keep most good points, kept {}",
+            clipped.xyz.len()
+        );
+        // No surviving point should be an outlier.
+        for p in &clipped.xyz {
+            assert!(
+                p[0].abs() < 100.0 && p[1].abs() < 100.0 && p[2].abs() < 100.0,
+                "outlier survived: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clip_outliers_preserves_clean_data() {
+        let mut pts = InitPoints::default();
+        for i in 0..200 {
+            let v = (i as f32 - 100.0) * 0.05;
+            pts.xyz.push([v, v + 1.0, v - 0.5]);
+            pts.rgb.push([100, 150, 200]);
+        }
+        let (clipped, dropped) = clip_outliers(pts.clone(), 0.01, 0.99, 5.0);
+        // At most a tiny fraction dropped by the percentile edges (1% each end ≈ 2 per axis).
+        assert!(
+            dropped <= 10,
+            "clean Gaussian data should lose very few points, lost {dropped}"
+        );
+        assert!(
+            clipped.xyz.len() >= 190,
+            "should keep most points, kept {}",
+            clipped.xyz.len()
+        );
+    }
+
+    #[test]
+    fn clip_outliers_tiny_input() {
+        let pts = InitPoints {
+            xyz: vec![[1.0, 2.0, 3.0], [100.0, 200.0, 300.0]],
+            rgb: vec![[0, 0, 0], [255, 255, 255]],
+        };
+        let (clipped, dropped) = clip_outliers(pts, 0.01, 0.99, 5.0);
+        assert_eq!(dropped, 0, "fewer than 4 points → no clipping");
+        assert_eq!(clipped.xyz.len(), 2);
     }
 }

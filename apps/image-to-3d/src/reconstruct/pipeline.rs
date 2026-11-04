@@ -24,7 +24,9 @@ use super::ba::{BaConfig, bundle_adjust};
 use super::geom::{GeoRefine, consistent_points, refine_poses};
 use super::joint::{DepthPriorCfg, DepthPriors, Joint, JointConfig, PoseRefine, TestViews};
 use super::prune::{PruneReport, prune_first};
-use super::scene::{Posed, holdout_split, spread_stats, subsample, training_scene, voxel_merge};
+use super::scene::{
+    Posed, clip_outliers, holdout_split, spread_stats, subsample, training_scene, voxel_merge,
+};
 use crate::eval::{ImageMetrics, image_metrics};
 use crate::export::colmap::{write_colmap, write_transforms_json};
 use crate::export::ply::write_inria_ply;
@@ -1240,10 +1242,12 @@ pub fn reconstruct_with(
             cfg.init_conf_drop,
             cap * cfg.init_oversample.max(1) as usize,
         );
+        let n_raw = cand.xyz.len();
+        let (cand, n_clipped) = clip_outliers(cand, 0.01, 0.99, 5.0);
         let (c, r) = extent(train_views.iter().map(View::center));
         let merged = voxel_merge(&cand, c, r, cfg.init_voxel);
         events(Event::Log(format!(
-            "voxel-merged init: {} candidates → {} voxels",
+            "voxel-merged init: {} candidates ({n_clipped} outliers clipped from {n_raw}) → {} voxels",
             cand.xyz.len(),
             merged.xyz.len()
         )));
