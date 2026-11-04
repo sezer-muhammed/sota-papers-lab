@@ -29,8 +29,9 @@ printf 'COMPOSE_FILE=compose.yaml:compose.tailnet.yaml\nSPL_TAILNET_IP=%s\n' "$(
 SPL_GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
 ```
 
-Open `http://<machine>.<tailnet>.ts.net:7070`. Update with `git pull && BUILDX_BUILDER=default docker compose up -d --build`
-(`BUILDX_BUILDER=default` keeps the build on Docker's own builder when another project has made its docker-container builder the current one; that builder may not resolve Docker Hub).
+Open `http://<machine>.<tailnet>.ts.net:7070`. Update with `git pull && deploy/update.sh`.
+It builds with `BUILDX_BUILDER=default` (Docker's own builder, used because another project may have made its docker-container builder the current one, and that builder may not resolve Docker Hub).
+It keeps only the last two builds: `sota-papers-lab-spl:latest` and `:prev` for rollback. It also removes other tags, this project's untagged images and build cache unused for three days.
 (Rust and pnpm caches persist between builds).
 
 Data (SQLite file + artifacts) lives in `./data` (bind-mounted to `/var/lib/spl`).
