@@ -20,6 +20,6 @@ SPL_GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
 # Keep the last two builds only: other tags of this image, this project's
 # untagged leftovers, and build cache unused for three days go.
 docker images "$img" --format '{{.Repository}}:{{.Tag}}' \
-  | grep -vE ":(latest|prev)$" | xargs -r docker rmi
+  | { grep -vE ":(latest|prev)$" || true; } | xargs -r docker rmi
 docker image prune -f --filter label=com.docker.compose.project=sota-papers-lab
 docker builder prune -af --filter until=72h
